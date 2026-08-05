@@ -1,0 +1,56 @@
+# Secrets and local environment configuration
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+__pypackages__/
+
+# Python bytecode and packaging output
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+build/
+dist/
+pip-wheel-metadata/
+
+# Test, lint, type-check, and coverage caches
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.tox/
+.nox/
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+
+# StellarCode local state and potentially sensitive runtime data
+.stellarcode/mcp.json
+.stellarcode/audit/
+.stellarcode/traces/
+.stellarcode-memory/
+.stellarcode-rag/
+
+# Local editor and scratch files
+.vscode/
+.idea/
+tmp/
+*.log
+*.tmp
+*.bak
+*~
+
+# Notebook and operating-system metadata
+.ipynb_checkpoints/
+.DS_Store
+Thumbs.db
+Desktop.ini
