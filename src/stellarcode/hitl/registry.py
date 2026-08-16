@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import json
+import threading
+from concurrent.futures import ThreadPoolExecutor
+from contextvars import copy_context
 from typing import Any
 
 from stellarcode.hitl.handler import HitlHandler
@@ -42,6 +45,31 @@ class HitlToolRegistry(ToolRegistry):
     def schemas(self) -> list[dict[str, Any]]:
         return self.delegate.schemas()
 
+    def preview(
+        self,
+        name: str,
+        arguments: str | dict[str, Any] | None,
+    ) -> dict[str, Any] | None:
+        return self.delegate.preview(name, arguments)
+
+    def event_arguments(
+        self,
+        name: str,
+        arguments: str | dict[str, Any] | None,
+    ) -> dict[str, Any]:
+        return self.delegate.event_arguments(name, arguments)
+
+    def wait_for_quiescence(
+        self,
+        timeout_seconds: float | None = None,
+        *,
+        task_id: str | None = None,
+    ) -> bool:
+        return self.delegate.wait_for_quiescence(
+            timeout_seconds,
+            task_id=task_id,
+        )
+
     def execute(self, name: str, arguments: str | dict[str, Any] | None) -> str:
         if not self.hitl_handler.is_enabled():
             return self.delegate.execute(name, arguments)
@@ -53,7 +81,13 @@ class HitlToolRegistry(ToolRegistry):
             return self.delegate.execute(name, arguments)
 
         original_arguments = _serialize_arguments(arguments)
-        request = ApprovalRequest.create(name, original_arguments)
+        change_preview = self.delegate.preview(name, arguments)
+        request = ApprovalRequest.create(
+            name,
+            original_arguments,
+            change_preview=change_preview,
+            display_arguments=self.delegate.event_arguments(name, arguments),
+        )
         result = self.hitl_handler.request_approval(request)
 
         if result.is_rejected:
@@ -65,21 +99,39 @@ class HitlToolRegistry(ToolRegistry):
             message = "[HITL] Operation skipped by the user."
             self._record_intercepted(name, arguments, message)
             return message
+        effective_arguments = result.effective_arguments(original_arguments)
+        effective_preview = (
+            self.delegate.preview(name, effective_arguments)
+            if result.modified_arguments is not None
+            else change_preview
+        )
         return self.delegate.execute(
             name,
-            result.effective_arguments(original_arguments),
+            _guard_approved_change(
+                name,
+                effective_arguments,
+                effective_preview,
+            ),
         )
 
     def execute_tools(
         self,
         invocations: list[ToolInvocation],
         timeout_seconds: float | None = None,
+        cancellation_event: threading.Event | None = None,
     ) -> list[ToolExecutionResult]:
         if not self.hitl_handler.is_enabled():
-            return self.delegate.execute_tools(invocations, timeout_seconds)
+            return self.delegate.execute_tools(
+                invocations,
+                timeout_seconds,
+                cancellation_event,
+            )
 
         prepared: list[tuple[int, ToolInvocation]] = []
         immediate: dict[int, ToolExecutionResult] = {}
+        approval_candidates: list[
+            tuple[int, ToolInvocation, str, dict[str, Any] | None, ApprovalRequest]
+        ] = []
         for index, invocation in enumerate(invocations):
             policy_result = _restricted_policy_result(
                 invocation.name,
@@ -98,9 +150,53 @@ class HitlToolRegistry(ToolRegistry):
                 continue
 
             original_arguments = _serialize_arguments(invocation.arguments)
-            approval = self.hitl_handler.request_approval(
-                ApprovalRequest.create(invocation.name, original_arguments)
+            change_preview = self.delegate.preview(
+                invocation.name,
+                invocation.arguments,
             )
+            approval_candidates.append(
+                (
+                    index,
+                    invocation,
+                    original_arguments,
+                    change_preview,
+                    ApprovalRequest.create(
+                        invocation.name,
+                        original_arguments,
+                        tool_call_id=invocation.id,
+                        change_preview=change_preview,
+                        display_arguments=self.delegate.event_arguments(
+                            invocation.name,
+                            invocation.arguments,
+                        ),
+                    ),
+                )
+            )
+
+        approvals: dict[int, Any] = {}
+        if approval_candidates:
+            # Desktop approvals are independent asynchronous decisions. Start every
+            # request in the batch before waiting for any one of them so the UI can
+            # display the complete approval queue at once. TerminalHitlHandler still
+            # serializes its stdin prompt internally, preserving CLI behaviour.
+            with ThreadPoolExecutor(
+                max_workers=len(approval_candidates),
+                thread_name_prefix="stellarcode-approval",
+            ) as executor:
+                futures = {
+                    index: executor.submit(
+                        copy_context().run,
+                        self.hitl_handler.request_approval,
+                        request,
+                    )
+                    for index, _invocation, _arguments, _preview, request
+                    in approval_candidates
+                }
+                for index, *_rest in approval_candidates:
+                    approvals[index] = futures[index].result()
+
+        for index, invocation, original_arguments, change_preview, _request in approval_candidates:
+            approval = approvals[index]
             if approval.is_rejected:
                 reason = approval.reason or "The user rejected this operation."
                 immediate[index] = _approval_result(
@@ -124,13 +220,23 @@ class HitlToolRegistry(ToolRegistry):
                     immediate[index].result,
                 )
                 continue
+            effective_arguments = approval.effective_arguments(original_arguments)
+            effective_preview = (
+                self.delegate.preview(invocation.name, effective_arguments)
+                if approval.modified_arguments is not None
+                else change_preview
+            )
             prepared.append(
                 (
                     index,
                     ToolInvocation(
                         id=invocation.id,
                         name=invocation.name,
-                        arguments=approval.effective_arguments(original_arguments),
+                        arguments=_guard_approved_change(
+                            invocation.name,
+                            effective_arguments,
+                            effective_preview,
+                        ),
                     ),
                 )
             )
@@ -138,6 +244,7 @@ class HitlToolRegistry(ToolRegistry):
         executed = self.delegate.execute_tools(
             [invocation for _, invocation in prepared],
             timeout_seconds,
+            cancellation_event,
         )
         for (index, _), result in zip(prepared, executed):
             immediate[index] = result
@@ -168,6 +275,37 @@ def _serialize_arguments(arguments: str | dict[str, Any] | None) -> str:
     if isinstance(arguments, str):
         return arguments
     return json.dumps(arguments, ensure_ascii=False, separators=(",", ":"))
+
+
+def _guard_approved_change(
+    name: str,
+    arguments: str | dict[str, Any] | None,
+    preview: dict[str, Any] | None,
+) -> str | dict[str, Any] | None:
+    """Bind an approved file preview to the exact pre-write file state.
+
+    The hidden values never enter the model schema or UI.  The built-in file
+    handler rechecks them while holding its mutation lock, closing the window
+    between approval and the actual atomic replace/unlink.
+    """
+
+    if name not in {"write_file", "delete_file"}:
+        return arguments
+    if preview is None:
+        return arguments
+    try:
+        parsed = json.loads(arguments) if isinstance(arguments, str) else arguments
+    except json.JSONDecodeError:
+        return arguments
+    if not isinstance(parsed, dict):
+        return arguments
+    guarded = dict(parsed)
+    guarded["__expected_path"] = str(preview.get("path") or "")
+    before_hash = preview.get("before_sha256")
+    guarded["__expected_before_sha256"] = (
+        str(before_hash) if before_hash is not None else "__stellarcode_missing__"
+    )
+    return guarded
 
 
 def _approval_result(

@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import threading
+import shutil
+import uuid
+from collections.abc import Iterable
 from pathlib import Path
 
 from stellarcode.skill.model import Skill, SkillSource
@@ -9,28 +12,27 @@ from stellarcode.skill.state import SkillStateStore
 
 
 class SkillRegistry:
-    """Loads builtin, user, and project skills with later layers overriding earlier ones."""
+    """Loads user and project skills, with project skills overriding user skills."""
 
     def __init__(
         self,
-        builtin_dir: str | Path | None,
         user_dir: str | Path | None,
         project_dir: str | Path | None,
         state_store: SkillStateStore | None = None,
+        startup_warnings: Iterable[str] = (),
     ) -> None:
-        self.builtin_dir = Path(builtin_dir) if builtin_dir is not None else None
         self.user_dir = Path(user_dir) if user_dir is not None else None
         self.project_dir = Path(project_dir) if project_dir is not None else None
         self.state_store = state_store
+        self._startup_warnings = tuple(startup_warnings)
         self._skills: dict[str, Skill] = {}
         self._warnings: list[str] = []
         self._lock = threading.RLock()
 
     def reload(self) -> None:
         loaded: dict[str, Skill] = {}
-        warnings: list[str] = []
+        warnings = list(self._startup_warnings)
         for directory, source in (
-            (self.builtin_dir, SkillSource.BUILTIN),
             (self.user_dir, SkillSource.USER),
             (self.project_dir, SkillSource.PROJECT),
         ):
@@ -104,8 +106,41 @@ class SkillRegistry:
             )
 
 
-def builtin_skills_dir() -> Path:
+def bundled_skills_dir() -> Path:
     return Path(__file__).resolve().parent.parent / "skills"
+
+
+def bootstrap_bundled_skills(
+    user_dir: str | Path,
+    bundled_dir: str | Path | None = None,
+) -> tuple[str, ...]:
+    """Installs missing bundled Skill templates into the editable user layer."""
+    target_root = Path(user_dir)
+    source_root = Path(bundled_dir) if bundled_dir is not None else bundled_skills_dir()
+    warnings: list[str] = []
+    try:
+        target_root.mkdir(parents=True, exist_ok=True)
+        sources = sorted(path for path in source_root.iterdir() if path.is_dir())
+    except OSError as exc:
+        return (f"could not initialize user Skill directory {target_root}: {exc}",)
+
+    for source in sources:
+        if not (source / "SKILL.md").is_file():
+            continue
+        target = target_root / source.name
+        if target.exists():
+            continue
+        temporary = target_root / f".{source.name}.install-{uuid.uuid4().hex}"
+        try:
+            shutil.copytree(source, temporary)
+            temporary.replace(target)
+        except OSError as exc:
+            if not target.exists():
+                warnings.append(f"could not install bundled Skill {source.name}: {exc}")
+        finally:
+            if temporary.exists():
+                shutil.rmtree(temporary, ignore_errors=True)
+    return tuple(warnings)
 
 
 def _string_field(frontmatter: dict[str, object], key: str) -> str | None:

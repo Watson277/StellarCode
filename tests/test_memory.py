@@ -4,7 +4,13 @@ from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
 from stellarcode.agent import Agent
-from stellarcode.memory import MemoryEntry, MemoryManager, MemoryType, estimate_tokens
+from stellarcode.memory import (
+    MemoryEntry,
+    MemoryManager,
+    MemoryType,
+    ProjectMemoryService,
+    estimate_tokens,
+)
 from stellarcode.memory.long_term import LongTermMemory
 from stellarcode.tools import build_default_registry
 
@@ -38,6 +44,38 @@ def test_long_term_memory_persists_and_dedupes(tmp_path):
     reloaded = LongTermMemory(tmp_path)
     assert len(reloaded.all()) == 1
     assert reloaded.all()[0].content == "项目默认使用 Python 3.10"
+
+
+def test_long_term_memory_quarantines_corrupt_json_without_blocking_startup(tmp_path):
+    storage_file = tmp_path / "long_term_memory.json"
+    corrupt_bytes = b'{"entries": [{"id": "truncated"}'
+    storage_file.write_bytes(corrupt_bytes)
+
+    memory = LongTermMemory(tmp_path)
+
+    assert memory.all() == []
+    assert not storage_file.exists()
+    quarantined = list(tmp_path.glob("long_term_memory.corrupt-*.json"))
+    assert len(quarantined) == 1
+    assert quarantined[0].read_bytes() == corrupt_bytes
+    assert str(quarantined[0]) in memory.warnings()[0]
+
+    assert memory.store(MemoryEntry.create("recovered fact", MemoryType.FACT))
+    assert storage_file.is_file()
+    assert quarantined[0].read_bytes() == corrupt_bytes
+
+
+def test_long_term_memory_quarantines_structurally_invalid_entries(tmp_path):
+    storage_file = tmp_path / "long_term_memory.json"
+    storage_file.write_text(
+        '{"entries": [{"content": "missing fields"}]}', encoding="utf-8"
+    )
+
+    memory = LongTermMemory(tmp_path)
+
+    assert memory.all() == []
+    assert memory.warnings()
+    assert len(list(tmp_path.glob("long_term_memory.corrupt-*.json"))) == 1
 
 
 def test_memory_manager_retrieves_saved_fact(tmp_path):
@@ -75,6 +113,40 @@ def test_memory_manager_and_token_budget_are_safe_for_parallel_writers(tmp_path)
     assert manager.token_budget.llm_call_count == 100
     assert manager.token_budget.total_input_tokens == 1000
     assert manager.token_budget.total_output_tokens == 200
+
+
+def test_project_memory_service_shares_long_term_but_isolates_conversations(tmp_path):
+    service = ProjectMemoryService(tmp_path, context_window=100_000)
+    first = service.create_conversation_manager(short_term_tokens=10_000)
+    second = service.create_conversation_manager(short_term_tokens=10_000)
+
+    assert first is not second
+    assert first.short_term is not second.short_term
+    assert first.token_budget is not second.token_budget
+    assert first.long_term is second.long_term
+
+    first.add_user_message("Only conversation one should contain this message")
+    first.save_fact("The project uses Python 3.12")
+
+    assert len(first.short_term.all()) == 1
+    assert second.short_term.all() == []
+    assert [entry.content for entry in second.search("Python 3.12")] == [
+        "The project uses Python 3.12"
+    ]
+
+
+def test_project_memory_service_preserves_parallel_long_term_writes(tmp_path):
+    service = ProjectMemoryService(tmp_path)
+    managers = [service.create_conversation_manager() for _ in range(8)]
+
+    def save_fact(index: int) -> None:
+        managers[index % len(managers)].save_fact(f"shared-project-fact-{index}")
+
+    with ThreadPoolExecutor(max_workers=len(managers)) as executor:
+        list(executor.map(save_fact, range(100)))
+
+    assert service.long_term.count() == 100
+    assert len(LongTermMemory(tmp_path).all()) == 100
 
 
 def test_compression_creates_summary_and_extracts_fact(tmp_path):

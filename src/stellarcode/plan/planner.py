@@ -2,11 +2,14 @@ from __future__ import annotations
 
 import json
 import re
+import threading
 import uuid
 from pathlib import Path
 
 from stellarcode.agent import ChatClient, runtime_context
+from stellarcode.cancellation import cancellable_call
 from stellarcode.image import ImageReferenceParser
+from stellarcode.llm.types import llm_operation, normalize_chat_result
 from stellarcode.plan.execution_plan import ExecutionPlan, PlanValidationError
 from stellarcode.plan.task import Task, TaskType
 
@@ -52,7 +55,11 @@ class Planner:
         self.llm_client = llm_client
         self.image_parser = ImageReferenceParser(workspace or ".")
 
-    def create_plan(self, goal: str) -> ExecutionPlan:
+    def create_plan(
+        self,
+        goal: str,
+        cancellation_event: threading.Event | None = None,
+    ) -> ExecutionPlan:
         messages = [
             {
                 "role": "system",
@@ -60,7 +67,17 @@ class Planner:
             },
             self.image_parser.user_message(f"Create an execution plan for this goal:\n{goal}"),
         ]
-        response = self.llm_client.chat(messages, tools=None)
+        with llm_operation("plan-planner"):
+            raw = cancellable_call(
+                lambda: self.llm_client.chat(messages, tools=None),
+                cancellation_event,
+            )
+        response = normalize_chat_result(
+            raw,
+            client=self.llm_client,
+            messages=messages,
+            tools=None,
+        ).message
         return self.parse_plan(goal, str(response.get("content") or ""))
 
     def parse_plan(self, goal: str, raw_output: str) -> ExecutionPlan:

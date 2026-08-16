@@ -6,7 +6,6 @@ from pathlib import Path
 
 
 class SkillSource(str, Enum):
-    BUILTIN = "builtin"
     USER = "user"
     PROJECT = "project"
 

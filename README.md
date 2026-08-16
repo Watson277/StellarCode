@@ -25,7 +25,82 @@ python -m pip install -e ".[dev]"
 Copy-Item .env.example .env
 ```
 
-Configure either `GLM_API_KEY` or `AGNES_API_KEY` in `.env`, select the provider with
+## Desktop client
+
+The `desktop/` Tauri application starts the same Python Agent through the JSONL Runtime
+Sidecar. During development it automatically uses `.venv\Scripts\python.exe`:
+
+```powershell
+cd desktop
+npm install
+npm run tauri dev
+```
+
+The CLI remains available and does not need to be replaced. The desktop transport and its
+typed messages are documented in `docs/desktop-runtime-event-protocol.md`.
+
+Unexpected Sidecar exits are recovered automatically. The desktop restarts Python with
+bounded backoff, replays missed per-session events from the project journal, restores the
+unfinished task checkpoint, and continues ReAct history from the last safe message/tool
+boundary. Interrupted side-effecting tools are marked unconfirmed and verified before any
+retry instead of being executed blindly.
+
+One desktop Sidecar now keeps independently loaded project Runtimes alive. Each conversation
+owns its own task slot, cancellation signal, checkpoint, short-term context, Skill buffer,
+usage ledger, and Trace target, so tasks in different projects or conversations can continue
+in the background while the user switches the visible workspace. The sidebar marks running
+conversations and project task counts. A conversation still accepts only one task at a time.
+
+Desktop Plan mode displays the generated DAG as a persistent live plan card. Overall
+progress and each step's dependencies, running state, result, failure, or skipped state are
+updated through structured RuntimeEvents and restored when the conversation is reopened.
+
+Every desktop task is protected before execution by an isolated Side-Git snapshot stored in
+StellarCode application data. It never stages, commits, resets, or changes the user's Git
+repository. `write_file` and `delete_file` approvals include a bounded pre-change diff and
+verify the approved file hash again under the mutation lock before an atomic replace/unlink.
+After completed, failed, and cancelled tasks, the transcript shows the protected file set,
+lazy full diff, and a task-level Undo action. Undo restores only that task's paths, refuses
+to overwrite later edits, preserves unrelated changes, and uses its own crash-recoverable
+safety snapshot. See `docs/task-modification-protection.md` for the exact scope and limits.
+Windows junctions/reparse points are never followed into snapshots, and rollback refuses a
+file/directory replacement when it would remove excluded or otherwise unprotected children.
+
+Desktop conversation reopening now combines the persisted transcript with a filtered replay
+of the project's durable RuntimeEvent journal. Tool cards, approval decisions, task status,
+and elapsed time therefore survive project switches and application restarts while historical
+pending approvals remain read-only and reset boundaries discard older execution details. A
+persisted per-conversation event floor makes reset durable across Sidecar crash boundaries.
+
+The Runtime now compacts the actual provider message history before it reaches the configured
+context limit. It preserves recent turns and complete tool-call/result boundaries, stores an
+LLM-generated summary with the conversation, and uses a deterministic fallback if the summary
+request fails. Provider-reported Token usage is accumulated per call, task, and conversation;
+APIs that omit usage are shown explicitly as estimates. See
+`docs/context-compression-and-token-usage.md` for the memory boundaries and lifecycle.
+
+The desktop top bar exposes a unified **Manage** and **Settings** center. Settings persist
+non-secret General, Appearance, Models, Agent, and Diagnostics configuration in the Tauri
+application-data directory. Management pages audit/edit shared project Memory, enable or reload
+Skills, manage MCP/RAG, and explicitly connect Browser sessions without returning secret values.
+The Problems panel now uses persisted real analyzer output rather than a fixed placeholder:
+safe runs check Python syntax and Ruff and can query an explicitly configured local Python
+Language Server over read-only LSP JSON-RPC; confirmed build runs are limited to project-local
+TypeScript `--noEmit` and Cargo `--locked --offline`. Runs are asynchronous and cancellable.
+The LSP client never installs a server, uses a shell, accepts workspace edits/commands, or reports
+diagnostics for files it did not open; when no server is configured it is shown as unavailable
+instead of simulating LSP output. The MCP Servers section reads live project Runtime state, displays discovered tools
+and schemas, and can manage or add project-local stdio/HTTP servers.
+General includes a persisted Simplified Chinese/English language selector that localizes all
+built-in desktop navigation, dialogs, approvals, task/tool/Plan states, and settings pages;
+model replies, project files, and third-party MCP content keep their original language.
+Appearance includes
+fixed dark/light presets, custom accent, background, panel, and font colors, automatically
+dimmed secondary text, and client-wide font scaling. Model and Agent overrides are passed to
+the Python Sidecar on restart; API keys remain in `.env` or system environment variables,
+and Full access is never persisted as a default.
+
+Configure `DEEPSEEK_API_KEY`, `GLM_API_KEY`, or `AGNES_API_KEY` in `.env`, select the provider with
 `LLM_PROVIDER`, then run:
 
 ```powershell
@@ -67,6 +142,10 @@ Trace mode can also be changed while StellarCode is running:
 /trace status
 ```
 
+In the desktop client, use the `Trace On/Off` button beside the composer controls. The
+desktop setting is stored independently for every conversation and restored when that
+conversation is opened again.
+
 Each session is an append-only `session-YYYYMMDD-HHMMSS-xxxxxxxx.jsonl` file. Events
 include CLI input/output, complete LLM messages and tool schemas, LLM responses and
 errors, tool arguments, complete untruncated command stdout/stderr, elapsed time, HITL
@@ -95,7 +174,16 @@ still contain sensitive working context, so do not commit or share them casually
 - Human approval for dangerous tools with serialized Multi-Agent prompts
 - Ordered parallel tool execution shared by ReAct, Plan tasks, and Multi-Agent Workers
 - DAG-layer parallelism for independent Plan-and-Execute tasks
-- Four-tool default concurrency cap, batch timeout, and command-output truncation
+- Four-tool default concurrency cap, cooperative batch cancellation, command process-tree
+  cleanup on timeout, and command-output truncation
+- Persistent conversation history repair for interrupted assistant/tool-call rounds
+- Persistent desktop task, tool, approval, Plan, and elapsed-time execution details
+- Isolated task Side-Git snapshots, approval-time file diffs, atomic writes, conflict-safe
+  task rollback, and interrupted-rollback recovery without touching the user's Git state
+- Provider-history compression with tool-call-safe turn grouping and persisted summaries
+- Exact provider Token usage with estimated fallback and per-task/conversation ledgers
+- SSE assistant streaming for DeepSeek, GLM, and Agnes with authoritative final-message
+  reconciliation, live context occupancy, cache/reasoning usage, and cost accounting
 - Automatic Zhipu, SerpAPI, or SearXNG web search provider selection
 - SSRF-protected, rate-limited web fetching with HTML-to-Markdown extraction
 - Current local date and timezone injected into ReAct, Plan, and Multi-Agent prompts
@@ -110,6 +198,39 @@ still contain sensitive working context, so do not commit or share them casually
   arrays, MCP screenshot attachments, and historical Base64 pruning
 
 ## Multimodal Image Input
+
+To use DeepSeek V4 Flash for text and tool-calling tasks, configure:
+
+```dotenv
+LLM_PROVIDER=deepseek
+DEEPSEEK_API_KEY=your_deepseek_api_key_here
+DEEPSEEK_MODEL=deepseek-v4-flash
+DEEPSEEK_BASE_URL=https://api.deepseek.com
+```
+
+DeepSeek V4 Flash uses the OpenAI-compatible Chat Completions API. StellarCode preserves
+the returned `reasoning_content` in assistant history so subsequent tool rounds remain
+valid. The DeepSeek endpoint itself is treated as text-only. When a separate vision
+provider is not configured, local images and screenshot attachments are replaced by an
+explicit text notice before the request is sent.
+
+To keep DeepSeek for code and tool calling while routing image-bearing turns through the
+existing GLM vision pipeline, configure:
+
+```dotenv
+LLM_PROVIDER=deepseek
+VISION_PROVIDER=glm
+GLM_API_KEY=your_glm_api_key_here
+GLM_VISION_MODEL=glm-5v-turbo
+# GLM_VISION_API_KEY=optional_standard_bigmodel_api_key
+```
+
+`VISION_PROVIDER` accepts `auto`, `glm`, `agnes`, or `disabled`. With `auto` (also the
+default when the variable is omitted), StellarCode selects the first configured VLM in
+GLM then Agnes order. Text-only requests continue using `DEEPSEEK_MODEL`; a request whose
+active message history contains an image uses the VLM for the complete image/tool round.
+After historical image bytes are pruned on the next user turn, routing returns to DeepSeek.
+Provider-specific DeepSeek `reasoning_content` fields are removed from requests sent to GLM.
 
 StellarCode routes each request automatically. With the GLM provider, normal text tasks use
 `GLM_MODEL`; a request whose active context contains an image uses `GLM_VISION_MODEL`.
@@ -134,6 +255,11 @@ Relative paths are resolved from `--workspace`. Angle brackets or quotes are req
 when a path contains spaces. `@clipboard` reads the current GUI clipboard image and
 caches a PNG under `~/.stellarcode/cache`.
 
+In the desktop client, focus the chat box and press `Ctrl+V` after copying an image or taking
+a screenshot. The image appears as a removable attachment before it is sent, is cached under
+`~/.stellarcode/cache`, and follows the same automatic VLM routing as attached image files.
+Clipboard images are limited to 20 MB. Normal copied text continues to paste as text.
+
 Images are decoded and validated rather than trusted by extension. Sources are limited
 to 50 MB; payloads over the API's 5 MB Base64 limit are resized to at most 2000x2000
 and re-encoded. Transparent images are flattened onto white. Previous-turn image data
@@ -147,7 +273,8 @@ DOM inspection, `take_snapshot` is still preferred over a screenshot.
 
 No manual switching is needed. Local images and MCP screenshots select
 `glm-5v-turbo` for that task. Before the next external user task, StellarCode removes the
-historical image payload; an ordinary text prompt therefore returns to `glm-5.1`.
+historical image payload; an ordinary text prompt therefore returns to `glm-5.1`, or to the
+separate primary text provider when cross-provider vision routing is enabled.
 Set `GLM_VISION_MODEL=disabled` only when image routing must be turned off; image bytes
 will then be omitted with an explicit notice.
 
@@ -205,10 +332,11 @@ Plan-and-Execute groups the task DAG into dependency layers. Independent tasks i
 layer run together; dependent tasks wait for the previous layer. Multi-Agent keeps its
 Worker pool and each Worker can also execute independent tool calls concurrently.
 
-Restricted mode gathers dangerous-tool approvals serially before starting the approved
-calls in parallel. This preserves the terminal's single `stdin` owner and prevents a
-batch timeout from leaving an approval prompt running in the background. Command output
-is capped at 8,000 characters before it is returned to the model.
+Restricted mode creates every dangerous-tool approval in a batch before waiting for the
+decisions. Desktop therefore displays the whole approval queue immediately and starts the
+approved calls together after the batch is resolved. The terminal handler keeps its own
+single-`stdin` lock, so CLI prompts remain serialized even though they use the same batching
+code. Command output is capped at 8,000 characters before it is returned to the model.
 
 Configure concurrency and the tool-batch timeout at startup:
 
@@ -232,6 +360,14 @@ keeps the unrestricted command behavior defined by its access contract.
 
 `/clear` clears the current conversation and short-term memory, but keeps long-term
 memory in `long_term_memory.json`.
+
+In the desktop Runtime, short-term memory and Token accounting remain isolated per
+conversation. All loaded conversations in one project share a synchronized project-level
+long-term memory service, so newly saved facts are visible across conversations without a
+Runtime restart and concurrent writes cannot replace newer facts with a stale copy.
+The **Manage → Memory** page exposes this same project store for audit, filtering, explicit
+save/delete, and confirmed clear operations; it does not mix conversation history into the
+long-term fact list.
 
 ## Multi-Agent
 
@@ -278,6 +414,20 @@ Inside StellarCode, build the index before searching:
 /search Where is the ReAct tool-call loop implemented?
 /graph Agent
 ```
+
+The desktop client no longer requires a trip back to `/index`. Open **Settings > Code RAG**,
+add one or more files/folders (or the full workspace), and select **Build index**. Sources are
+stored per desktop project and are de-duplicated before one atomic rebuild, so adding a second
+file does not replace the first file's index. The page reports live progress, indexed files,
+chunks, relations, the active Embedding provider/model, and whether a rebuild is required.
+It also supports rebuilding and clearing the generated SQLite index while retaining the
+source list.
+
+Desktop RAG settings can override the non-secret `EMBEDDING_PROVIDER`, `EMBEDDING_MODEL`, and
+`EMBEDDING_BASE_URL` values for the next Runtime. `EMBEDDING_API_KEY` remains in `.env` or the
+system environment and is never copied into desktop settings. Automatic retrieval is enabled
+by default, which tells ReAct, Plan, and Team agents to use `search_code` for semantic
+codebase questions; it can be switched to explicit-request-only mode.
 
 `/index [path]` rebuilds the index for the workspace or a specified directory. Python files are parsed with the
 standard-library `ast` module; supported non-Python files use line-based chunks. The
@@ -345,14 +495,18 @@ rendering or block automation may not expose readable static content.
 
 ## Skills And Web Access
 
-StellarCode scans three Skill layers at startup. A later layer completely overrides an
-earlier Skill with the same frontmatter `name`:
+StellarCode scans two editable Skill layers at startup. Project Skills completely
+override User Skills with the same frontmatter `name`:
 
 ```text
-1. <installed stellarcode package>/skills/<name>/SKILL.md   builtin
-2. ~/.stellarcode/skills/<name>/SKILL.md                   user
-3. <workspace>/.stellarcode/skills/<name>/SKILL.md         project
+1. ~/.stellarcode/skills/<name>/SKILL.md                   user
+2. <workspace>/.stellarcode/skills/<name>/SKILL.md         project
 ```
+
+Packaged default Skills are templates rather than a third registry layer. On first
+startup, each missing template (for example `web-access`) is copied into the User
+directory. Existing User copies are never overwritten, so every discovered Skill is
+visible and editable in either the User or Project directory.
 
 Only a compact name and description index is added to the system prompt. When a task
 matches a description, the model calls the safe built-in `load_skill` tool. The full
@@ -456,6 +610,14 @@ the `error` state without blocking the others. Configured servers start concurre
 perform the MCP initialize handshake, discover `tools/list`, sanitize input schemas,
 and register names such as `mcp__filesystem__read_file` in the shared ToolRegistry.
 ReAct, Plan, and Multi-Agent Workers can all call the discovered tools.
+
+Desktop users can manage the same runtime from **Settings → MCP Servers**. The page displays
+live `starting`/`ready`/`error`/`disabled` state, safe endpoint metadata, all discovered
+namespaced tools and input schemas, and bounded stderr logs. It supports project-local stdio
+and Streamable HTTP additions, enable/disable, restart, and removal. Adding stdio requires an
+explicit confirmation of the command that will run with the current Windows account. Secret
+environment/header values are not returned to the UI; store `${VARIABLE}` placeholders in
+the MCP config and define their values in the system environment or `.env`.
 
 Manage servers while StellarCode is running:
 
@@ -611,8 +773,8 @@ Switching back to restricted mode is immediate. Every mode change clears session
 "approve all" choices. The old `/hitl on` and `/hitl off` commands only show a migration
 hint and do not change permissions. ReAct, Plan task agents, and Multi-Agent Workers
 share the same live approval registry, so a mode change applies to all three execution
-paths. Concurrent Worker approval prompts are serialized so only one request reads
-terminal input at a time.
+paths. Desktop approval requests can wait concurrently; terminal prompts are serialized so
+only one request reads terminal input at a time.
 
 Full access still runs with the permissions of the Windows/Linux/macOS account that
 started StellarCode. Operating-system ACLs, firewalls, proxies, and endpoint security can

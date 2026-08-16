@@ -221,7 +221,11 @@ class VectorStore:
             "SELECT COUNT(*) FROM code_relations WHERE project_path = ?",
             (self.project_path,),
         ).fetchone()[0]
-        return IndexStats(int(chunk_count), int(relation_count))
+        file_count = self.connection.execute(
+            "SELECT COUNT(DISTINCT file_path) FROM code_chunks WHERE project_path = ?",
+            (self.project_path,),
+        ).fetchone()[0]
+        return IndexStats(int(chunk_count), int(relation_count), int(file_count))
 
     @staticmethod
     def _row_to_result(row: sqlite3.Row, similarity: float) -> SearchResult:

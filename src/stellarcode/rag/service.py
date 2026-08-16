@@ -7,6 +7,7 @@ from stellarcode.rag.embedding import EmbeddingClient
 from stellarcode.rag.index import CodeIndex
 from stellarcode.rag.model import CodeRelation, IndexResult, IndexStats, SearchResult
 from stellarcode.rag.retriever import CodeRetriever
+from stellarcode.rag.store import VectorStore
 
 
 class RagService:
@@ -20,6 +21,13 @@ class RagService:
         self.project_path = self.workspace_path
         self.storage_dir = storage_dir
         self.embedding_client = embedding_client or EmbeddingClient()
+        self._readiness_check: Callable[[], str | None] | None = None
+
+    def set_readiness_check(self, callback: Callable[[], str | None] | None) -> None:
+        self._readiness_check = callback
+
+    def unavailable_reason(self) -> str | None:
+        return self._readiness_check() if self._readiness_check else None
 
     def index(
         self,
@@ -46,6 +54,31 @@ class RagService:
             storage_dir=self.storage_dir,
         ) as retriever:
             return retriever.hybrid_search(query, top_k)
+
+    def index_sources(
+        self,
+        sources: list[str | Path],
+        progress_callback: Callable[[str], None] | None = None,
+    ) -> IndexResult:
+        """Rebuild the workspace namespace from a stable multi-source manifest.
+
+        Unlike the legacy CLI ``index`` method, this never changes ``project_path``.
+        It is therefore safe for a desktop project to add several files or folders.
+        """
+
+        self.project_path = self.workspace_path
+        indexer = CodeIndex(
+            project_path=self.workspace_path,
+            embedding_client=self.embedding_client,
+            storage_dir=self.storage_dir,
+            progress_callback=progress_callback,
+        )
+        return indexer.index_paths(sources)
+
+    def clear(self) -> None:
+        self.project_path = self.workspace_path
+        with VectorStore(self.workspace_path, storage_dir=self.storage_dir) as store:
+            store.clear_project()
 
     def graph(self, name: str) -> list[CodeRelation]:
         with CodeRetriever(

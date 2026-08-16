@@ -26,7 +26,7 @@ from stellarcode.skill import (
     SkillContextBuffer,
     SkillRegistry,
     SkillStateStore,
-    builtin_skills_dir,
+    bootstrap_bundled_skills,
     format_skill_warnings,
     handle_skill_command,
     register_skill_tools,
@@ -291,11 +291,12 @@ def main() -> None:
         trace_recorder=trace_recorder,
     )
     skill_state_store = SkillStateStore(Path.home() / ".stellarcode" / "skills.json")
+    user_skills_dir = Path.home() / ".stellarcode" / "skills"
     skill_registry = SkillRegistry(
-        builtin_dir=builtin_skills_dir(),
-        user_dir=Path.home() / ".stellarcode" / "skills",
+        user_dir=user_skills_dir,
         project_dir=workspace / ".stellarcode" / "skills",
         state_store=skill_state_store,
+        startup_warnings=bootstrap_bundled_skills(user_skills_dir),
     )
     skill_registry.reload()
     skill_context_buffer = SkillContextBuffer()

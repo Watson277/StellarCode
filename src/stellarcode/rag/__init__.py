@@ -12,6 +12,7 @@ from stellarcode.rag.model import (
 )
 from stellarcode.rag.retriever import CodeRetriever
 from stellarcode.rag.service import RagService
+from stellarcode.rag.sources import RagSourceStore
 from stellarcode.rag.store import VectorStore
 from stellarcode.rag.tokenizer import tokenize_query
 
@@ -27,6 +28,7 @@ __all__ = [
     "IndexResult",
     "IndexStats",
     "RagService",
+    "RagSourceStore",
     "SearchResult",
     "SearchResultFormatter",
     "VectorStore",

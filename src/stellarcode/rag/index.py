@@ -13,25 +13,44 @@ from stellarcode.rag.store import VectorStore
 INDEXED_SUFFIXES = {
     ".c",
     ".cpp",
+    ".cs",
+    ".css",
     ".go",
     ".gradle",
     ".h",
     ".html",
+    ".hpp",
+    ".ini",
     ".java",
     ".js",
+    ".jsx",
     ".json",
     ".kt",
     ".md",
+    ".php",
+    ".ps1",
     ".properties",
     ".py",
+    ".rb",
+    ".rst",
     ".rs",
     ".sh",
+    ".sql",
+    ".toml",
     ".ts",
     ".tsx",
+    ".txt",
+    ".vue",
     ".xml",
     ".yaml",
     ".yml",
 }
+
+
+def is_indexable_file(path: str | Path) -> bool:
+    return Path(path).suffix.lower() in INDEXED_SUFFIXES
+
+
 SKIPPED_DIRECTORIES = {
     ".git",
     ".idea",
@@ -66,13 +85,35 @@ class CodeIndex:
 
     def index(self, index_path: str | Path | None = None) -> IndexResult:
         target = self._resolve_target(index_path)
-        if not target.exists():
-            message = f"Path does not exist: {target}"
+        self._emit(f"Starting code index: {target}")
+        return self._index_targets([target])
+
+    def index_paths(self, index_paths: list[str | Path]) -> IndexResult:
+        """Rebuild one project index from several explicitly selected sources."""
+
+        targets = [self._resolve_target(path) for path in index_paths]
+        self._emit(f"Starting code index from {len(targets)} source(s)")
+        return self._index_targets(targets)
+
+    def _index_targets(self, targets: list[Path]) -> IndexResult:
+        if not targets:
+            message = "No index sources were selected"
             self._emit(f"ERROR: {message}")
             return IndexResult(0, 0, 0, 1, message)
 
-        self._emit(f"Starting code index: {target}")
-        files = self._collect_files(target)
+        missing = [target for target in targets if not target.exists()]
+        if missing:
+            message = f"Path does not exist: {missing[0]}"
+            self._emit(f"ERROR: {message}")
+            return IndexResult(0, 0, 0, len(missing), message)
+
+        files = sorted(
+            {
+                file_path.resolve()
+                for target in targets
+                for file_path in self._collect_files(target)
+            }
+        )
         self._emit(f"Discovered {len(files)} file(s) to index")
         entries: list[tuple[CodeChunk, list[float]]] = []
         relations: list[CodeRelation] = []
@@ -142,7 +183,7 @@ class CodeIndex:
 
     def _collect_files(self, target: Path) -> list[Path]:
         if target.is_file():
-            return [target] if target.suffix.lower() in INDEXED_SUFFIXES else []
+            return [target] if is_indexable_file(target) else []
         files = []
         for path in target.rglob("*"):
             if not path.is_file() or path.suffix.lower() not in INDEXED_SUFFIXES:

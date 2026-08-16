@@ -146,13 +146,43 @@ def test_task_executable_requires_completed_dependencies():
 def test_plan_execute_agent_runs_tasks_in_order(tmp_path):
     registry = build_default_registry(tmp_path)
     client = FakePlanClient()
-    agent = PlanExecuteAgent(client, registry)
+    events: list[tuple[str, dict[str, object]]] = []
+    agent = PlanExecuteAgent(
+        client,
+        registry,
+        event_callback=lambda event_type, data: events.append((event_type, data)),
+    )
 
     result = agent.run("write and verify a file")
 
     assert "Plan status: COMPLETED" in result
     assert "task_1 [COMPLETED]" in result
     assert "task_2 [COMPLETED]" in result
+    event_types = [event_type for event_type, _data in events]
+    assert event_types == [
+        "plan.created",
+        "plan.step.started",
+        "plan.step.completed",
+        "plan.step.started",
+        "plan.step.completed",
+    ]
+    created = events[0][1]
+    assert created["summary"] == "write and verify"
+    assert created["execution_order"] == ["task_1", "task_2"]
+    assert created["tasks"] == [
+        {
+            "id": "task_1",
+            "description": "write hello.txt",
+            "task_type": "FILE_WRITE",
+            "dependencies": [],
+        },
+        {
+            "id": "task_2",
+            "description": "read hello.txt and verify it",
+            "task_type": "VERIFICATION",
+            "dependencies": ["task_1"],
+        },
+    ]
 
 
 def test_plan_execute_agent_runs_independent_dag_tasks_in_parallel(tmp_path):
@@ -211,6 +241,39 @@ def test_skip_blocked_tasks_after_failure():
     plan.skip_blocked_tasks("task_1")
 
     assert plan.tasks["task_2"].status == TaskStatus.SKIPPED
+
+
+def test_plan_events_report_failed_and_skipped_steps(tmp_path):
+    class FailingPlanAgent(PlanExecuteAgent):
+        def _execute_task(self, plan, task, cancellation_event=None):
+            raise RuntimeError("boom")
+
+    plan = ExecutionPlan(id="plan_1", goal="failure events")
+    plan.add_task(Task(id="task_1", description="first", type=TaskType.ANALYSIS))
+    plan.add_task(
+        Task(
+            id="task_2",
+            description="blocked",
+            type=TaskType.VERIFICATION,
+            dependencies=["task_1"],
+        )
+    )
+    events: list[tuple[str, dict[str, object]]] = []
+    agent = FailingPlanAgent(
+        FakePlanClient(),
+        build_default_registry(tmp_path),
+        event_callback=lambda event_type, data: events.append((event_type, data)),
+    )
+
+    result = agent.execute_plan(plan)
+
+    assert "Plan status: FAILED" in result
+    assert [(event_type, data.get("step_id")) for event_type, data in events] == [
+        ("plan.created", None),
+        ("plan.step.started", "task_1"),
+        ("plan.step.failed", "task_1"),
+        ("plan.step.skipped", "task_2"),
+    ]
 
 
 def test_should_plan_for_complex_chinese_prompt():

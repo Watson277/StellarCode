@@ -1,17 +1,31 @@
 from __future__ import annotations
 
 import json
+import threading
+import time
 from collections.abc import Callable
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Protocol
 
+from stellarcode.cancellation import (
+    TaskCancelledError,
+    cancellable_call,
+    raise_if_cancelled,
+)
 from stellarcode.image import (
     ImageReferenceParser,
     image_tool_message,
     prune_historical_images,
 )
-from stellarcode.memory import MemoryManager, estimate_tokens
+from stellarcode.llm.types import (
+    ChatResult,
+    chat_with_optional_delta,
+    llm_operation,
+    normalize_chat_result,
+)
+from stellarcode.llm.message_history import repair_tool_message_history
+from stellarcode.memory import ConversationHistoryCompactor, MemoryManager
 from stellarcode.skill import (
     SkillContextBuffer,
     SkillRegistry,
@@ -70,10 +84,15 @@ User messages may contain @image:<path>, @image:"path with spaces", or @clipboar
 When an image attachment is present, inspect the actual image instead of inferring its
 contents from the filename or prior context. Tool-returned images arrive in a following
 user-role attachment message for API compatibility.
+Desktop user messages may also contain @skill:<name> and
+@mcp:<mcp__server__tool> references. An explicitly referenced enabled Skill is loaded
+into that same task. Treat an MCP reference as a preference for that exact discovered
+tool when relevant, not as permission to call it blindly or bypass approval and policy.
 
-For questions about how the current codebase works, use search_code to locate relevant
-symbols and implementations before answering. Use read_file when exact surrounding
-source is needed after retrieval.
+Follow the retrieval policy stated in the search_code tool description. When automatic
+retrieval is enabled, use search_code for questions about how the current codebase works
+before answering; when it is disabled, only use RAG on the user's explicit request. Use
+read_file when exact surrounding source is needed after retrieval.
 """
 
 
@@ -83,7 +102,8 @@ class ChatClient(Protocol):
         messages: list[dict[str, Any]],
         tools: list[dict[str, Any]] | None = None,
         temperature: float = 0.2,
-    ) -> dict[str, Any]:
+        on_delta: Callable[[str], None] | None = None,
+    ) -> ChatResult | dict[str, Any]:
         ...
 
 
@@ -96,10 +116,18 @@ class Agent:
         max_iterations: int = 8,
         memory_manager: MemoryManager | None = None,
         progress_callback: Callable[[str], None] | None = None,
+        event_callback: Callable[[str, dict[str, Any]], None] | None = None,
+        checkpoint_callback: Callable[[str], None] | None = None,
         max_web_search_calls: int = 4,
         skill_registry: SkillRegistry | None = None,
         skill_context_buffer: SkillContextBuffer | None = None,
         workspace: str | Path | None = None,
+        context_window: int = 200_000,
+        history_summary: str = "",
+        history_compaction_count: int = 0,
+        history_last_compacted_at: str | None = None,
+        llm_operation_name: str = "react",
+        stream_output: bool = True,
     ) -> None:
         if max_web_search_calls < 1:
             raise ValueError("max_web_search_calls must be at least 1.")
@@ -109,20 +137,38 @@ class Agent:
         self.base_system_prompt = system_prompt
         self.memory_manager = memory_manager
         self.progress_callback = progress_callback
+        self.event_callback = event_callback
+        self.checkpoint_callback = checkpoint_callback
         self.max_web_search_calls = max_web_search_calls
         self.skill_registry = skill_registry
         self.skill_context_buffer = skill_context_buffer
         self.workspace = Path(workspace or ".").resolve()
         self.image_parser = ImageReferenceParser(self.workspace)
         self._web_search_calls = 0
+        self._current_query = ""
+        self.llm_operation_name = llm_operation_name
+        self.stream_output = stream_output
+        self.history_compactor = ConversationHistoryCompactor(
+            context_window=context_window,
+            summary=history_summary,
+            compaction_count=history_compaction_count,
+            last_compacted_at=history_last_compacted_at,
+        )
         self.messages: list[dict[str, Any]] = [{"role": "system", "content": system_prompt}]
 
     def reset(self) -> None:
         self.messages = [{"role": "system", "content": self.base_system_prompt}]
+        self.history_compactor.reset()
         if self.skill_context_buffer:
             self.skill_context_buffer.clear()
 
-    def run(self, user_input: str) -> str:
+    def run(
+        self,
+        user_input: str,
+        cancellation_event: threading.Event | None = None,
+    ) -> str:
+        raise_if_cancelled(cancellation_event)
+        self._current_query = user_input
         self._web_search_calls = 0
         prune_historical_images(self.messages)
         if self.memory_manager:
@@ -132,15 +178,53 @@ class Agent:
         self.messages.append(
             self.image_parser.user_message(self._prepend_skill_bodies(user_input))
         )
+        self._checkpoint("user_message")
+        return self._run_iterations(cancellation_event)
+
+    def resume(
+        self,
+        original_input: str,
+        cancellation_event: threading.Event | None = None,
+    ) -> str:
+        """Continue a durable ReAct history without repeating the user's turn."""
+
+        raise_if_cancelled(cancellation_event)
+        self._current_query = original_input
+        self._web_search_calls = 0
+        prune_historical_images(self.messages)
+        self.messages, _ = repair_tool_message_history(self.messages)
+        self._refresh_system_prompt(original_input)
+        self.messages.append(
+            {
+                "role": "user",
+                "content": (
+                    "[RUNTIME_RECOVERY] The desktop Sidecar restarted while this task "
+                    "was running. Continue the original request from the durable history. "
+                    "An interrupted tool result means its side effects are unknown: inspect "
+                    "the current workspace or system state before deciding whether to retry. "
+                    "Do not repeat an already confirmed operation."
+                ),
+            }
+        )
+        self._checkpoint("recovery_ready")
+        return self._run_iterations(cancellation_event)
+
+    def _run_iterations(
+        self,
+        cancellation_event: threading.Event | None,
+    ) -> str:
         repeated_failures: dict[tuple[str, str, str], int] = {}
         execution_trace: list[tuple[ToolInvocation, ToolExecutionResult]] = []
 
         for iteration in range(1, self.max_iterations + 1):
+            raise_if_cancelled(cancellation_event)
             try:
-                assistant_message = self.llm_client.chat(
-                    self.messages,
-                    tools=self.tool_registry.schemas(),
+                assistant_message = self._chat(
+                    self.tool_registry.schemas(),
+                    cancellation_event,
                 )
+            except TaskCancelledError:
+                raise
             except Exception as exc:
                 content = (
                     f"LLM request failed on iteration {iteration}/{self.max_iterations}: "
@@ -150,6 +234,7 @@ class Agent:
                 self._record_final_answer(content)
                 return content
             self.messages.append(assistant_message)
+            self._checkpoint("assistant_message")
 
             tool_calls = assistant_message.get("tool_calls") or []
             if not tool_calls:
@@ -160,6 +245,7 @@ class Agent:
             tool_results, execution_results = self._execute_tool_calls(
                 tool_calls,
                 iteration,
+                cancellation_event,
             )
             execution_trace.extend(
                 zip(
@@ -182,18 +268,43 @@ class Agent:
                     if repeated_failures[fingerprint] >= 2:
                         repeated_failure_result = tool_result
             self._append_tool_images(execution_results)
+            self._checkpoint("tool_results")
+            raise_if_cancelled(cancellation_event)
             if repeated_failure_result is not None:
-                return self._finish_after_repeated_failure(repeated_failure_result)
+                return self._finish_after_repeated_failure(
+                    repeated_failure_result,
+                    cancellation_event,
+                )
 
-        return self._finish_after_iteration_limit(execution_trace)
+        return self._finish_after_iteration_limit(execution_trace, cancellation_event)
 
     def _execute_tool_calls(
         self,
         tool_calls: list[dict[str, Any]],
         iteration: int,
+        cancellation_event: threading.Event | None = None,
     ) -> tuple[list[dict[str, Any]], list[ToolExecutionResult]]:
         invocations = [_tool_invocation(tool_call) for tool_call in tool_calls]
         for invocation in invocations:
+            change_preview = self.tool_registry.preview(
+                invocation.name,
+                invocation.arguments,
+            )
+            event_data = {
+                "tool_call_id": invocation.id,
+                "name": invocation.name,
+                "arguments": self.tool_registry.event_arguments(
+                    invocation.name,
+                    invocation.arguments,
+                ),
+                "iteration": iteration,
+            }
+            if change_preview is not None:
+                event_data["change_preview"] = change_preview
+            self._emit_event(
+                "tool.started",
+                event_data,
+            )
             self._emit_progress(
                 f"[Agent {iteration}/{self.max_iterations}] calling "
                 f"{invocation.name} {_format_tool_arguments(invocation.arguments)}"
@@ -223,18 +334,42 @@ class Agent:
             runnable_indexes.append(index)
 
         with activate_skill_context(self.skill_context_buffer):
-            executed = self.tool_registry.execute_tools(runnable)
+            executed = self.tool_registry.execute_tools(
+                runnable,
+                cancellation_event=cancellation_event,
+            )
         for index, result in zip(runnable_indexes, executed):
             results_by_index[index] = result
         results = [result for result in results_by_index if result is not None]
         for result in results:
             failed = not result.success or _is_failed_tool_result(result.result)
             if failed:
+                self._emit_event(
+                    "tool.failed",
+                    {
+                        "tool_call_id": result.id,
+                        "name": result.name,
+                        "error": _truncate_text(result.result, 2000),
+                        "elapsed_ms": result.elapsed_ms,
+                        "timed_out": result.timed_out,
+                    },
+                )
                 self._emit_progress(
                     f"[Tool {result.name}] failed after {result.elapsed_ms} ms: "
                     f"{_truncate_text(result.result, 500)}"
                 )
             else:
+                self._emit_event(
+                    "tool.completed",
+                    {
+                        "tool_call_id": result.id,
+                        "name": result.name,
+                        "result_preview": _truncate_text(result.result, 2000),
+                        "elapsed_ms": result.elapsed_ms,
+                        "success": True,
+                        "has_attachments": bool(result.image_parts),
+                    },
+                )
                 self._emit_progress(
                     f"[Tool {result.name}] completed in {result.elapsed_ms} ms"
                     f"{_tool_result_summary(result)}"
@@ -266,7 +401,10 @@ class Agent:
             memory_context = self.memory_manager.build_context_for_query(query)
             if memory_context:
                 content = f"{content}\n\n{memory_context}"
-        self.messages[0] = {"role": "system", "content": content}
+        self.messages[0] = {
+            "role": "system",
+            "content": self.history_compactor.decorate_system_prompt(content),
+        }
 
     def _prepend_skill_bodies(self, user_input: str) -> str:
         if not self.skill_context_buffer:
@@ -276,7 +414,11 @@ class Agent:
             return user_input
         return f"{loaded}\n用户输入：\n{user_input}"
 
-    def _finish_after_repeated_failure(self, tool_result: dict[str, Any]) -> str:
+    def _finish_after_repeated_failure(
+        self,
+        tool_result: dict[str, Any],
+        cancellation_event: threading.Event | None = None,
+    ) -> str:
         self._emit_progress(
             "[Agent] The same tool call failed twice; requesting a final explanation."
         )
@@ -289,8 +431,11 @@ class Agent:
                 ),
             }
         )
+        self._checkpoint("repeated_failure_prompt")
         try:
-            assistant_message = self.llm_client.chat(self.messages, tools=None)
+            assistant_message = self._chat(None, cancellation_event)
+        except TaskCancelledError:
+            raise
         except Exception as exc:
             content = f"Tool operation failed repeatedly. {tool_result['content']}"
             self._emit_progress(
@@ -299,6 +444,7 @@ class Agent:
             self._record_final_answer(content)
             return content
         self.messages.append(assistant_message)
+        self._checkpoint("assistant_final")
         content = str(assistant_message.get("content") or "").strip()
         if not content:
             content = f"Tool operation failed repeatedly. {tool_result['content']}"
@@ -308,6 +454,7 @@ class Agent:
     def _finish_after_iteration_limit(
         self,
         execution_trace: list[tuple[ToolInvocation, ToolExecutionResult]],
+        cancellation_event: threading.Event | None = None,
     ) -> str:
         self._emit_progress(
             f"[Agent] Reached the {self.max_iterations}-round tool limit; "
@@ -324,15 +471,19 @@ class Agent:
                 ),
             }
         )
+        self._checkpoint("iteration_limit_prompt")
         final_error = ""
         try:
-            assistant_message = self.llm_client.chat(self.messages, tools=None)
+            assistant_message = self._chat(None, cancellation_event)
             self.messages.append(assistant_message)
+            self._checkpoint("assistant_final")
             content = str(assistant_message.get("content") or "").strip()
             if content:
                 self._record_final_answer(content)
                 return content
             final_error = "The model returned no final text even with tools disabled."
+        except TaskCancelledError:
+            raise
         except Exception as exc:
             final_error = (
                 f"Final answer request failed: {type(exc).__name__}: {exc}"
@@ -355,14 +506,143 @@ class Agent:
         except Exception:
             pass
 
+    def _emit_event(self, event_type: str, data: dict[str, Any]) -> None:
+        if not self.event_callback:
+            return
+        try:
+            self.event_callback(event_type, data)
+        except Exception:
+            pass
+
+    def _checkpoint(self, stage: str) -> None:
+        if not self.checkpoint_callback:
+            return
+        try:
+            self.checkpoint_callback(stage)
+        except Exception:
+            # A checkpoint is a recovery aid; an I/O failure must not mutate the
+            # in-memory message list halfway through the active turn.
+            pass
+
     def _record_final_answer(self, content: str) -> None:
         if not self.memory_manager:
             return
         self.memory_manager.add_assistant_message(content)
-        self.memory_manager.token_budget.record_usage(
-            estimate_tokens(str(self.messages)),
-            estimate_tokens(content),
+
+    def history_snapshot(self) -> dict[str, Any]:
+        return self.history_compactor.snapshot()
+
+    def _chat(
+        self,
+        tools: list[dict[str, Any]] | None,
+        cancellation_event: threading.Event | None,
+    ) -> dict[str, Any]:
+        compaction_needed = self.history_compactor.needs_compaction(self.messages, tools)
+        compaction = None
+        if compaction_needed:
+            self._emit_event(
+                "history.compaction.started",
+                {
+                    "estimated_tokens": self.history_compactor.estimated_tokens(
+                        self.messages,
+                        tools,
+                    ),
+                    "trigger_tokens": self.history_compactor.trigger_tokens,
+                },
+            )
+        try:
+            compaction = self.history_compactor.maybe_compact(
+                self.messages,
+                tools,
+                self.llm_client,
+                cancellation_event,
+            )
+            if compaction is not None:
+                self.messages = compaction.messages
+                self._refresh_system_prompt(self._current_query)
+                self._checkpoint("history_compacted")
+                self._emit_event(
+                    "history.compacted",
+                    {
+                        "before_tokens": compaction.before_tokens,
+                        "after_tokens": compaction.after_tokens,
+                        "compacted_turns": compaction.compacted_turns,
+                        "method": compaction.method,
+                        "compaction_count": compaction.compaction_count,
+                    },
+                )
+        finally:
+            if compaction_needed:
+                self._emit_event(
+                    "history.compaction.finished",
+                    {"compacted": compaction is not None},
+                )
+        pending_delta: list[str] = []
+        pending_chars = 0
+        last_flush = time.monotonic()
+        emitted_delta = False
+
+        def flush_delta() -> None:
+            nonlocal emitted_delta, pending_chars, last_flush
+            if cancellation_event is not None and cancellation_event.is_set():
+                pending_delta.clear()
+                pending_chars = 0
+                return
+            if not pending_delta:
+                return
+            text = "".join(pending_delta)
+            pending_delta.clear()
+            pending_chars = 0
+            last_flush = time.monotonic()
+            emitted_delta = True
+            self._emit_event("assistant.delta", {"text": text})
+
+        def collect_delta(text: str) -> None:
+            nonlocal pending_chars
+            if (
+                not text
+                or cancellation_event is not None
+                and cancellation_event.is_set()
+            ):
+                return
+            pending_delta.append(text)
+            pending_chars += len(text)
+            if pending_chars >= 48 or time.monotonic() - last_flush >= 0.05:
+                flush_delta()
+
+        delta_callback = (
+            collect_delta if self.stream_output and self.event_callback is not None else None
         )
+        try:
+            with llm_operation(self.llm_operation_name):
+                raw = cancellable_call(
+                    lambda: chat_with_optional_delta(
+                        self.llm_client,
+                        self.messages,
+                        tools=tools,
+                        temperature=0.2,
+                        on_delta=delta_callback,
+                    ),
+                    cancellation_event,
+                )
+        finally:
+            flush_delta()
+        result = normalize_chat_result(
+            raw,
+            client=self.llm_client,
+            messages=self.messages,
+            tools=tools,
+        )
+        if emitted_delta and result.message.get("tool_calls"):
+            # A model may emit a short preamble before requesting tools. Remove that
+            # provisional text so the following final-answer stream does not append to it.
+            self._emit_event("assistant.delta", {"text": "", "reset": True})
+        if self.memory_manager:
+            self.memory_manager.token_budget.record_usage(
+                result.usage.input_tokens,
+                result.usage.output_tokens,
+            )
+        return result.message
 
 
 def _tool_failure_fingerprint(
@@ -423,6 +703,18 @@ def _format_tool_arguments(
         except (json.JSONDecodeError, TypeError):
             rendered = str(arguments)
     return _truncate_text(rendered, max_chars)
+
+
+def _arguments_object(arguments: str | dict[str, Any] | None) -> dict[str, Any]:
+    if isinstance(arguments, dict):
+        return arguments
+    if not arguments:
+        return {}
+    try:
+        parsed = json.loads(arguments)
+    except (json.JSONDecodeError, TypeError):
+        return {"value": str(arguments)}
+    return parsed if isinstance(parsed, dict) else {"value": parsed}
 
 
 def _iteration_limit_diagnostic(

@@ -1,11 +1,18 @@
 from __future__ import annotations
 
+import threading
 from pathlib import Path
 from typing import Any
 
 from stellarcode.agent import ChatClient, runtime_context
+from stellarcode.cancellation import (
+    TaskCancelledError,
+    cancellable_call,
+    raise_if_cancelled,
+)
 from stellarcode.image import ImageReferenceParser, image_tool_message, prune_historical_images
-from stellarcode.memory import MemoryManager
+from stellarcode.llm.types import llm_operation, normalize_chat_result
+from stellarcode.memory import ConversationHistoryCompactor, MemoryManager
 from stellarcode.multi_agent.message import AgentMessage, MessageType
 from stellarcode.multi_agent.role import AgentRole
 from stellarcode.skill import (
@@ -68,7 +75,7 @@ slightly different searches after the available search budget is exhausted.
 Return independent tool calls together in one response so they can run in parallel.
 Keep dependent tool calls in separate rounds.
 Avoid full-disk recursive scans; narrow exploration with list_dir and search_code.
-For codebase-understanding tasks, use search_code before guessing, then use read_file
+For codebase-understanding tasks, follow the search_code tool's retrieval policy, then use read_file
 when exact surrounding source is needed.
 Inputs can contain @image:<path> or @clipboard attachments. Inspect attached image
 content directly and do not infer it from a filename.
@@ -111,6 +118,7 @@ class SubAgent:
         skill_registry: SkillRegistry | None = None,
         skill_context_buffer: SkillContextBuffer | None = None,
         workspace: str | Path | None = None,
+        context_window: int = 200_000,
     ) -> None:
         if max_web_search_calls < 1:
             raise ValueError("max_web_search_calls must be at least 1.")
@@ -127,6 +135,9 @@ class SubAgent:
         self.skill_context_buffer = skill_context_buffer
         self.workspace = Path(workspace or ".").resolve()
         self.image_parser = ImageReferenceParser(self.workspace)
+        self._current_query = ""
+        self.context_window = context_window
+        self.history_compactor = ConversationHistoryCompactor(context_window=context_window)
         self.messages: list[dict[str, Any]] = [
             {"role": "system", "content": self.base_system_prompt}
         ]
@@ -137,10 +148,16 @@ class SubAgent:
 
     def clear_history(self) -> None:
         self.messages = [{"role": "system", "content": self.base_system_prompt}]
+        self.history_compactor.reset()
         if self.skill_context_buffer:
             self.skill_context_buffer.clear()
 
-    def execute(self, task: AgentMessage) -> AgentMessage:
+    def execute(
+        self,
+        task: AgentMessage,
+        cancellation_event: threading.Event | None = None,
+    ) -> AgentMessage:
+        raise_if_cancelled(cancellation_event)
         if task.type != MessageType.TASK:
             return AgentMessage.error(
                 self.name,
@@ -149,6 +166,7 @@ class SubAgent:
             )
 
         self._web_search_calls = 0
+        self._current_query = task.content
         prune_historical_images(self.messages)
         self._refresh_system_prompt(task.content)
         self.messages.append(
@@ -156,11 +174,11 @@ class SubAgent:
         )
 
         for _ in range(self.max_iterations):
+            raise_if_cancelled(cancellation_event)
             try:
-                response = self.llm_client.chat(
-                    self.messages,
-                    tools=self.tool_registry.schemas() if self.should_use_tools else None,
-                )
+                response = self._chat(cancellation_event)
+            except TaskCancelledError:
+                raise
             except Exception as exc:
                 return AgentMessage.error(self.name, self.role, f"LLM call failed: {exc}")
 
@@ -173,7 +191,10 @@ class SubAgent:
                         self.role,
                         f"{self.role.value} is not allowed to call tools.",
                     )
-                self.messages.extend(self._execute_tool_calls(tool_calls))
+                self.messages.extend(
+                    self._execute_tool_calls(tool_calls, cancellation_event)
+                )
+                raise_if_cancelled(cancellation_event)
                 continue
 
             return AgentMessage.result(
@@ -188,22 +209,39 @@ class SubAgent:
             f"Stopped after {self.max_iterations} iterations without a final result.",
         )
 
-    def execute_with_context(self, task: AgentMessage, context: str) -> AgentMessage:
+    def execute_with_context(
+        self,
+        task: AgentMessage,
+        context: str,
+        cancellation_event: threading.Event | None = None,
+    ) -> AgentMessage:
         content = task.content
         if context.strip():
             content = f"{context.strip()}\n\nCurrent task:\n{task.content}"
-        return self.execute(AgentMessage.task(task.from_agent, content))
+        return self.execute(
+            AgentMessage.task(task.from_agent, content),
+            cancellation_event,
+        )
 
-    def review(self, original_task: str, execution_result: str) -> AgentMessage:
+    def review(
+        self,
+        original_task: str,
+        execution_result: str,
+        cancellation_event: threading.Event | None = None,
+    ) -> AgentMessage:
         review_input = (
             f"Original task:\n{original_task}\n\n"
             f"Execution result:\n{execution_result}"
         )
-        return self.execute(AgentMessage.task("orchestrator", review_input))
+        return self.execute(
+            AgentMessage.task("orchestrator", review_input),
+            cancellation_event,
+        )
 
     def _execute_tool_calls(
         self,
         tool_calls: list[dict[str, Any]],
+        cancellation_event: threading.Event | None = None,
     ) -> list[dict[str, Any]]:
         invocations = []
         for tool_call in tool_calls:
@@ -238,7 +276,10 @@ class SubAgent:
             runnable.append(invocation)
             runnable_indexes.append(index)
         with activate_skill_context(self.skill_context_buffer):
-            executed = self.tool_registry.execute_tools(runnable)
+            executed = self.tool_registry.execute_tools(
+                runnable,
+                cancellation_event=cancellation_event,
+            )
         for index, result in zip(runnable_indexes, executed):
             results_by_index[index] = result
         results = [result for result in results_by_index if result is not None]
@@ -267,10 +308,45 @@ class SubAgent:
             memory_context = self.memory_manager.build_context_for_query(query)
             if memory_context:
                 prompt = f"{prompt}\n\n{memory_context}"
-        self.messages[0] = {"role": "system", "content": prompt}
+        self.messages[0] = {
+            "role": "system",
+            "content": self.history_compactor.decorate_system_prompt(prompt),
+        }
 
     def _prepend_skill_bodies(self, content: str) -> str:
         if not self.skill_context_buffer:
             return content
         loaded = self.skill_context_buffer.drain()
         return f"{loaded}\n{content}" if loaded else content
+
+    def _chat(
+        self,
+        cancellation_event: threading.Event | None,
+    ) -> dict[str, Any]:
+        tools = self.tool_registry.schemas() if self.should_use_tools else None
+        compaction = self.history_compactor.maybe_compact(
+            self.messages,
+            tools,
+            self.llm_client,
+            cancellation_event,
+        )
+        if compaction is not None:
+            self.messages = compaction.messages
+            self._refresh_system_prompt(self._current_query)
+        with llm_operation(f"team-{self.role.value.lower()}"):
+            raw = cancellable_call(
+                lambda: self.llm_client.chat(self.messages, tools=tools),
+                cancellation_event,
+            )
+        result = normalize_chat_result(
+            raw,
+            client=self.llm_client,
+            messages=self.messages,
+            tools=tools,
+        )
+        if self.memory_manager:
+            self.memory_manager.token_budget.record_usage(
+                result.usage.input_tokens,
+                result.usage.output_tokens,
+            )
+        return result.message

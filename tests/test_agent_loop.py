@@ -1,10 +1,16 @@
 from __future__ import annotations
 
 import json
+import threading
+import time
 from typing import Any
 
+import pytest
+
 from stellarcode.agent import Agent
-from stellarcode.tools import ToolDefinition, ToolRegistry, build_default_registry
+from stellarcode.cancellation import TaskCancelledError
+from stellarcode.llm.message_history import INTERRUPTED_TOOL_RESULT
+from stellarcode.tools import ToolDefinition, ToolOutput, ToolRegistry, build_default_registry
 
 
 class FakeClient:
@@ -36,6 +42,26 @@ class FakeClient:
         return {"role": "assistant", "content": "The todo says: ship chapter one."}
 
 
+def test_agent_stops_waiting_for_a_blocking_llm_request_when_cancelled(tmp_path):
+    cancellation_event = threading.Event()
+
+    class BlockingClient:
+        def chat(self, messages, tools=None, temperature=0.2):
+            time.sleep(5)
+            return {"role": "assistant", "content": "too late"}
+
+    threading.Timer(0.05, cancellation_event.set).start()
+    started = time.monotonic()
+
+    with pytest.raises(TaskCancelledError, match="cancelled by user"):
+        Agent(BlockingClient(), build_default_registry(tmp_path)).run(
+            "wait",
+            cancellation_event,
+        )
+
+    assert time.monotonic() - started < 1
+
+
 def test_agent_executes_tool_call_and_returns_final_answer(tmp_path):
     (tmp_path / "todo.txt").write_text("ship chapter one", encoding="utf-8")
     registry = build_default_registry(tmp_path)
@@ -49,6 +75,47 @@ def test_agent_executes_tool_call_and_returns_final_answer(tmp_path):
     assert agent.messages[-2]["role"] == "tool"
     assert agent.messages[-2]["content"] == "ship chapter one"
     assert "Current local date:" in agent.messages[0]["content"]
+
+
+def test_agent_resume_repairs_an_inflight_tool_and_requires_state_verification(tmp_path):
+    checkpoint_stages: list[str] = []
+
+    class RecoveryClient:
+        def chat(self, messages, tools=None, temperature=0.2):
+            assert any(
+                message.get("role") == "tool"
+                and message.get("content") == INTERRUPTED_TOOL_RESULT
+                for message in messages
+            )
+            assert "inspect the current workspace or system state" in messages[-1]["content"]
+            return {"role": "assistant", "content": "Verified state and continued safely."}
+
+    agent = Agent(
+        RecoveryClient(),
+        build_default_registry(tmp_path),
+        checkpoint_callback=checkpoint_stages.append,
+    )
+    agent.messages.append(
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": "call-interrupted",
+                    "type": "function",
+                    "function": {
+                        "name": "write_file",
+                        "arguments": '{"path":"demo.txt","content":"value"}',
+                    },
+                }
+            ],
+        }
+    )
+
+    answer = agent.resume("write demo.txt")
+
+    assert answer == "Verified state and continued safely."
+    assert checkpoint_stages == ["recovery_ready", "assistant_message"]
 
 
 def test_agent_reports_tool_calls_and_results_through_progress_callback(tmp_path):
@@ -310,3 +377,75 @@ def test_agent_limits_different_web_search_queries_per_task():
     ]
     assert agent.messages[-2]["content"].startswith("[WEB_POLICY]")
     assert any("stub, 1, high" in message for message in progress)
+
+
+def test_agent_emits_coalesced_assistant_deltas_before_final_answer():
+    class StreamingClient:
+        def chat(self, messages, tools=None, temperature=0.2, on_delta=None):
+            assert on_delta is not None
+            on_delta("hello ")
+            on_delta("world")
+            return {"role": "assistant", "content": "hello world"}
+
+    events: list[tuple[str, dict[str, Any]]] = []
+    agent = Agent(
+        StreamingClient(),
+        ToolRegistry(),
+        event_callback=lambda event_type, data: events.append((event_type, data)),
+    )
+
+    answer = agent.run("say hello")
+
+    assert answer == "hello world"
+    assert "".join(
+        data["text"] for event_type, data in events if event_type == "assistant.delta"
+    ) == "hello world"
+
+
+def test_agent_resets_provisional_stream_when_model_requests_a_tool():
+    class StreamingToolClient:
+        def __init__(self):
+            self.calls = 0
+
+        def chat(self, messages, tools=None, temperature=0.2, on_delta=None):
+            self.calls += 1
+            assert on_delta is not None
+            if self.calls == 1:
+                on_delta("I will inspect it first.")
+                return {
+                    "role": "assistant",
+                    "content": "I will inspect it first.",
+                    "tool_calls": [
+                        {
+                            "id": "call-1",
+                            "type": "function",
+                            "function": {"name": "echo", "arguments": "{}"},
+                        }
+                    ],
+                }
+            on_delta("Final answer")
+            return {"role": "assistant", "content": "Final answer"}
+
+    registry = ToolRegistry()
+    registry.register(
+        ToolDefinition(
+            name="echo",
+            description="echo",
+            parameters={"type": "object", "properties": {}},
+            handler=lambda: ToolOutput("ok"),
+        )
+    )
+    events: list[tuple[str, dict[str, Any]]] = []
+    agent = Agent(
+        StreamingToolClient(),
+        registry,
+        event_callback=lambda event_type, data: events.append((event_type, data)),
+    )
+
+    assert agent.run("inspect") == "Final answer"
+    deltas = [data for event_type, data in events if event_type == "assistant.delta"]
+    assert deltas == [
+        {"text": "I will inspect it first."},
+        {"text": "", "reset": True},
+        {"text": "Final answer"},
+    ]

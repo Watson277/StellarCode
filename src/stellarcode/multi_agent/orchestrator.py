@@ -3,12 +3,15 @@ from __future__ import annotations
 import json
 import queue
 import re
+import threading
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
+from contextvars import copy_context
 from dataclasses import dataclass
 from pathlib import Path
 
 from stellarcode.agent import ChatClient
+from stellarcode.cancellation import TaskCancelledError, raise_if_cancelled
 from stellarcode.memory import MemoryManager
 from stellarcode.multi_agent.message import AgentMessage, MessageType
 from stellarcode.multi_agent.role import AgentRole
@@ -48,6 +51,7 @@ class AgentOrchestrator:
         progress_callback: Callable[[str], None] | None = None,
         skill_registry: SkillRegistry | None = None,
         workspace: str | Path | None = None,
+        context_window: int = 200_000,
     ) -> None:
         if worker_count < 1:
             raise ValueError("worker_count must be at least 1.")
@@ -62,6 +66,7 @@ class AgentOrchestrator:
         self.progress_callback = progress_callback
         self.skill_registry = skill_registry
         self.workspace = Path(workspace or ".").resolve()
+        self.context_window = context_window
         self.plan_parser = Planner(llm_client, self.workspace)
         self.planner = self._new_sub_agent("planner", AgentRole.PLANNER)
         self.workers = [
@@ -73,31 +78,40 @@ class AgentOrchestrator:
         self.last_step_results: dict[str, StepExecutionResult] = {}
         self._worker_cursor = 0
 
-    def run(self, user_input: str) -> str:
+    def run(
+        self,
+        user_input: str,
+        cancellation_event: threading.Event | None = None,
+    ) -> str:
+        raise_if_cancelled(cancellation_event)
         if self.memory_manager:
             self.memory_manager.add_user_message(user_input)
 
         try:
-            plan = self.create_plan(user_input)
+            plan = self.create_plan(user_input, cancellation_event)
         except (MultiAgentError, PlanValidationError, json.JSONDecodeError) as exc:
             result = f"Multi-Agent planning failed: {exc}"
             if self.memory_manager:
                 self.memory_manager.add_assistant_message(result)
             return result
 
-        result = self.execute_plan(plan)
+        result = self.execute_plan(plan, cancellation_event)
         if self.memory_manager:
             self.memory_manager.add_assistant_message(result)
         return result
 
-    def create_plan(self, user_input: str) -> ExecutionPlan:
+    def create_plan(
+        self,
+        user_input: str,
+        cancellation_event: threading.Event | None = None,
+    ) -> ExecutionPlan:
         self._emit("Multi-Agent phase 1/2: planner is creating the execution DAG...")
         task = AgentMessage.task(
             "orchestrator",
             f"Create an execution plan for this user goal:\n{user_input}",
         )
         try:
-            response = self.planner.execute(task)
+            response = self.planner.execute(task, cancellation_event)
         finally:
             self.planner.clear_history()
 
@@ -114,7 +128,12 @@ class AgentOrchestrator:
     def preview_plan(self, user_input: str) -> str:
         return self.create_plan(user_input).visualize()
 
-    def execute_plan(self, plan: ExecutionPlan) -> str:
+    def execute_plan(
+        self,
+        plan: ExecutionPlan,
+        cancellation_event: threading.Event | None = None,
+    ) -> str:
+        raise_if_cancelled(cancellation_event)
         self.last_plan = plan
         self.last_step_results = {}
         try:
@@ -128,6 +147,7 @@ class AgentOrchestrator:
         batch_index = 0
 
         while True:
+            raise_if_cancelled(cancellation_event)
             batch = plan.executable_tasks()
             if not batch:
                 break
@@ -139,7 +159,7 @@ class AgentOrchestrator:
 
             for task in batch:
                 task.mark_started()
-            outcomes = self._run_batch(plan, batch)
+            outcomes = self._run_batch(plan, batch, cancellation_event)
             for task in batch:
                 outcome = outcomes[task.id]
                 self.last_step_results[task.id] = outcome
@@ -221,6 +241,7 @@ class AgentOrchestrator:
         self,
         plan: ExecutionPlan,
         batch: list[Task],
+        cancellation_event: threading.Event | None = None,
     ) -> dict[str, StepExecutionResult]:
         contexts = {task.id: self._build_step_context(plan, task) for task in batch}
         if len(batch) == 1:
@@ -231,7 +252,11 @@ class AgentOrchestrator:
                 worker.clear_history()
                 return {
                     batch[0].id: self._run_step(
-                        batch[0], worker, reviewer, contexts[batch[0].id]
+                        batch[0],
+                        worker,
+                        reviewer,
+                        contexts[batch[0].id],
+                        cancellation_event,
                     )
                 }
             finally:
@@ -247,7 +272,15 @@ class AgentOrchestrator:
             reviewer = self._new_sub_agent(f"reviewer-{task.id}", AgentRole.REVIEWER)
             try:
                 worker.clear_history()
-                return self._run_step(task, worker, reviewer, contexts[task.id])
+                return self._run_step(
+                    task,
+                    worker,
+                    reviewer,
+                    contexts[task.id],
+                    cancellation_event,
+                )
+            except TaskCancelledError:
+                raise
             except Exception as exc:
                 return StepExecutionResult(
                     task_id=task.id,
@@ -265,7 +298,10 @@ class AgentOrchestrator:
             max_workers=parallelism,
             thread_name_prefix="stellarcode-team",
         ) as executor:
-            futures = {task.id: executor.submit(run_parallel, task) for task in batch}
+            futures = {
+                task.id: executor.submit(copy_context().run, run_parallel, task)
+                for task in batch
+            }
             return {task.id: futures[task.id].result() for task in batch}
 
     def _run_step(
@@ -274,9 +310,15 @@ class AgentOrchestrator:
         worker: SubAgent,
         reviewer: SubAgent,
         context: str,
+        cancellation_event: threading.Event | None = None,
     ) -> StepExecutionResult:
+        raise_if_cancelled(cancellation_event)
         task_message = AgentMessage.task("orchestrator", task.description)
-        worker_result = worker.execute_with_context(task_message, context)
+        worker_result = worker.execute_with_context(
+            task_message,
+            context,
+            cancellation_event,
+        )
         if worker_result.type == MessageType.ERROR:
             return StepExecutionResult(
                 task_id=task.id,
@@ -293,7 +335,11 @@ class AgentOrchestrator:
             )
 
         accepted_result = worker_result.content
-        review = reviewer.review(task.description, accepted_result)
+        review = reviewer.review(
+            task.description,
+            accepted_result,
+            cancellation_event,
+        )
         reviewer.clear_history()
         if review.type == MessageType.ERROR:
             return StepExecutionResult(
@@ -310,12 +356,17 @@ class AgentOrchestrator:
         retries = 0
 
         while not approved and retries < self.max_retries_per_step:
+            raise_if_cancelled(cancellation_event)
             retries += 1
             retry_context = (
                 f"{context}\n\nThe previous result was rejected by the reviewer.\n"
                 f"Review feedback:\n{feedback}"
             )
-            retry_result = worker.execute_with_context(task_message, retry_context)
+            retry_result = worker.execute_with_context(
+                task_message,
+                retry_context,
+                cancellation_event,
+            )
             if retry_result.type == MessageType.ERROR:
                 feedback = retry_result.content
                 continue
@@ -324,7 +375,11 @@ class AgentOrchestrator:
                 continue
 
             accepted_result = retry_result.content
-            review = reviewer.review(task.description, accepted_result)
+            review = reviewer.review(
+                task.description,
+                accepted_result,
+                cancellation_event,
+            )
             reviewer.clear_history()
             if review.type == MessageType.ERROR:
                 return StepExecutionResult(
@@ -405,6 +460,7 @@ class AgentOrchestrator:
             skill_registry=self.skill_registry,
             skill_context_buffer=SkillContextBuffer(),
             workspace=self.workspace,
+            context_window=self.context_window,
         )
 
     def _emit(self, message: str) -> None:

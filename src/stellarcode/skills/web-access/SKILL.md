@@ -58,7 +58,7 @@ navigate_page → wait_for → take_snapshot → 提取目标内容
 - `site-patterns/xiaohongshu.com.md`
 - `site-patterns/juejin.cn.md`
 
-新经验应写入用户层 `~/.stellarcode/skills/web-access/references/site-patterns/<domain>.md`，不要修改包内 builtin 文件。创建用户层同名 Skill 后，执行 `/skill reload` 即可整体覆盖内置版本。
+新经验应写入用户层 `~/.stellarcode/skills/web-access/references/site-patterns/<domain>.md`。默认模板首次启动时会安装到此目录，并且不会覆盖已有的用户版本；修改后执行 `/skill reload` 即可生效。
 
 ## 并发边界
 

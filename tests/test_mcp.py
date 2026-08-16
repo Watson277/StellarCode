@@ -20,6 +20,7 @@ from stellarcode.mcp import (
     McpClient,
     McpConfigError,
     McpConfigLoader,
+    McpServerConfig,
     McpServerManager,
     McpServerStatus,
     McpTransport,
@@ -159,6 +160,58 @@ def test_config_prepare_isolates_missing_variable_and_invalid_transport(tmp_path
         loader.prepare(servers["missing"])
     with pytest.raises(McpConfigError, match="exactly one"):
         loader.prepare(servers["both"])
+
+
+def test_project_config_crud_preserves_document_and_secret_placeholders(
+    tmp_path,
+    monkeypatch,
+):
+    project_config = tmp_path / ".stellarcode" / "mcp.json"
+    project_config.parent.mkdir()
+    project_config.write_text(
+        json.dumps({"formatVersion": 1, "mcpServers": {"existing": {"command": "old"}}}),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("MCP_DESKTOP_TOKEN", "must-not-be-written")
+    loader = McpConfigLoader(
+        tmp_path,
+        tmp_path / "user.json",
+        project_config,
+    )
+
+    installed = loader.install_project_server(
+        "custom-server",
+        McpServerConfig(
+            command="runner",
+            args=["${PROJECT_DIR}"],
+            env={"TOKEN": "${MCP_DESKTOP_TOKEN}"},
+        ),
+    )
+    stored = json.loads(project_config.read_text(encoding="utf-8"))
+
+    assert installed.source == "project"
+    assert stored["formatVersion"] == 1
+    assert stored["mcpServers"]["existing"]["command"] == "old"
+    assert stored["mcpServers"]["custom-server"]["env"]["TOKEN"] == "${MCP_DESKTOP_TOKEN}"
+    assert "must-not-be-written" not in project_config.read_text(encoding="utf-8")
+    assert loader.load()["custom-server"].source == "project"
+
+    loader.remove_project_server("custom-server")
+    remaining = json.loads(project_config.read_text(encoding="utf-8"))
+    assert set(remaining["mcpServers"]) == {"existing"}
+
+
+def test_project_config_rejects_invalid_server_names_and_http_urls(tmp_path):
+    loader = McpConfigLoader(
+        tmp_path,
+        tmp_path / "user.json",
+        tmp_path / ".stellarcode" / "mcp.json",
+    )
+
+    with pytest.raises(McpConfigError, match="letters"):
+        loader.install_project_server("bad server", McpServerConfig(command="runner"))
+    with pytest.raises(McpConfigError, match="http"):
+        loader.install_project_server("remote", McpServerConfig(url="file:///tmp/mcp"))
 
 
 def test_schema_sanitizer_removes_refs_and_flattens_alternatives():
@@ -446,6 +499,76 @@ def test_server_manager_registers_invokes_and_unloads_namespaced_tools(tmp_path)
     manager.disable("demo")
     with pytest.raises(ToolExecutionError, match="Unknown tool"):
         registry.execute("mcp__demo__echo", {"text": "hello"})
+
+
+def test_server_manager_project_management_updates_snapshot_and_registry(
+    tmp_path,
+    monkeypatch,
+):
+    transport = LoopbackTransport(
+        {
+            "initialize": {"capabilities": {"tools": {}}},
+            "tools/list": {
+                "tools": [
+                    {
+                        "name": "echo",
+                        "description": "Echo text",
+                        "inputSchema": {"type": "object", "properties": {}},
+                    }
+                ]
+            },
+        }
+    )
+    registry = ToolRegistry()
+    statuses: list[str] = []
+    loader = McpConfigLoader(
+        tmp_path,
+        tmp_path / "user.json",
+        tmp_path / ".stellarcode" / "mcp.json",
+    )
+    manager = McpServerManager(
+        registry,
+        tmp_path,
+        config_loader=loader,
+        transport_factory=lambda _config, _project: transport,
+        status_callback=lambda server: statuses.append(server.status.value),
+    )
+    manager.load_configured_servers()
+    monkeypatch.setenv("MCP_MANAGER_TOKEN", "runtime-secret")
+
+    manager.install(
+        "demo",
+        McpServerConfig(
+            command="memory",
+            env={"CUSTOM": "${MCP_MANAGER_TOKEN}"},
+        ),
+    )
+    ready = manager.snapshot()
+
+    assert ready["ready_servers"] == 1
+    assert ready["total_tools"] == 1
+    assert ready["servers"][0]["tools"][0]["namespaced_name"] == "mcp__demo__echo"
+    assert ready["servers"][0]["env_keys"] == ["CUSTOM"]
+    assert "runtime-secret" not in json.dumps(ready)
+    assert any(tool.name == "mcp__demo__echo" for tool in registry.list_tools())
+
+    manager.set_enabled("demo", False)
+    assert manager.snapshot()["servers"][0]["status"] == "disabled"
+    assert all(tool.name != "mcp__demo__echo" for tool in registry.list_tools())
+    stored = json.loads(loader.project_config.read_text(encoding="utf-8"))
+    assert stored["mcpServers"]["demo"]["disabled"] is True
+    assert stored["mcpServers"]["demo"]["env"]["CUSTOM"] == "${MCP_MANAGER_TOKEN}"
+
+    manager.set_enabled("demo", True)
+    assert manager.snapshot()["servers"][0]["status"] == "ready"
+    assert any(tool.name == "mcp__demo__echo" for tool in registry.list_tools())
+
+    manager.remove_project_server("demo")
+    assert manager.snapshot()["servers"] == []
+    assert all(tool.name != "mcp__demo__echo" for tool in registry.list_tools())
+    assert "starting" in statuses
+    assert "ready" in statuses
+    assert "disabled" in statuses
 
 
 def test_one_bad_server_does_not_block_a_good_server(tmp_path):

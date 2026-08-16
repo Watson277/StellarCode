@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import os
 import time
-from typing import Any
+from typing import Any, Callable
 
 from stellarcode.image import strip_images_for_text_model
+from stellarcode.llm.openai_stream import consume_chat_completion_stream
+from stellarcode.llm.types import ChatResult, TokenUsage
 
 
 class AgnesApiError(RuntimeError):
@@ -70,7 +72,8 @@ class AgnesClient:
         messages: list[dict[str, Any]],
         tools: list[dict[str, Any]] | None = None,
         temperature: float = 0.2,
-    ) -> dict[str, Any]:
+        on_delta: Callable[[str], None] | None = None,
+    ) -> ChatResult:
         try:
             import httpx
         except ModuleNotFoundError as exc:
@@ -88,31 +91,85 @@ class AgnesClient:
         if tools:
             payload["tools"] = tools
             payload["tool_choice"] = "auto"
+        if on_delta is not None:
+            payload["stream"] = True
+            payload["stream_options"] = {"include_usage": True}
 
         headers = {
             "Authorization": f"Bearer {self.api_key}",
             "Content-Type": "application/json",
         }
+        if on_delta is not None:
+            message, raw_usage = self._stream_chat(
+                httpx,
+                payload,
+                headers,
+                request_model,
+                on_delta,
+            )
+        else:
+            with httpx.Client(timeout=self.timeout_seconds) as client:
+                for attempt in range(self.max_retries + 1):
+                    response = client.post(self.base_url, headers=headers, json=payload)
+                    if not response.is_error:
+                        break
+                    error = _agnes_api_error(response, request_model)
+                    if not error.retryable or attempt >= self.max_retries:
+                        raise error
+                    delay = _retry_delay_seconds(response, attempt, self.retry_base_seconds)
+                    if delay > 0:
+                        time.sleep(delay)
+                data = response.json()
+
+            choices = data.get("choices") or []
+            if not choices:
+                raise RuntimeError(f"Agnes response has no choices: {data}")
+            message = choices[0].get("message")
+            if not isinstance(message, dict):
+                raise RuntimeError(f"Agnes response has no message: {data}")
+            raw_usage = data.get("usage")
+        return ChatResult(
+            message=message,
+            usage=TokenUsage.from_api(
+                raw_usage,
+                messages=prepared_messages,
+                tools=tools,
+                response_message=message,
+            ),
+            provider=self.provider_name,
+            model=request_model,
+        )
+
+    def _stream_chat(
+        self,
+        httpx: Any,
+        payload: dict[str, Any],
+        headers: dict[str, str],
+        request_model: str,
+        on_delta: Callable[[str], None],
+    ) -> tuple[dict[str, Any], dict[str, Any] | None]:
+        attempt = 0
         with httpx.Client(timeout=self.timeout_seconds) as client:
-            for attempt in range(self.max_retries + 1):
-                response = client.post(self.base_url, headers=headers, json=payload)
-                if not response.is_error:
-                    break
-                error = _agnes_api_error(response, request_model)
-                if not error.retryable or attempt >= self.max_retries:
-                    raise error
-                delay = _retry_delay_seconds(response, attempt, self.retry_base_seconds)
+            while True:
+                with client.stream(
+                    "POST",
+                    self.base_url,
+                    headers=headers,
+                    json=payload,
+                ) as response:
+                    if not response.is_error:
+                        return consume_chat_completion_stream(response.iter_lines(), on_delta)
+                    response.read()
+                    if response.status_code == 400 and "stream_options" in payload:
+                        payload.pop("stream_options", None)
+                        continue
+                    error = _agnes_api_error(response, request_model)
+                    if not error.retryable or attempt >= self.max_retries:
+                        raise error
+                    delay = _retry_delay_seconds(response, attempt, self.retry_base_seconds)
+                attempt += 1
                 if delay > 0:
                     time.sleep(delay)
-            data = response.json()
-
-        choices = data.get("choices") or []
-        if not choices:
-            raise RuntimeError(f"Agnes response has no choices: {data}")
-        message = choices[0].get("message")
-        if not isinstance(message, dict):
-            raise RuntimeError(f"Agnes response has no message: {data}")
-        return message
 
     def supports_image_input(self) -> bool:
         return bool(self.vision_model)

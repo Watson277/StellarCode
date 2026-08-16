@@ -9,7 +9,56 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
-from stellarcode.trace import TraceRecorder
+from stellarcode.llm.types import current_llm_scope
+from stellarcode.trace import TraceRecorder, TraceTarget
+
+
+class _CombinedCancellation:
+    def __init__(
+        self,
+        *,
+        batch_event: threading.Event | None = None,
+        task_event: threading.Event | None = None,
+    ) -> None:
+        self._batch_event = batch_event
+        self._task_event = task_event
+
+    def is_set(self) -> bool:
+        return bool(
+            (self._batch_event is not None and self._batch_event.is_set())
+            or (self._task_event is not None and self._task_event.is_set())
+        )
+
+    def reason(self) -> str | None:
+        if self._task_event is not None and self._task_event.is_set():
+            return "task"
+        if self._batch_event is not None and self._batch_event.is_set():
+            return "batch"
+        return None
+
+
+_TOOL_CANCELLATION_EVENT: contextvars.ContextVar[threading.Event | _CombinedCancellation | None] = (
+    contextvars.ContextVar("stellarcode_tool_cancellation_event", default=None)
+)
+_CURRENT_TRACE_TARGET = object()
+
+
+def tool_cancellation_requested() -> bool:
+    """Return whether the active parallel tool batch cancelled this invocation."""
+
+    event = _TOOL_CANCELLATION_EVENT.get()
+    return event is not None and event.is_set()
+
+
+def tool_cancellation_reason() -> str | None:
+    """Return whether cancellation came from the task or the tool batch."""
+
+    event = _TOOL_CANCELLATION_EVENT.get()
+    if event is None or not event.is_set():
+        return None
+    if isinstance(event, _CombinedCancellation):
+        return event.reason()
+    return "batch"
 
 
 class ToolExecutionError(RuntimeError):
@@ -22,6 +71,7 @@ class ToolDefinition:
     description: str
     parameters: dict[str, Any]
     handler: Callable[..., str | ToolOutput]
+    previewer: Callable[..., dict[str, Any]] | None = None
 
     def to_openai_tool(self) -> dict[str, Any]:
         return {
@@ -73,6 +123,9 @@ class ToolRegistry:
             raise ValueError("batch_timeout_seconds must be greater than 0.")
         self._tools: dict[str, ToolDefinition] = {}
         self._tools_lock = threading.RLock()
+        self._executions_condition = threading.Condition(threading.RLock())
+        self._active_executions = 0
+        self._active_executions_by_task: dict[str, int] = {}
         self.max_parallel_tools = max_parallel_tools
         self.batch_timeout_seconds = batch_timeout_seconds
         self.trace_recorder = trace_recorder
@@ -94,8 +147,82 @@ class ToolRegistry:
     def schemas(self) -> list[dict[str, Any]]:
         return [tool.to_openai_tool() for tool in self.list_tools()]
 
+    def preview(
+        self,
+        name: str,
+        arguments: str | dict[str, Any] | None,
+    ) -> dict[str, Any] | None:
+        with self._tools_lock:
+            tool = self._tools.get(name)
+        if tool is None or tool.previewer is None:
+            return None
+        try:
+            kwargs = {
+                key: value
+                for key, value in self._parse_arguments(arguments).items()
+                if not key.startswith("__")
+            }
+            return tool.previewer(**kwargs)
+        except Exception as exc:
+            return {
+                "operation": "unknown",
+                "path": "",
+                "workspace_scoped": False,
+                "rollback_protected": False,
+                "protection_reason": "preview_error",
+                "sensitive": False,
+                "binary": False,
+                "before_sha256": None,
+                "after_sha256": None,
+                "additions": 0,
+                "deletions": 0,
+                "diff": "",
+                "truncated": False,
+                "error": f"{type(exc).__name__}: {exc}",
+            }
+
+    def event_arguments(
+        self,
+        name: str,
+        arguments: str | dict[str, Any] | None,
+    ) -> dict[str, Any]:
+        """Return journal-safe arguments without embedding complete replacement files."""
+
+        try:
+            parsed = {
+                key: value
+                for key, value in self._parse_arguments(arguments).items()
+                if not key.startswith("__")
+            }
+        except ToolExecutionError:
+            return {"value": str(arguments or "")[:2_000]}
+        if name == "write_file" and isinstance(parsed.get("content"), str):
+            content = str(parsed["content"])
+            parsed["content"] = f"[full content omitted: {len(content)} characters]"
+        return parsed
+
+    @staticmethod
+    def sanitize_event_arguments(
+        name: str,
+        arguments: str | dict[str, Any] | None,
+    ) -> dict[str, Any]:
+        """Sanitize arguments without requiring a registered tool definition."""
+
+        try:
+            parsed = ToolRegistry._parse_arguments(arguments)
+        except ToolExecutionError:
+            return {"value": str(arguments or "")[:2_000]}
+        safe = {key: value for key, value in parsed.items() if not key.startswith("__")}
+        if name == "write_file" and isinstance(safe.get("content"), str):
+            content = str(safe["content"])
+            safe["content"] = f"[full content omitted: {len(content)} characters]"
+        return safe
+
     def execute(self, name: str, arguments: str | dict[str, Any] | None) -> str:
         started_at = time.monotonic()
+        trace_target = (
+            self.trace_recorder.capture_target() if self.trace_recorder else None
+        )
         try:
             output = self._execute_output(name, arguments)
         except ToolExecutionError as exc:
@@ -106,6 +233,7 @@ class ToolRegistry:
                 result=f"Tool error: {exc}",
                 elapsed_ms=int((time.monotonic() - started_at) * 1000),
                 success=False,
+                trace_target=trace_target,
             )
             raise
         self._record_tool_result(
@@ -116,6 +244,7 @@ class ToolRegistry:
             elapsed_ms=int((time.monotonic() - started_at) * 1000),
             success=True,
             image_parts=output.image_parts,
+            trace_target=trace_target,
         )
         return output.text
 
@@ -130,25 +259,116 @@ class ToolRegistry:
             raise ToolExecutionError(f"Unknown tool: {name}")
 
         kwargs = self._parse_arguments(arguments)
+        execution_task_id = self._register_execution()
         try:
-            result = tool.handler(**kwargs)
-            if isinstance(result, ToolOutput):
-                return result
-            return ToolOutput(str(result))
-        except ToolExecutionError:
-            raise
-        except Exception as exc:
-            raise ToolExecutionError(f"{name} failed: {exc}") from exc
+            try:
+                result = tool.handler(**kwargs)
+                if isinstance(result, ToolOutput):
+                    return result
+                return ToolOutput(str(result))
+            except ToolExecutionError:
+                raise
+            except Exception as exc:
+                raise ToolExecutionError(f"{name} failed: {exc}") from exc
+        finally:
+            self._finish_execution(execution_task_id)
+
+    def _register_execution(self) -> str:
+        _session_id, task_id = current_llm_scope()
+        with self._executions_condition:
+            self._active_executions += 1
+            self._active_executions_by_task[task_id] = (
+                self._active_executions_by_task.get(task_id, 0) + 1
+            )
+        return task_id
+
+    def _finish_execution(self, task_id: str) -> None:
+        with self._executions_condition:
+            self._active_executions -= 1
+            remaining = self._active_executions_by_task.get(task_id, 0) - 1
+            if remaining > 0:
+                self._active_executions_by_task[task_id] = remaining
+            else:
+                self._active_executions_by_task.pop(task_id, None)
+            self._executions_condition.notify_all()
+
+    def wait_for_quiescence(
+        self,
+        timeout_seconds: float | None = None,
+        *,
+        task_id: str | None = None,
+    ) -> bool:
+        """Wait until detached/cancelled tool handlers can no longer mutate state."""
+
+        deadline = None if timeout_seconds is None else time.monotonic() + timeout_seconds
+        with self._executions_condition:
+            while (
+                self._active_executions_by_task.get(task_id, 0)
+                if task_id is not None
+                else self._active_executions
+            ):
+                if deadline is None:
+                    self._executions_condition.wait()
+                    continue
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return False
+                self._executions_condition.wait(remaining)
+            return True
 
     def execute_tools(
         self,
         invocations: list[ToolInvocation],
         timeout_seconds: float | None = None,
+        cancellation_event: threading.Event | None = None,
     ) -> list[ToolExecutionResult]:
         if not invocations:
             return []
         if len(invocations) == 1:
-            return [self._execute_invocation(invocations[0])]
+            if cancellation_event is None:
+                return [self._execute_invocation(invocations[0])]
+            result_holder: list[ToolExecutionResult] = []
+            execution_context = contextvars.copy_context()
+            execution_task_id = self._register_execution()
+
+            def run_single() -> None:
+                try:
+                    result_holder.append(
+                        self._execute_invocation(
+                            invocations[0],
+                            cancellation_event=_CombinedCancellation(
+                                task_event=cancellation_event,
+                            ),
+                        )
+                    )
+                finally:
+                    self._finish_execution(execution_task_id)
+
+            thread = threading.Thread(
+                target=execution_context.run,
+                args=(run_single,),
+                name="stellarcode-tool-1",
+                daemon=True,
+            )
+            thread.start()
+            while thread.is_alive():
+                thread.join(0.05)
+                if result_holder:
+                    return result_holder
+                if cancellation_event.is_set():
+                    return [
+                        ToolExecutionResult(
+                            id=invocations[0].id,
+                            name=invocations[0].name,
+                            arguments=invocations[0].arguments,
+                            result="Tool error: Task cancelled by user.",
+                            elapsed_ms=0,
+                            success=False,
+                        )
+                    ]
+            return [
+                result_holder[0]
+            ]
 
         batch_timeout = (
             self.batch_timeout_seconds if timeout_seconds is None else timeout_seconds
@@ -161,38 +381,63 @@ class ToolRegistry:
             work_queue.put((index, invocation))
 
         results: list[ToolExecutionResult | None] = [None] * len(invocations)
+        cancellation_events = [threading.Event() for _ in invocations]
         deadline = time.monotonic() + batch_timeout
 
-        def run_worker() -> None:
-            while time.monotonic() < deadline:
-                try:
-                    index, invocation = work_queue.get_nowait()
-                except queue.Empty:
-                    return
-                results[index] = self._execute_invocation(invocation)
-                work_queue.task_done()
+        def run_worker(execution_task_id: str) -> None:
+            try:
+                while (
+                    time.monotonic() < deadline
+                    and not (cancellation_event and cancellation_event.is_set())
+                ):
+                    try:
+                        index, invocation = work_queue.get_nowait()
+                    except queue.Empty:
+                        return
+                    results[index] = self._execute_invocation(
+                        invocation,
+                        cancellation_event=_CombinedCancellation(
+                            batch_event=cancellation_events[index],
+                            task_event=cancellation_event,
+                        ),
+                    )
+                    work_queue.task_done()
+            finally:
+                self._finish_execution(execution_task_id)
 
         threads = []
         for index in range(min(len(invocations), self.max_parallel_tools)):
             execution_context = contextvars.copy_context()
+            execution_task_id = self._register_execution()
             threads.append(
                 threading.Thread(
                     target=execution_context.run,
-                    args=(run_worker,),
+                    args=(run_worker, execution_task_id),
                     name=f"stellarcode-tool-{index + 1}",
                     daemon=True,
                 )
             )
         for thread in threads:
             thread.start()
-        for thread in threads:
-            remaining = max(0.0, deadline - time.monotonic())
-            thread.join(remaining)
+        while any(thread.is_alive() for thread in threads):
+            if time.monotonic() >= deadline:
+                break
+            if cancellation_event is not None and cancellation_event.is_set():
+                break
+            for thread in threads:
+                thread.join(min(0.05, max(0.0, deadline - time.monotonic())))
 
+        unfinished_indexes = {
+            index for index, result in enumerate(results) if result is None
+        }
+        for index in unfinished_indexes:
+            cancellation_events[index].set()
+
+        task_cancelled = cancellation_event is not None and cancellation_event.is_set()
         timeout_ms = int(batch_timeout * 1000)
         completed_results = []
-        for invocation, result in zip(invocations, results):
-            if result is not None:
+        for index, (invocation, result) in enumerate(zip(invocations, results)):
+            if index not in unfinished_indexes and result is not None:
                 completed_results.append(result)
                 continue
             timeout_result = ToolExecutionResult(
@@ -200,37 +445,75 @@ class ToolRegistry:
                 name=invocation.name,
                 arguments=invocation.arguments,
                 result=(
-                    f"Tool error: {invocation.name} timed out after "
+                    "Tool error: Task cancelled by user."
+                    if task_cancelled
+                    else f"Tool error: {invocation.name} timed out after "
                     f"{batch_timeout:g}s (batch timeout)."
                 ),
-                elapsed_ms=timeout_ms,
+                elapsed_ms=0 if task_cancelled else timeout_ms,
                 success=False,
-                timed_out=True,
+                timed_out=not task_cancelled,
             )
             self._record_tool_result(
                 tool_call_id=invocation.id,
                 name=invocation.name,
                 arguments=invocation.arguments,
                 result=timeout_result.result,
-                elapsed_ms=timeout_ms,
+                elapsed_ms=timeout_result.elapsed_ms,
                 success=False,
             )
             completed_results.append(timeout_result)
         return completed_results
 
-    def _execute_invocation(self, invocation: ToolInvocation) -> ToolExecutionResult:
+    def _execute_invocation(
+        self,
+        invocation: ToolInvocation,
+        cancellation_event: threading.Event | _CombinedCancellation | None = None,
+    ) -> ToolExecutionResult:
         started_at = time.monotonic()
+        trace_target = (
+            self.trace_recorder.capture_target() if self.trace_recorder else None
+        )
+        if cancellation_event is not None and cancellation_event.is_set():
+            result = "Tool error: Task cancelled by user."
+            self._record_tool_result(
+                tool_call_id=invocation.id,
+                name=invocation.name,
+                arguments=invocation.arguments,
+                result=result,
+                elapsed_ms=0,
+                success=False,
+                trace_target=trace_target,
+            )
+            return ToolExecutionResult(
+                id=invocation.id,
+                name=invocation.name,
+                arguments=invocation.arguments,
+                result=result,
+                elapsed_ms=0,
+                success=False,
+            )
+        cancellation_token = _TOOL_CANCELLATION_EVENT.set(cancellation_event)
         try:
-            output = self._execute_output(invocation.name, invocation.arguments)
-            result = output.text
-            trace_result = output.trace_text if output.trace_text is not None else result
-            image_parts = output.image_parts
-            success = True
-        except ToolExecutionError as exc:
-            result = f"Tool error: {exc}"
-            trace_result = result
-            image_parts = ()
-            success = False
+            try:
+                output = self._execute_output(invocation.name, invocation.arguments)
+                if cancellation_event is not None and cancellation_event.is_set():
+                    result = "Tool error: Task cancelled by user."
+                    trace_result = result
+                    image_parts = ()
+                    success = False
+                else:
+                    result = output.text
+                    trace_result = output.trace_text if output.trace_text is not None else result
+                    image_parts = output.image_parts
+                    success = True
+            except ToolExecutionError as exc:
+                result = f"Tool error: {exc}"
+                trace_result = result
+                image_parts = ()
+                success = False
+        finally:
+            _TOOL_CANCELLATION_EVENT.reset(cancellation_token)
         elapsed_ms = int((time.monotonic() - started_at) * 1000)
         self._record_tool_result(
             tool_call_id=invocation.id,
@@ -240,6 +523,7 @@ class ToolRegistry:
             elapsed_ms=elapsed_ms,
             success=success,
             image_parts=image_parts,
+            trace_target=trace_target,
         )
         return ToolExecutionResult(
             id=invocation.id,
@@ -261,10 +545,17 @@ class ToolRegistry:
         elapsed_ms: int,
         success: bool,
         image_parts: tuple[dict[str, Any], ...] = (),
+        trace_target: TraceTarget | None | object = _CURRENT_TRACE_TARGET,
     ) -> None:
         if self.trace_recorder is None:
             return
-        self.trace_recorder.record(
+        target = (
+            self.trace_recorder.capture_target()
+            if trace_target is _CURRENT_TRACE_TARGET
+            else trace_target
+        )
+        self.trace_recorder.record_for(
+            target if isinstance(target, tuple) else None,
             "tool_result",
             tool_call_id=tool_call_id,
             tool=name,

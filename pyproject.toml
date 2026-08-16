@@ -18,6 +18,7 @@ dependencies = [
 
 [project.scripts]
 stellarcode = "stellarcode.cli:main"
+stellarcode-sidecar = "stellarcode.runtime.sidecar:main"
 
 [project.optional-dependencies]
 dev = [

@@ -28,6 +28,7 @@ class McpServerConfig:
     url: str = ""
     headers: dict[str, str] = field(default_factory=dict)
     disabled: bool = False
+    source: str = ""
 
     @property
     def is_stdio(self) -> bool:
@@ -90,10 +91,48 @@ class McpConfigLoader:
 
     def load(self) -> dict[str, McpServerConfig]:
         merged: dict[str, McpServerConfig] = {}
-        for path in (self.user_config, self.project_config):
+        for path, source in (
+            (self.user_config, "user"),
+            (self.project_config, "project"),
+        ):
             if path.is_file():
-                merged.update(self._read(path))
+                merged.update(self._read(path, source))
         return merged
+
+    def install_project_server(
+        self,
+        name: str,
+        config: McpServerConfig,
+        *,
+        overwrite: bool = False,
+    ) -> McpServerConfig:
+        normalized_name = _server_name(name)
+        config = replace(config, source="project")
+        self.prepare(config)
+        document = self._project_document()
+        servers = document.setdefault("mcpServers", {})
+        if not isinstance(servers, dict):
+            raise McpConfigError(
+                f"MCP config {self.project_config} must contain an mcpServers object."
+            )
+        if normalized_name in servers and not overwrite:
+            raise McpConfigError(
+                f"Project MCP server already exists: {normalized_name}"
+            )
+        servers[normalized_name] = _serialize_config(config)
+        self._write_project_document(document)
+        return config
+
+    def remove_project_server(self, name: str) -> None:
+        normalized_name = _server_name(name)
+        document = self._project_document()
+        servers = document.get("mcpServers")
+        if not isinstance(servers, dict) or normalized_name not in servers:
+            raise McpConfigError(
+                f"Project MCP server not found: {normalized_name}"
+            )
+        del servers[normalized_name]
+        self._write_project_document(document)
 
     def prepare(self, config: McpServerConfig) -> McpServerConfig:
         prepared = replace(
@@ -108,9 +147,11 @@ class McpConfigLoader:
             raise McpConfigError(
                 "An MCP server must configure exactly one of 'command' or 'url'."
             )
+        if prepared.is_http and not prepared.url.lower().startswith(("http://", "https://")):
+            raise McpConfigError("MCP server URL must use http:// or https://.")
         return prepared
 
-    def _read(self, path: Path) -> dict[str, McpServerConfig]:
+    def _read(self, path: Path, source: str = "") -> dict[str, McpServerConfig]:
         try:
             raw = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError) as exc:
@@ -130,8 +171,36 @@ class McpConfigLoader:
                 url=_string(value.get("url")),
                 headers=_string_map(value.get("headers")),
                 disabled=bool(value.get("disabled", False)),
+                source=source,
             )
         return parsed
+
+    def _project_document(self) -> dict[str, object]:
+        if not self.project_config.exists():
+            return {"mcpServers": {}}
+        try:
+            document = json.loads(self.project_config.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise McpConfigError(
+                f"Could not read MCP config {self.project_config}: {exc}"
+            ) from exc
+        if not isinstance(document, dict):
+            raise McpConfigError(f"MCP config {self.project_config} must be an object.")
+        return document
+
+    def _write_project_document(self, document: dict[str, object]) -> None:
+        self.project_config.parent.mkdir(parents=True, exist_ok=True)
+        temporary = self.project_config.with_suffix(".json.tmp")
+        try:
+            temporary.write_text(
+                json.dumps(document, ensure_ascii=False, indent=2) + "\n",
+                encoding="utf-8",
+            )
+            os.replace(temporary, self.project_config)
+        except OSError as exc:
+            raise McpConfigError(
+                f"Could not write MCP config {self.project_config}: {exc}"
+            ) from exc
 
     def _expand(self, raw: str) -> str:
         if not raw:
@@ -185,3 +254,29 @@ def _string_map(value: object) -> dict[str, str]:
     ):
         raise McpConfigError("MCP server env/headers must map strings to strings.")
     return dict(value)
+
+
+def _server_name(value: str) -> str:
+    normalized = value.strip()
+    if not normalized or len(normalized) > 64:
+        raise McpConfigError("MCP server name must contain 1-64 characters.")
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]*", normalized):
+        raise McpConfigError(
+            "MCP server name may contain only letters, numbers, '_' and '-'."
+        )
+    return normalized
+
+
+def _serialize_config(config: McpServerConfig) -> dict[str, object]:
+    payload: dict[str, object] = {"disabled": config.disabled}
+    if config.is_stdio:
+        payload["command"] = config.command
+        if config.args:
+            payload["args"] = list(config.args)
+        if config.env:
+            payload["env"] = dict(config.env)
+    else:
+        payload["url"] = config.url
+        if config.headers:
+            payload["headers"] = dict(config.headers)
+    return payload

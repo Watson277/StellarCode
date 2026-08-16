@@ -6,7 +6,7 @@ from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
-from typing import TYPE_CHECKING, Callable
+from typing import TYPE_CHECKING, Any, Callable
 
 from stellarcode.mcp.audit import McpAuditLog
 from stellarcode.mcp.client import McpClient, McpToolDescriptor
@@ -55,6 +55,7 @@ class McpServer:
 
 
 TransportFactory = Callable[[McpServerConfig, Path], McpTransport]
+StatusCallback = Callable[[McpServer], None]
 
 
 class McpServerManager:
@@ -66,6 +67,7 @@ class McpServerManager:
         transport_factory: TransportFactory | None = None,
         audit_log: McpAuditLog | None = None,
         browser_guard: BrowserGuard | None = None,
+        status_callback: StatusCallback | None = None,
     ) -> None:
         self.tool_registry = tool_registry
         self.project_dir = Path(project_dir).resolve()
@@ -75,6 +77,7 @@ class McpServerManager:
             self.project_dir / ".stellarcode" / "audit" / "mcp-tools.jsonl"
         )
         self.browser_guard = browser_guard
+        self.status_callback = status_callback
         self._servers: dict[str, McpServer] = {}
         self._lock = threading.RLock()
 
@@ -93,6 +96,9 @@ class McpServerManager:
                 )
                 for name, config in configs.items()
             }
+            servers = list(self._servers.values())
+        for server in servers:
+            self._notify(server)
 
     def start_all(
         self,
@@ -163,6 +169,128 @@ class McpServerManager:
             return f"MCP server restarted: {name}"
         return f"MCP server restart failed: {name} - {server.error_message}"
 
+    def install(
+        self,
+        name: str,
+        config: McpServerConfig,
+        *,
+        overwrite: bool = False,
+    ) -> McpServer:
+        self.config_loader.install_project_server(name, config, overwrite=overwrite)
+        server = self.reload(name)
+        if server is None:
+            raise RuntimeError(f"MCP server disappeared after installation: {name}")
+        return server
+
+    def set_enabled(self, name: str, enabled: bool) -> McpServer:
+        server = self.server(name)
+        if server is None:
+            raise ValueError(f"MCP server not found: {name}")
+        config = McpServerConfig(
+            command=server.config.command,
+            args=list(server.config.args),
+            env=dict(server.config.env),
+            url=server.config.url,
+            headers=dict(server.config.headers),
+            disabled=not enabled,
+            source="project",
+        )
+        self.config_loader.install_project_server(name, config, overwrite=True)
+        reloaded = self.reload(name)
+        if reloaded is None:
+            raise RuntimeError(f"MCP server disappeared after update: {name}")
+        return reloaded
+
+    def remove_project_server(self, name: str) -> McpServer | None:
+        server = self.server(name)
+        if server is None:
+            raise ValueError(f"MCP server not found: {name}")
+        if server.config.source != "project":
+            raise ValueError(
+                f"MCP server {name} comes from the user config and cannot be removed "
+                "from this project. Disable it to create a project override."
+            )
+        self.config_loader.remove_project_server(name)
+        return self.reload(name)
+
+    def reload(self, name: str) -> McpServer | None:
+        configs = self.config_loader.load()
+        config = configs.get(name)
+        old = self.server(name)
+        if old is not None:
+            with old.lock:
+                self._unregister_tools(old)
+                self._close_client(old)
+        with self._lock:
+            if config is None:
+                self._servers.pop(name, None)
+                return None
+            server = McpServer(
+                name=name,
+                config=config,
+                status=(
+                    McpServerStatus.DISABLED
+                    if config.disabled
+                    else McpServerStatus.STARTING
+                ),
+            )
+            self._servers[name] = server
+        self._notify(server)
+        if not config.disabled:
+            self._start(server)
+        return server
+
+    def snapshot(self) -> dict[str, Any]:
+        servers = [self.server_snapshot(server) for server in self.servers()]
+        return {
+            "servers": servers,
+            "ready_servers": sum(1 for server in servers if server["status"] == "ready"),
+            "total_servers": len(servers),
+            "total_tools": sum(int(server["tool_count"]) for server in servers),
+            "project_config_path": str(self.config_loader.project_config),
+            "user_config_path": str(self.config_loader.user_config),
+        }
+
+    @staticmethod
+    def server_snapshot(server: McpServer) -> dict[str, Any]:
+        with server.lock:
+            process_id = (
+                server.client.transport.process_id
+                if server.client is not None
+                else None
+            )
+            capabilities = (
+                sorted(server.client.server_capabilities)
+                if server.client is not None
+                else []
+            )
+            return {
+                "name": server.name,
+                "status": server.status.value,
+                "transport": server.config.transport_name,
+                "source": server.config.source or "unknown",
+                "disabled": server.config.disabled,
+                "command": server.config.command,
+                "args": list(server.config.args),
+                "url": server.config.url,
+                "env_keys": sorted(server.config.env),
+                "header_keys": sorted(server.config.headers),
+                "tool_count": len(server.tools),
+                "tools": [
+                    {
+                        "name": tool.name,
+                        "namespaced_name": tool.namespaced_name,
+                        "description": tool.description,
+                        "input_schema": tool.input_schema,
+                    }
+                    for tool in server.tools
+                ],
+                "error": server.error_message,
+                "uptime_seconds": server.uptime_seconds,
+                "process_id": process_id,
+                "capabilities": capabilities,
+            }
+
     def restart_with_args(self, name: str, args: list[str]) -> str:
         server = self.server(name)
         if server is None:
@@ -180,6 +308,7 @@ class McpServerManager:
             self._close_client(server)
             server.status = McpServerStatus.DISABLED
             server.error_message = ""
+            self._notify(server)
         return f"MCP server disabled: {name}"
 
     def enable(self, name: str) -> str:
@@ -243,6 +372,7 @@ class McpServerManager:
             server.error_message = ""
             server.stderr_log = []
             server.startup_started_at = time.monotonic()
+            self._notify(server)
             client: McpClient | None = None
             registered_names: list[str] = []
             try:
@@ -279,6 +409,15 @@ class McpServerManager:
                 server.tools = []
                 server.error_message = f"{type(exc).__name__}: {exc}"
                 server.status = McpServerStatus.ERROR
+            self._notify(server)
+
+    def _notify(self, server: McpServer) -> None:
+        if self.status_callback is None:
+            return
+        try:
+            self.status_callback(server)
+        except Exception:
+            pass
 
     @staticmethod
     def _startup_result(server: McpServer) -> str:

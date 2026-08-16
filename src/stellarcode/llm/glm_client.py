@@ -3,9 +3,11 @@ from __future__ import annotations
 import copy
 import os
 import time
-from typing import Any
+from typing import Any, Callable
 
 from stellarcode.image import strip_images_for_text_model
+from stellarcode.llm.openai_stream import consume_chat_completion_stream
+from stellarcode.llm.types import ChatResult, TokenUsage
 
 
 class GLMApiError(RuntimeError):
@@ -80,21 +82,26 @@ class GLMClient:
         messages: list[dict[str, Any]],
         tools: list[dict[str, Any]] | None = None,
         temperature: float = 0.2,
-    ) -> dict[str, Any]:
+        on_delta: Callable[[str], None] | None = None,
+    ) -> ChatResult:
         try:
             import httpx
         except ModuleNotFoundError as exc:
             raise RuntimeError("Missing dependency: install httpx with `pip install -e .`.") from exc
 
         request_model = self.model_for_messages(messages)
+        prepared_messages = self._prepare_messages(messages, request_model)
         payload: dict[str, Any] = {
             "model": request_model,
-            "messages": self._prepare_messages(messages, request_model),
+            "messages": prepared_messages,
             "temperature": temperature,
         }
         if tools:
             payload["tools"] = tools
             payload["tool_choice"] = "auto"
+        if on_delta is not None:
+            payload["stream"] = True
+            payload["stream_options"] = {"include_usage": True}
 
         request_api_key = (
             self.vision_api_key if self._is_vision_model(request_model) else self.api_key
@@ -104,35 +111,88 @@ class GLMClient:
             "Content-Type": "application/json",
         }
 
+        if on_delta is not None:
+            message, raw_usage = self._stream_chat(
+                httpx,
+                payload,
+                headers,
+                request_model,
+                on_delta,
+            )
+        else:
+            with httpx.Client(timeout=self.timeout_seconds) as client:
+                for attempt in range(self.max_retries + 1):
+                    response = client.post(
+                        self._request_base_url(request_model),
+                        headers=headers,
+                        json=payload,
+                    )
+                    if not response.is_error:
+                        break
+                    error = _glm_api_error(response, request_model)
+                    if not error.retryable or attempt >= self.max_retries:
+                        raise error
+                    delay = _retry_delay_seconds(
+                        response,
+                        attempt,
+                        self.retry_base_seconds,
+                    )
+                    if delay > 0:
+                        time.sleep(delay)
+                data = response.json()
+
+            choices = data.get("choices") or []
+            if not choices:
+                raise RuntimeError(f"LLM response has no choices: {data}")
+
+            message = choices[0].get("message")
+            if not isinstance(message, dict):
+                raise RuntimeError(f"LLM response has no message: {data}")
+            raw_usage = data.get("usage")
+        return ChatResult(
+            message=message,
+            usage=TokenUsage.from_api(
+                raw_usage,
+                messages=prepared_messages,
+                tools=tools,
+                response_message=message,
+            ),
+            provider=str(getattr(self, "provider_name", "glm")),
+            model=request_model,
+        )
+
+    def _stream_chat(
+        self,
+        httpx: Any,
+        payload: dict[str, Any],
+        headers: dict[str, str],
+        request_model: str,
+        on_delta: Callable[[str], None],
+    ) -> tuple[dict[str, Any], dict[str, Any] | None]:
+        attempt = 0
         with httpx.Client(timeout=self.timeout_seconds) as client:
-            for attempt in range(self.max_retries + 1):
-                response = client.post(
+            while True:
+                with client.stream(
+                    "POST",
                     self._request_base_url(request_model),
                     headers=headers,
                     json=payload,
-                )
-                if not response.is_error:
-                    break
-                error = _glm_api_error(response, request_model)
-                if not error.retryable or attempt >= self.max_retries:
-                    raise error
-                delay = _retry_delay_seconds(
-                    response,
-                    attempt,
-                    self.retry_base_seconds,
-                )
+                ) as response:
+                    if not response.is_error:
+                        return consume_chat_completion_stream(response.iter_lines(), on_delta)
+                    response.read()
+                    if response.status_code == 400 and "stream_options" in payload:
+                        # Some OpenAI-compatible gateways stream correctly but do not
+                        # implement the optional final usage chunk.
+                        payload.pop("stream_options", None)
+                        continue
+                    error = _glm_api_error(response, request_model)
+                    if not error.retryable or attempt >= self.max_retries:
+                        raise error
+                    delay = _retry_delay_seconds(response, attempt, self.retry_base_seconds)
+                attempt += 1
                 if delay > 0:
                     time.sleep(delay)
-            data = response.json()
-
-        choices = data.get("choices") or []
-        if not choices:
-            raise RuntimeError(f"LLM response has no choices: {data}")
-
-        message = choices[0].get("message")
-        if not isinstance(message, dict):
-            raise RuntimeError(f"LLM response has no message: {data}")
-        return message
 
     def supports_image_input(self) -> bool:
         return self._is_vision_model(self.model) or bool(self.vision_model)
@@ -160,6 +220,10 @@ class GLMClient:
         model = request_model or self.model_for_messages(messages)
         if not self._is_vision_model(model):
             return strip_images_for_text_model(prepared)
+        for message in prepared:
+            # DeepSeek reasoning fields are provider-specific and can be present when a
+            # text conversation routes a later image turn to GLM.
+            message.pop("reasoning_content", None)
         return prepared
 
 

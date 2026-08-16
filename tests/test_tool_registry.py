@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import sys
 
 import pytest
 
@@ -91,6 +92,69 @@ def test_execute_command_uses_workspace(tmp_path):
 
     assert "exit_code: 0" in result
     assert "Python" in result
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows verbatim paths only")
+def test_execute_command_removes_windows_verbatim_workspace_prefix(tmp_path):
+    verbatim_workspace = rf"\\?\{tmp_path}"
+    registry = build_default_registry(verbatim_workspace)
+
+    result = registry.execute(
+        "execute_command",
+        {"command": "Write-Output (Get-Location).Path"},
+    )
+
+    assert "exit_code: 0" in result
+    assert "\\\\?\\" not in result
+    assert str(tmp_path) in result
+
+
+def test_execute_command_child_stdin_is_closed(tmp_path):
+    registry = build_default_registry(tmp_path)
+
+    result = registry.execute(
+        "execute_command",
+        {
+            "command": [
+                sys.executable,
+                "-c",
+                "import sys; print('stdin-bytes=' + str(len(sys.stdin.buffer.read())))",
+            ],
+            "timeout_seconds": 5,
+        },
+    )
+
+    assert "exit_code: 0" in result
+    assert "stdin-bytes=0" in result
+
+
+def test_execute_command_restores_user_pythonpath(monkeypatch, tmp_path):
+    runtime_path = str(tmp_path / "runtime-src")
+    user_path = str(tmp_path / "user-src")
+    monkeypatch.setenv("PYTHONPATH", runtime_path)
+    monkeypatch.setenv("STELLARCODE_RUNTIME_PYTHONPATH", runtime_path)
+    monkeypatch.setenv("STELLARCODE_TOOL_PYTHONPATH", user_path)
+    registry = build_default_registry(tmp_path)
+
+    result = registry.execute(
+        "execute_command",
+        {
+            "command": [
+                sys.executable,
+                "-c",
+                (
+                    "import os; "
+                    "print('pythonpath=' + str(os.getenv('PYTHONPATH'))); "
+                    "print('runtime-marker=' + str(os.getenv('STELLARCODE_RUNTIME_PYTHONPATH'))); "
+                    "print('tool-marker=' + str(os.getenv('STELLARCODE_TOOL_PYTHONPATH')))"
+                ),
+            ]
+        },
+    )
+
+    assert f"pythonpath={user_path}" in result
+    assert "runtime-marker=None" in result
+    assert "tool-marker=None" in result
 
 
 def test_execute_command_string_uses_platform_shell(tmp_path):

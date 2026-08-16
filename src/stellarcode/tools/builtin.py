@@ -1,14 +1,28 @@
 from __future__ import annotations
 
 import os
+import signal
+import stat
 import subprocess
+import tempfile
+import threading
+import time
+from functools import partial
 from pathlib import Path
 
 from stellarcode.hitl.handler import HitlHandler
 from stellarcode.hitl.registry import HitlToolRegistry
+from stellarcode.path_utils import subprocess_safe_path
+from stellarcode.protection import preview_delete_file, preview_write_file
 from stellarcode.rag import RagService, SearchResultFormatter
-from stellarcode.tools.registry import ToolDefinition, ToolExecutionError, ToolRegistry
-from stellarcode.tools.registry import ToolOutput
+from stellarcode.tools.registry import (
+    ToolDefinition,
+    ToolExecutionError,
+    ToolOutput,
+    ToolRegistry,
+    tool_cancellation_reason,
+    tool_cancellation_requested,
+)
 from stellarcode.trace import TraceRecorder
 from stellarcode.web import (
     SearchError,
@@ -22,6 +36,8 @@ from stellarcode.web import (
 
 
 MAX_COMMAND_OUTPUT_CHARS = 8000
+_FILE_MUTATION_LOCK = threading.RLock()
+_MISSING_FILE_GUARD = "__stellarcode_missing__"
 
 
 def build_default_registry(
@@ -33,8 +49,9 @@ def build_default_registry(
     search_provider: SearchProvider | None = None,
     web_fetcher: WebFetcher | None = None,
     trace_recorder: TraceRecorder | None = None,
+    rag_auto_retrieval: bool = True,
 ) -> ToolRegistry:
-    root = Path(workspace or Path.cwd()).resolve()
+    root = subprocess_safe_path(workspace or Path.cwd())
     code_search = rag_service or RagService(root)
     active_search_provider = search_provider or SearchProviderFactory.create_smart()
     active_web_fetcher = web_fetcher or WebFetcher()
@@ -90,7 +107,8 @@ def build_default_registry(
                 "required": ["path", "content"],
                 "additionalProperties": False,
             },
-            handler=lambda path, content: _write_file(root, path, content),
+            handler=partial(_write_file, root),
+            previewer=lambda path, content: preview_write_file(root, path, content),
         )
     )
 
@@ -114,7 +132,8 @@ def build_default_registry(
                 "required": ["path"],
                 "additionalProperties": False,
             },
-            handler=lambda path: _delete_file(root, path),
+            handler=partial(_delete_file, root),
+            previewer=lambda path: preview_delete_file(root, path),
         )
     )
 
@@ -253,7 +272,15 @@ def build_default_registry(
             name="search_code",
             description=(
                 "Search the indexed codebase by natural language. Returns relevant real code "
-                "chunks with file paths and line numbers. Run /index in the CLI first."
+                "chunks with file paths and line numbers. The index can be built from the "
+                "desktop RAG settings or with /index in the CLI. "
+                + (
+                    "Automatic retrieval is enabled: use it before guessing about architecture, "
+                    "behavior, or symbol locations, then read_file for exact context."
+                    if rag_auto_retrieval
+                    else "Automatic retrieval is disabled: call this tool only when the user "
+                    "explicitly asks to use RAG or search the semantic code index."
+                )
             ),
             parameters={
                 "type": "object",
@@ -304,25 +331,90 @@ def _read_file(root: Path, path: str, max_chars: int = 20000) -> str:
     return content
 
 
-def _write_file(root: Path, path: str, content: str) -> str:
+def _write_file(
+    root: Path,
+    path: str,
+    content: str,
+    *,
+    __expected_path: str | None = None,
+    __expected_before_sha256: str | None = None,
+) -> str:
     target = _resolve_path(root, path)
-    target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_text(content, encoding="utf-8")
-    return f"Wrote {len(content)} characters to {_display_path(root, target)}"
+    with _FILE_MUTATION_LOCK:
+        if tool_cancellation_requested():
+            raise ToolExecutionError("Task cancelled before file write.")
+        preview = preview_write_file(root, path, content)
+        _verify_change_guard(preview, __expected_path, __expected_before_sha256)
+        if preview["operation"] == "no_change":
+            return f"No changes needed for {_display_path(root, target)}"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        descriptor, temporary_name = tempfile.mkstemp(
+            prefix=f".{target.name}.",
+            dir=target.parent,
+        )
+        temporary = Path(temporary_name)
+        try:
+            with os.fdopen(descriptor, "w", encoding="utf-8", newline="") as stream:
+                stream.write(content)
+                stream.flush()
+                os.fsync(stream.fileno())
+            if target.exists():
+                temporary.chmod(stat.S_IMODE(target.stat().st_mode))
+            os.replace(temporary, target)
+        finally:
+            try:
+                temporary.unlink()
+            except FileNotFoundError:
+                pass
+        return (
+            f"Wrote {len(content)} characters to {_display_path(root, target)} "
+            f"({preview['operation']}, +{preview['additions']} -{preview['deletions']})"
+        )
 
 
-def _delete_file(root: Path, path: str) -> str:
-    target = _safe_delete_path(root, path)
-    display_path = _display_path(root, target)
-    if target.is_symlink():
-        target.unlink()
-    elif not target.exists():
-        raise ToolExecutionError(f"File not found: {path}")
-    elif not target.is_file():
-        raise ToolExecutionError(f"Path is not a file: {path}")
-    else:
-        target.unlink()
-    return f"Deleted file: {display_path}"
+def _delete_file(
+    root: Path,
+    path: str,
+    *,
+    __expected_path: str | None = None,
+    __expected_before_sha256: str | None = None,
+) -> str:
+    with _FILE_MUTATION_LOCK:
+        if tool_cancellation_requested():
+            raise ToolExecutionError("Task cancelled before file deletion.")
+        target = _safe_delete_path(root, path)
+        preview = preview_delete_file(root, path)
+        display_path = str(preview["path"])
+        _verify_change_guard(preview, __expected_path, __expected_before_sha256)
+        if target.is_symlink():
+            target.unlink()
+        elif not target.exists():
+            raise ToolExecutionError(f"File not found: {path}")
+        elif not target.is_file():
+            raise ToolExecutionError(f"Path is not a file: {path}")
+        else:
+            target.unlink()
+        return f"Deleted file: {display_path}"
+
+
+def _verify_change_guard(
+    preview: dict[str, object],
+    expected_path: str | None,
+    expected_before_sha256: str | None,
+) -> None:
+    if expected_path is None and expected_before_sha256 is None:
+        return
+    expected_hash = (
+        None
+        if expected_before_sha256 == _MISSING_FILE_GUARD
+        else expected_before_sha256
+    )
+    if preview.get("path") == expected_path and preview.get("before_sha256") == expected_hash:
+        return
+    raise ToolExecutionError(
+        "Modification guard stopped the operation because the target changed "
+        "after its diff was approved. Read the file again and retry."
+    )
 
 
 def _safe_delete_path(root: Path, user_path: str) -> Path:
@@ -355,35 +447,135 @@ def _execute_command(
     if not argv:
         raise ToolExecutionError("Command cannot be empty.")
 
+    creation_flags = 0
+    popen_options = {}
+    if os.name == "nt":
+        creation_flags = subprocess.CREATE_NEW_PROCESS_GROUP
+    else:
+        popen_options["start_new_session"] = True
+
     try:
-        completed = subprocess.run(
+        process = subprocess.Popen(
             argv,
-            cwd=root,
-            capture_output=True,
+            cwd=subprocess_safe_path(root),
+            env=_tool_process_environment(),
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             text=True,
-            timeout=timeout_seconds,
             shell=False,
             encoding="utf-8",
             errors="replace",
+            creationflags=creation_flags,
+            **popen_options,
         )
     except FileNotFoundError as exc:
         raise ToolExecutionError(f"Command not found: {argv[0]}") from exc
-    except subprocess.TimeoutExpired as exc:
-        raise ToolExecutionError(f"Command timed out after {timeout_seconds}s.") from exc
+
+    deadline = time.monotonic() + timeout_seconds
+    while True:
+        cancelled = tool_cancellation_requested()
+        remaining = deadline - time.monotonic()
+        if cancelled or remaining <= 0:
+            _terminate_process_tree(process)
+            stdout, stderr = _collect_terminated_process(process)
+            detail = _partial_command_output(stdout, stderr)
+            if cancelled:
+                if tool_cancellation_reason() == "task":
+                    message = "Command cancelled by the active task."
+                else:
+                    message = "Command cancelled because its parallel tool batch timed out."
+            else:
+                message = f"Command timed out after {timeout_seconds}s."
+            if detail:
+                message += f" Partial output:\n{detail}"
+            raise ToolExecutionError(message)
+        try:
+            stdout, stderr = process.communicate(timeout=min(0.1, remaining))
+            break
+        except subprocess.TimeoutExpired:
+            continue
 
     output = []
-    output.append(f"exit_code: {completed.returncode}")
-    if completed.stdout:
+    output.append(f"exit_code: {process.returncode}")
+    if stdout:
         output.append("stdout:")
-        output.append(completed.stdout.strip())
-    if completed.stderr:
+        output.append(stdout.strip())
+    if stderr:
         output.append("stderr:")
-        output.append(completed.stderr.strip())
+        output.append(stderr.strip())
     full_output = "\n".join(output)
     return ToolOutput(
         text=_truncate_command_output(full_output),
         trace_text=full_output,
     )
+
+
+def _tool_process_environment() -> dict[str, str]:
+    """Remove Runtime-only import paths before launching workspace commands."""
+
+    environment = os.environ.copy()
+    runtime_pythonpath = environment.pop("STELLARCODE_RUNTIME_PYTHONPATH", None)
+    inherited_pythonpath = environment.pop("STELLARCODE_TOOL_PYTHONPATH", None)
+    if runtime_pythonpath and environment.get("PYTHONPATH") == runtime_pythonpath:
+        environment.pop("PYTHONPATH", None)
+    if inherited_pythonpath:
+        environment["PYTHONPATH"] = inherited_pythonpath
+    return environment
+
+
+def _terminate_process_tree(process: subprocess.Popen[str]) -> None:
+    if process.poll() is not None:
+        return
+    if os.name == "nt":
+        try:
+            terminated = subprocess.run(
+                ["taskkill", "/PID", str(process.pid), "/T", "/F"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=5,
+                check=False,
+                creationflags=subprocess.CREATE_NO_WINDOW,
+            )
+            if terminated.returncode == 0:
+                return
+        except (OSError, subprocess.SubprocessError):
+            pass
+    else:
+        try:
+            os.killpg(os.getpgid(process.pid), signal.SIGKILL)
+            return
+        except OSError:
+            pass
+    try:
+        process.kill()
+    except OSError:
+        pass
+
+
+def _collect_terminated_process(
+    process: subprocess.Popen[str],
+) -> tuple[str, str]:
+    try:
+        return process.communicate(timeout=5)
+    except subprocess.TimeoutExpired:
+        try:
+            process.kill()
+        except OSError:
+            pass
+        try:
+            return process.communicate(timeout=1)
+        except subprocess.TimeoutExpired:
+            return "", ""
+
+
+def _partial_command_output(stdout: str, stderr: str) -> str:
+    values = []
+    if stdout:
+        values.append(f"stdout:\n{stdout.strip()}")
+    if stderr:
+        values.append(f"stderr:\n{stderr.strip()}")
+    return _truncate_command_output("\n".join(values))
 
 
 def _normalize_command(command: str | list[str]) -> list[str]:
@@ -451,9 +643,15 @@ def _web_fetch(
 def _search_code(rag_service: RagService, query: str, top_k: int = 5) -> str:
     if not query.strip():
         raise ToolExecutionError("Code search query cannot be empty.")
+    unavailable_reason = rag_service.unavailable_reason()
+    if unavailable_reason:
+        return unavailable_reason
     stats = rag_service.stats()
     if stats.chunk_count == 0:
-        return "Code index is empty. Run /index in the CLI before using search_code."
+        return (
+            "Code index is empty. Add files or folders and build the index in desktop "
+            "Settings > RAG, or run /index in the CLI."
+        )
     results = rag_service.search(query, max(1, min(int(top_k), 20)))
     formatted = SearchResultFormatter.format_for_tool(query, results)
     return f"Indexed project: {rag_service.project_path}\n\n{formatted}"

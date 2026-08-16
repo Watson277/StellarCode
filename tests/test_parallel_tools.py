@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import os
+import sys
 import threading
 import time
 from typing import Any
@@ -8,6 +10,8 @@ from typing import Any
 from stellarcode.agent import Agent
 from stellarcode.hitl import TerminalHitlHandler
 from stellarcode.hitl.registry import HitlToolRegistry
+from stellarcode.llm.types import llm_runtime_scope
+from stellarcode.runtime.hitl import RuntimeHitlHandler
 from stellarcode.tools import (
     ToolDefinition,
     ToolInvocation,
@@ -122,6 +126,155 @@ def test_parallel_tool_batch_timeout_is_reported_without_waiting_for_stuck_tool(
     assert "batch timeout" in results[1].result
 
 
+def test_command_timeout_terminates_descendant_process_tree(tmp_path):
+    registry = build_default_registry(tmp_path)
+    child_code = "import time; time.sleep(30)"
+    parent_code = (
+        "import subprocess, sys, time; "
+        f"subprocess.Popen([sys.executable, '-c', {child_code!r}]); "
+        "print('parent started', flush=True); time.sleep(30)"
+    )
+
+    started = time.monotonic()
+    result = registry.execute_tools(
+        [
+            ToolInvocation(
+                "command-timeout",
+                "execute_command",
+                {
+                    "command": [sys.executable, "-c", parent_code],
+                    "timeout_seconds": 0.2,
+                },
+            )
+        ]
+    )[0]
+    elapsed = time.monotonic() - started
+
+    assert elapsed < (8 if os.name == "nt" else 3)
+    assert not result.success
+    assert "Command timed out after 0.2s" in result.result
+    assert "parent started" in result.result
+
+
+def test_batch_timeout_cancels_running_command_process(tmp_path):
+    registry = build_default_registry(
+        tmp_path,
+        max_parallel_tools=2,
+        tool_batch_timeout_seconds=0.2,
+    )
+    started = time.monotonic()
+    results = registry.execute_tools(
+        [
+            ToolInvocation(
+                "slow-command",
+                "execute_command",
+                {
+                    "command": [sys.executable, "-c", "import time; time.sleep(30)"],
+                    "timeout_seconds": 30,
+                },
+            ),
+            ToolInvocation("quick-list", "list_dir", {"path": "."}),
+        ]
+    )
+    elapsed = time.monotonic() - started
+
+    assert elapsed < 2
+    assert results[0].timed_out
+    assert "batch timeout" in results[0].result
+    assert results[1].success
+
+
+def test_task_cancellation_stops_running_command_process(tmp_path):
+    registry = build_default_registry(tmp_path)
+    cancellation_event = threading.Event()
+    threading.Timer(0.2, cancellation_event.set).start()
+
+    started = time.monotonic()
+    result = registry.execute_tools(
+        [
+            ToolInvocation(
+                "cancel-command",
+                "execute_command",
+                {
+                    "command": [sys.executable, "-c", "import time; time.sleep(30)"],
+                    "timeout_seconds": 30,
+                },
+            )
+        ],
+        cancellation_event=cancellation_event,
+    )[0]
+
+    assert time.monotonic() - started < (8 if os.name == "nt" else 3)
+    assert not result.success
+    assert "cancelled" in result.result.lower()
+
+
+def test_task_cancellation_stops_waiting_for_a_blocking_generic_tool():
+    registry = _sleep_registry()
+    cancellation_event = threading.Event()
+    threading.Timer(0.05, cancellation_event.set).start()
+
+    started = time.monotonic()
+    result = registry.execute_tools(
+        [ToolInvocation("slow", "sleep_tool", {"label": "late", "delay": 5})],
+        cancellation_event=cancellation_event,
+    )[0]
+
+    assert time.monotonic() - started < 1
+    assert not result.success
+    assert "cancelled" in result.result.lower()
+
+
+def test_quiescence_waits_for_a_detached_cancelled_tool_to_finish():
+    registry = _sleep_registry()
+    cancellation_event = threading.Event()
+    threading.Timer(0.02, cancellation_event.set).start()
+
+    result = registry.execute_tools(
+        [ToolInvocation("slow", "sleep_tool", {"label": "late", "delay": 0.2})],
+        cancellation_event=cancellation_event,
+    )[0]
+
+    assert not result.success
+    started = time.monotonic()
+    assert registry.wait_for_quiescence(timeout_seconds=1)
+    assert time.monotonic() - started >= 0.1
+
+
+def test_quiescence_is_scoped_to_the_owning_task():
+    registry = ToolRegistry()
+    started = threading.Barrier(3)
+    releases = {"one": threading.Event(), "two": threading.Event()}
+
+    def blocking(label: str) -> str:
+        started.wait()
+        releases[label].wait()
+        return label
+
+    registry.register(
+        ToolDefinition("blocking", "Test helper.", {"type": "object"}, blocking)
+    )
+
+    def run(task_id: str, label: str) -> None:
+        with llm_runtime_scope(f"session-{label}", task_id):
+            registry.execute("blocking", {"label": label})
+
+    first = threading.Thread(target=run, args=("task-one", "one"), daemon=True)
+    second = threading.Thread(target=run, args=("task-two", "two"), daemon=True)
+    first.start()
+    second.start()
+    started.wait()
+    releases["one"].set()
+    first.join(timeout=1)
+
+    assert registry.wait_for_quiescence(timeout_seconds=0.1, task_id="task-one")
+    assert not registry.wait_for_quiescence(timeout_seconds=0.05)
+    assert second.is_alive()
+    releases["two"].set()
+    second.join(timeout=1)
+    assert registry.wait_for_quiescence(timeout_seconds=0.1)
+
+
 def test_parallel_tool_failure_does_not_discard_other_results():
     registry = ToolRegistry()
 
@@ -189,6 +342,102 @@ def test_restricted_batch_collects_approvals_before_parallel_execution(tmp_path)
     assert all(result.success for result in results)
     assert (tmp_path / "one.txt").read_text(encoding="utf-8") == "one"
     assert (tmp_path / "two.txt").read_text(encoding="utf-8") == "two"
+
+
+def test_desktop_batch_publishes_all_approvals_before_waiting(tmp_path):
+    condition = threading.Condition()
+    requested: list[dict[str, Any]] = []
+    results: list[Any] = []
+
+    def emit(event_type: str, data: dict[str, Any]) -> None:
+        if event_type != "approval.requested":
+            return
+        with condition:
+            requested.append(data)
+            condition.notify_all()
+
+    handler = RuntimeHitlHandler(emit)
+    registry = build_default_registry(tmp_path, hitl_handler=handler)
+
+    def execute_batch() -> None:
+        with llm_runtime_scope("session-one", "task-one"):
+            results.extend(registry.execute_tools([
+                ToolInvocation(
+                    "one",
+                    "write_file",
+                    {"path": "one.txt", "content": "one"},
+                ),
+                ToolInvocation(
+                    "two",
+                    "write_file",
+                    {"path": "two.txt", "content": "two"},
+                ),
+            ]))
+
+    worker = threading.Thread(target=execute_batch, daemon=True)
+    worker.start()
+    with condition:
+        assert condition.wait_for(lambda: len(requested) == 2, timeout=2)
+
+    contexts = [handler.context(item["approval_id"]) for item in requested]
+    assert contexts == [("session-one", "task-one"), ("session-one", "task-one")]
+    for item in requested:
+        assert handler.resolve(item["approval_id"], "approve")
+
+    worker.join(timeout=2)
+    assert not worker.is_alive()
+    assert all(result.success for result in results)
+    assert (tmp_path / "one.txt").read_text(encoding="utf-8") == "one"
+    assert (tmp_path / "two.txt").read_text(encoding="utf-8") == "two"
+
+
+def test_stop_releases_remaining_approvals_after_one_batch_rejection(tmp_path):
+    condition = threading.Condition()
+    requested: list[dict[str, Any]] = []
+    results: list[Any] = []
+    cancellation_event = threading.Event()
+
+    def emit(event_type: str, data: dict[str, Any]) -> None:
+        if event_type != "approval.requested":
+            return
+        with condition:
+            requested.append(data)
+            condition.notify_all()
+
+    handler = RuntimeHitlHandler(emit)
+    registry = build_default_registry(tmp_path, hitl_handler=handler)
+
+    def execute_batch() -> None:
+        with llm_runtime_scope("session-one", "task-one"):
+            results.extend(registry.execute_tools(
+                [
+                    ToolInvocation(
+                        "one",
+                        "execute_command",
+                        {"command": "echo one"},
+                    ),
+                    ToolInvocation(
+                        "two",
+                        "execute_command",
+                        {"command": "echo two"},
+                    ),
+                ],
+                cancellation_event=cancellation_event,
+            ))
+
+    worker = threading.Thread(target=execute_batch, daemon=True)
+    worker.start()
+    with condition:
+        assert condition.wait_for(lambda: len(requested) == 2, timeout=2)
+
+    assert handler.resolve(requested[0]["approval_id"], "reject")
+    cancellation_event.set()
+    handler.reject_task("task-one", "Task cancelled by user.")
+
+    worker.join(timeout=2)
+    assert not worker.is_alive()
+    assert len(results) == 2
+    assert all(not result.success for result in results)
 
 
 def test_restricted_mode_blocks_full_disk_scan_but_full_access_bypasses_policy():

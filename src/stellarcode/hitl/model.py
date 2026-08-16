@@ -24,6 +24,9 @@ class ApprovalRequest:
     risk_description: str
     suggestion: str | None = None
     caller_context: str | None = None
+    tool_call_id: str | None = None
+    change_preview: dict[str, Any] | None = None
+    display_arguments: dict[str, Any] | None = None
 
     @classmethod
     def create(
@@ -32,6 +35,9 @@ class ApprovalRequest:
         arguments: str,
         suggestion: str | None = None,
         caller_context: str | None = None,
+        tool_call_id: str | None = None,
+        change_preview: dict[str, Any] | None = None,
+        display_arguments: dict[str, Any] | None = None,
     ) -> "ApprovalRequest":
         return cls(
             tool_name=tool_name,
@@ -40,6 +46,9 @@ class ApprovalRequest:
             risk_description=ApprovalPolicy.risk_description(tool_name, arguments),
             suggestion=suggestion,
             caller_context=caller_context,
+            tool_call_id=tool_call_id,
+            change_preview=change_preview,
+            display_arguments=display_arguments,
         )
 
     def to_display_text(self, use_icons: bool = True) -> str:

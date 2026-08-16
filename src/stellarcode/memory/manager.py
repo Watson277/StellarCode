@@ -17,9 +17,14 @@ class MemoryManager:
         storage_dir: str | Path | None = None,
         short_term_tokens: int = 8192,
         context_window: int = 200_000,
+        long_term: LongTermMemory | None = None,
     ) -> None:
         self.short_term = ConversationMemory(max_tokens=short_term_tokens)
-        self.long_term = LongTermMemory(storage_dir=storage_dir)
+        self.long_term = (
+            long_term
+            if long_term is not None
+            else LongTermMemory(storage_dir=storage_dir)
+        )
         self.compressor = ContextCompressor()
         self.retriever = MemoryRetriever()
         self.token_budget = TokenBudget(context_window=context_window)
@@ -104,7 +109,7 @@ class MemoryManager:
                     f"{short_tokens} tokens (budget: {self.short_term.max_tokens}, "
                     f"usage: {self.short_term.usage_ratio():.0%}, compressed summaries: "
                     f"{len(self.short_term.compressed_summaries)})",
-                    f"Long-term: {len(self.long_term.entries)} entries / "
+                    f"Long-term: {self.long_term.count()} entries / "
                     f"{long_tokens} tokens (file: {self.long_term.storage_file})",
                     self.token_budget.report(),
                 ]

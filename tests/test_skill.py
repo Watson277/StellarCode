@@ -13,7 +13,9 @@ from stellarcode.skill import (
     SkillSource,
     SkillStateStore,
     activate_skill_context,
-    builtin_skills_dir,
+    bootstrap_bundled_skills,
+    bundled_skills_dir,
+    explicit_skill_context,
     format_skill_index,
     handle_skill_command,
     parse_frontmatter,
@@ -70,15 +72,13 @@ def test_frontmatter_parser_keeps_body_and_warns_without_markers():
     assert result.warnings
 
 
-def test_registry_uses_builtin_user_project_override_order(tmp_path):
-    builtin = tmp_path / "builtin"
+def test_registry_uses_user_project_override_order(tmp_path):
     user = tmp_path / "user"
     project = tmp_path / "project"
-    _write_skill(builtin, "shared", body="builtin body")
     _write_skill(user, "shared", body="user body")
     project_path = _write_skill(project, "different-directory", name="shared", body="project")
     state = SkillStateStore(tmp_path / "skills.json")
-    registry = SkillRegistry(builtin, user, project, state)
+    registry = SkillRegistry(user, project, state)
 
     registry.reload()
 
@@ -106,7 +106,7 @@ def test_registry_filters_disabled_skills_and_commands_toggle_state(tmp_path):
     root = tmp_path / "skills"
     _write_skill(root, "web-access")
     store = SkillStateStore(tmp_path / "state.json")
-    registry = SkillRegistry(root, None, None, store)
+    registry = SkillRegistry(root, None, store)
     registry.reload()
 
     disabled = handle_skill_command("/skill off web-access", registry, store)
@@ -131,7 +131,7 @@ def test_skill_commands_display_registry_warnings(tmp_path):
         encoding="utf-8",
     )
     store = SkillStateStore(tmp_path / "state.json")
-    registry = SkillRegistry(root, None, None, store)
+    registry = SkillRegistry(root, None, store)
     registry.reload()
 
     listed = handle_skill_command("/skill", registry, store)
@@ -149,7 +149,7 @@ def test_state_write_failure_is_reported_without_leaving_temp_file(
     root = tmp_path / "skills"
     _write_skill(root, "web-access")
     store = SkillStateStore(tmp_path / ".stellarcode" / "skills.json")
-    registry = SkillRegistry(root, None, None, store)
+    registry = SkillRegistry(root, None, store)
     registry.reload()
 
     def fail_replace(_source, _target):
@@ -190,7 +190,7 @@ def test_skill_index_respects_count_and_utf8_budget(tmp_path):
             f"skill-{index:02}",
             description="中文描述" * 200,
         )
-    registry = SkillRegistry(root, None, None)
+    registry = SkillRegistry(root, None)
     registry.reload()
 
     index = format_skill_index(registry.enabled_skills())
@@ -209,7 +209,7 @@ def test_load_skill_tool_queues_body_for_next_agent_user_message(tmp_path):
         description="Use for web research.",
         body="Always inspect the page evidence.",
     )
-    registry = SkillRegistry(skills_root, None, None)
+    registry = SkillRegistry(skills_root, None)
     registry.reload()
     buffer = SkillContextBuffer()
     tools = ToolRegistry()
@@ -264,11 +264,34 @@ def test_load_skill_tool_queues_body_for_next_agent_user_message(tmp_path):
     assert buffer.is_empty()
 
 
+def test_explicit_skill_reference_loads_enabled_guidance_for_current_task(tmp_path):
+    skills_root = tmp_path / "skills"
+    _write_skill(
+        skills_root,
+        "web-access",
+        body="Inspect primary evidence before answering.",
+    )
+    state = SkillStateStore(tmp_path / "state.json")
+    registry = SkillRegistry(skills_root, None, state)
+    registry.reload()
+
+    rendered = explicit_skill_context(
+        "@skill:web-access @skill:web-access investigate this page",
+        registry,
+    )
+
+    assert rendered.count("Explicitly referenced Skill: web-access") == 1
+    assert "Inspect primary evidence before answering." in rendered
+
+    state.disable("web-access")
+    assert explicit_skill_context("@skill:web-access investigate", registry) == ""
+
+
 def test_parallel_tool_threads_route_skill_loads_to_the_calling_context(tmp_path):
     skills_root = tmp_path / "skills"
     _write_skill(skills_root, "alpha", body="Alpha guidance.")
     _write_skill(skills_root, "beta", body="Beta guidance.")
-    registry = SkillRegistry(skills_root, None, None)
+    registry = SkillRegistry(skills_root, None)
     registry.reload()
     tools = ToolRegistry(max_parallel_tools=2)
     register_skill_tools(tools, registry)
@@ -327,13 +350,26 @@ def test_multi_agent_assigns_an_independent_skill_buffer_to_every_role(tmp_path)
     assert len({id(buffer) for buffer in buffers}) == len(buffers)
 
 
-def test_builtin_web_access_skill_and_references_are_packaged():
-    registry = SkillRegistry(builtin_skills_dir(), None, None)
+def test_bundled_web_access_is_installed_into_user_skills(tmp_path):
+    user_skills = tmp_path / "user-skills"
+    assert bootstrap_bundled_skills(user_skills) == ()
+    registry = SkillRegistry(user_skills, None)
     registry.reload()
 
     skill = registry.find_skill("web-access")
 
     assert skill is not None
+    assert skill.source == SkillSource.USER
+    assert skill.skill_md_path == user_skills / "web-access" / "SKILL.md"
     assert skill.references_dir is not None
     assert (skill.references_dir / "cdp-cheatsheet.md").is_file()
     assert (skill.references_dir / "site-patterns" / "github.com.md").is_file()
+    assert bundled_skills_dir().is_dir()
+
+
+def test_bundled_skill_bootstrap_never_overwrites_user_copy(tmp_path):
+    user_skills = tmp_path / "user-skills"
+    custom = _write_skill(user_skills, "web-access", body="custom user guidance")
+
+    assert bootstrap_bundled_skills(user_skills) == ()
+    assert "custom user guidance" in custom.read_text(encoding="utf-8")

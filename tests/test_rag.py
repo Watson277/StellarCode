@@ -11,6 +11,7 @@ from stellarcode.rag import (
     CodeRetriever,
     EmbeddingClient,
     RagService,
+    RagSourceStore,
     SearchResultFormatter,
     VectorStore,
     tokenize_query,
@@ -346,6 +347,86 @@ def test_rag_service_can_switch_to_an_external_index_project(tmp_path: Path):
     assert result.chunk_count >= 4
     assert service.project_path == external.resolve()
     assert matches[0].file_path == "service.py"
+
+
+def test_desktop_rag_indexes_multiple_sources_in_workspace_namespace(tmp_path: Path):
+    workspace = tmp_path / "workspace"
+    external = tmp_path / "external"
+    workspace.mkdir()
+    external.mkdir()
+    local_file = workspace / "local.py"
+    external_file = external / "external.py"
+    local_file.write_text("def local_symbol(): return 'local'", encoding="utf-8")
+    external_file.write_text("def external_symbol(): return 'external'", encoding="utf-8")
+    service = RagService(
+        workspace,
+        storage_dir=tmp_path / "rag",
+        embedding_client=EmbeddingClient(provider="local"),
+    )
+
+    result = service.index_sources([local_file, external_file, workspace])
+
+    assert result.file_count == 2
+    assert service.project_path == workspace.resolve()
+    assert service.stats().file_count == 2
+    assert service.search("local_symbol", top_k=3)
+    assert any("external.py" in match.file_path for match in service.search("external_symbol", 3))
+
+
+def test_rag_source_store_persists_sources_and_invalidates_stale_index_metadata(tmp_path: Path):
+    first = tmp_path / "first.py"
+    second = tmp_path / "second"
+    first.write_text("print('first')", encoding="utf-8")
+    second.mkdir()
+    store = RagSourceStore(tmp_path / "project-data" / "rag" / "sources.json")
+
+    store.add([first])
+    store.record_index(
+        {"chunk_count": 1},
+        embedding_provider="local",
+        embedding_model="hash-embedding-256",
+    )
+    assert store.snapshot()["last_indexed_at"]
+
+    sources = store.add([first, second])
+    snapshot = store.snapshot()
+
+    assert len(sources) == 2
+    assert snapshot["last_indexed_at"] is None
+    assert RagSourceStore(store.path).snapshot()["sources"] == sources
+    assert len(store.remove(first)) == 1
+
+
+def test_search_code_schema_exposes_desktop_retrieval_policy(tmp_path: Path):
+    manual_registry = build_default_registry(
+        tmp_path,
+        rag_service=RagService(
+            tmp_path,
+            storage_dir=tmp_path / "rag",
+            embedding_client=EmbeddingClient(provider="local"),
+        ),
+        rag_auto_retrieval=False,
+    )
+
+    search_schema = next(
+        schema["function"]
+        for schema in manual_registry.schemas()
+        if schema["function"]["name"] == "search_code"
+    )
+
+    assert "Automatic retrieval is disabled" in search_schema["description"]
+    assert "explicitly asks" in search_schema["description"]
+
+    service = RagService(
+        tmp_path,
+        storage_dir=tmp_path / "rag",
+        embedding_client=EmbeddingClient(provider="local"),
+    )
+    service.set_readiness_check(lambda: "Rebuild the desktop RAG index first.")
+    guarded_registry = build_default_registry(tmp_path, rag_service=service)
+    assert guarded_registry.execute("search_code", {"query": "demo"}) == (
+        "Rebuild the desktop RAG index first."
+    )
 
 
 def test_formatter_includes_location_summary_and_real_code():

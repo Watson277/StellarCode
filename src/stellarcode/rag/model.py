@@ -95,6 +95,7 @@ class SearchResult:
 class IndexStats:
     chunk_count: int
     relation_count: int
+    file_count: int = 0
 
 
 @dataclass(frozen=True)
