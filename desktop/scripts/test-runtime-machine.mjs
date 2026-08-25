@@ -166,6 +166,35 @@ state = machine.transitionFrontendRuntime(state, {
 });
 assert.equal(state.connection, "starting");
 
+assert.equal(machine.shouldOpenActivatedWorkspace({
+  connection: "starting",
+  activeProjectId: "project-first",
+  targetProjectId: "project-first",
+  pendingActivationProjectId: "project-first",
+  workspaceOpenRequestId: "",
+}), true, "the first project must open after its Sidecar starts");
+assert.equal(machine.shouldOpenActivatedWorkspace({
+  connection: "starting",
+  activeProjectId: "project-first",
+  targetProjectId: "project-first",
+  pendingActivationProjectId: "project-first",
+  workspaceOpenRequestId: "workspace-open-early-ready",
+}), false, "an early runtime.ready request must suppress the fallback request");
+assert.equal(machine.shouldOpenActivatedWorkspace({
+  connection: "online",
+  activeProjectId: "project-first",
+  targetProjectId: "project-first",
+  pendingActivationProjectId: "",
+  workspaceOpenRequestId: "",
+}), false, "a confirmed activation must not reopen the workspace");
+assert.equal(machine.shouldOpenActivatedWorkspace({
+  connection: "starting",
+  activeProjectId: "project-other",
+  targetProjectId: "project-first",
+  pendingActivationProjectId: "project-first",
+  workspaceOpenRequestId: "",
+}), false, "a stale startup completion cannot reopen a project after the user switches");
+
 const projectRoutes = {
   ...machine.INITIAL_FRONTEND_RUNTIME_STATE,
   tasksBySession: {

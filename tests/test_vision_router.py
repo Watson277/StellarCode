@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from stellarcode.llm import DeepSeekClient, GLMClient, VisionRoutingClient, create_chat_client
+from stellarcode.llm import GLMClient, OpenAICompatibleClient, VisionRoutingClient, create_chat_client
 
 
 def _image_message() -> dict[str, Any]:
@@ -45,23 +45,23 @@ def test_router_uses_primary_for_text_and_vision_client_for_images():
     assert client.supports_image_input() is True
 
 
-def test_factory_combines_deepseek_text_with_configured_glm_vision(monkeypatch):
-    monkeypatch.setenv("LLM_PROVIDER", "deepseek")
-    monkeypatch.setenv("DEEPSEEK_API_KEY", "deepseek-test")
-    monkeypatch.setenv("DEEPSEEK_MODEL", "deepseek-text")
-    monkeypatch.setenv("VISION_PROVIDER", "glm")
-    monkeypatch.setenv("GLM_API_KEY", "glm-test")
-    monkeypatch.setenv("GLM_VISION_MODEL", "glm-5v-test")
+def test_factory_combines_provider_free_text_and_vision_endpoints(monkeypatch):
+    monkeypatch.setenv("LLM_API_KEY", "text-test")
+    monkeypatch.setenv("LLM_BASE_URL", "https://text.example/v1")
+    monkeypatch.setenv("LLM_MODEL_NAME", "text-model")
+    monkeypatch.setenv("VISION_API_KEY", "vision-test")
+    monkeypatch.setenv("VISION_BASE_URL", "https://vision.example/v1")
+    monkeypatch.setenv("VISION_MODEL_NAME", "vision-model")
 
     client = create_chat_client()
 
     assert isinstance(client, VisionRoutingClient)
-    assert isinstance(client.primary, DeepSeekClient)
-    assert isinstance(client.vision, GLMClient)
+    assert isinstance(client.primary, OpenAICompatibleClient)
+    assert isinstance(client.vision, OpenAICompatibleClient)
     assert client.model_for_messages([{"role": "user", "content": "hello"}]) == (
-        "deepseek-text"
+        "text-model"
     )
-    assert client.model_for_messages([_image_message()]) == "glm-5v-test"
+    assert client.model_for_messages([_image_message()]) == "vision-model"
 
 
 def test_glm_vision_removes_deepseek_reasoning_fields():

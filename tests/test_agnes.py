@@ -3,7 +3,7 @@ from __future__ import annotations
 import httpx
 import pytest
 
-from stellarcode.llm import AgnesApiError, AgnesClient, create_chat_client
+from stellarcode.llm import AgnesApiError, AgnesClient, OpenAICompatibleClient, create_chat_client
 
 
 def _image_message() -> dict[str, object]:
@@ -96,21 +96,24 @@ def test_agnes_reports_api_error(monkeypatch):
         client.chat([{"role": "user", "content": "hello"}])
 
 
-def test_factory_selects_agnes_from_environment(monkeypatch):
-    monkeypatch.setenv("LLM_PROVIDER", "agnes")
-    monkeypatch.setenv("AGNES_API_KEY", "test")
-    monkeypatch.setenv("AGNES_MODEL", "agnes-text")
-    monkeypatch.setenv("AGNES_VISION_MODEL", "agnes-vision")
+def test_factory_accepts_keyless_local_endpoint(monkeypatch):
+    monkeypatch.setenv("LLM_API_KEY", "")
+    monkeypatch.setenv("LLM_BASE_URL", "http://127.0.0.1:11434/v1")
+    monkeypatch.setenv("LLM_MODEL_NAME", "local-model")
+    monkeypatch.delenv("VISION_BASE_URL", raising=False)
+    monkeypatch.delenv("VISION_MODEL_NAME", raising=False)
 
     client = create_chat_client()
 
-    assert isinstance(client, AgnesClient)
-    assert client.model == "agnes-text"
-    assert client.vision_model == "agnes-vision"
+    assert isinstance(client, OpenAICompatibleClient)
+    assert client.api_key == ""
+    assert client.model == "local-model"
 
 
-def test_factory_rejects_unknown_provider(monkeypatch):
-    monkeypatch.setenv("LLM_PROVIDER", "unknown")
+def test_factory_requires_url_and_model_instead_of_provider(monkeypatch):
+    monkeypatch.delenv("LLM_PROVIDER", raising=False)
+    monkeypatch.delenv("LLM_BASE_URL", raising=False)
+    monkeypatch.delenv("LLM_MODEL_NAME", raising=False)
 
-    with pytest.raises(ValueError, match="Unsupported LLM_PROVIDER"):
+    with pytest.raises(ValueError, match="LLM_MODEL_NAME is required"):
         create_chat_client()

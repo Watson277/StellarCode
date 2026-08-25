@@ -3,11 +3,11 @@
 from __future__ import annotations
 
 import copy
-import os
 import time
 from typing import Any, Callable
 
 from stellarcode.image import strip_images_for_text_model
+from stellarcode.llm.environment import first_env
 from stellarcode.llm.openai_stream import consume_chat_completion_stream
 from stellarcode.llm.types import ChatResult, TokenUsage
 
@@ -54,30 +54,47 @@ class GLMClient:
         *,
         vision_model: str | None = None,
         vision_api_key: str | None = None,
+        vision_base_url: str | None = None,
         max_retries: int = 2,
         retry_base_seconds: float = 1.0,
     ) -> None:
-        self.api_key = api_key or os.getenv("GLM_API_KEY")
-        self.model = model or os.getenv("GLM_MODEL", "glm-5.1")
-        configured_vision_model = vision_model or os.getenv(
-            "GLM_VISION_MODEL",
-            self.DEFAULT_VISION_MODEL,
+        self.api_key = api_key or first_env("LLM_API_KEY", "GLM_API_KEY")
+        self.model = model or first_env("LLM_MODEL_NAME", "GLM_MODEL", default="glm-5.1")
+        configured_vision_model = vision_model or first_env(
+            "VISION_MODEL_NAME", "GLM_VISION_MODEL", default=self.DEFAULT_VISION_MODEL
         )
         self.vision_model = (
             ""
             if configured_vision_model.strip().lower() in {"off", "none", "disabled"}
             else configured_vision_model.strip()
         )
-        self.vision_api_key = vision_api_key or os.getenv("GLM_VISION_API_KEY") or self.api_key
-        configured_url = base_url or os.getenv("GLM_BASE_URL")
+        self.vision_api_key = (
+            vision_api_key
+            or first_env("VISION_API_KEY", "GLM_VISION_API_KEY")
+            or self.api_key
+        )
+        raw_configured_url = base_url or first_env("LLM_BASE_URL", "GLM_BASE_URL")
+        raw_configured_vision_url = vision_base_url or first_env("VISION_BASE_URL")
+        configured_url = (
+            _chat_completions_url(raw_configured_url) if raw_configured_url else None
+        )
+        configured_vision_url = (
+            _chat_completions_url(raw_configured_vision_url)
+            if raw_configured_vision_url
+            else None
+        )
         self._configured_base_url = configured_url
+        self._configured_vision_base_url = configured_vision_url or configured_url
         self.base_url = configured_url or self._default_base_url(self.model)
         self.timeout_seconds = timeout_seconds
         self.max_retries = max(0, max_retries)
         self.retry_base_seconds = max(0.0, retry_base_seconds)
 
         if not self.api_key:
-            raise ValueError("GLM_API_KEY is required. Put it in .env or your environment.")
+            raise ValueError(
+                "LLM_API_KEY is required when LLM_PROVIDER=glm "
+                "(legacy GLM_API_KEY is also supported)."
+            )
 
     def chat(
         self,
@@ -208,6 +225,8 @@ class GLMClient:
         return self.MULTIMODAL_API_URL if self._is_vision_model(model) else self.CODING_API_URL
 
     def _request_base_url(self, model: str) -> str:
+        if self._is_vision_model(model):
+            return self._configured_vision_base_url or self._default_base_url(model)
         return self._configured_base_url or self._default_base_url(model)
 
     def _is_vision_model(self, model: str) -> bool:
@@ -240,6 +259,13 @@ def _messages_have_images(messages: list[dict[str, Any]]) -> bool:
         ):
             return True
     return False
+
+
+def _chat_completions_url(base_url: str) -> str:
+    normalized = base_url.strip().rstrip("/")
+    if normalized.endswith("/chat/completions"):
+        return normalized
+    return normalized + "/chat/completions"
 
 
 def _glm_api_error(response: Any, model: str) -> GLMApiError:

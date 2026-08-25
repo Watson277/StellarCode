@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import sys
 import threading
 import time
 from io import StringIO
@@ -28,10 +29,33 @@ from stellarcode.runtime.protocol import (
 from stellarcode.runtime.recovery import EventJournal, TaskCheckpointStore
 from stellarcode.runtime.sidecar import (
     SidecarServer,
+    _configure_jsonl_standard_streams,
     _desktop_visible_recoveries,
     create_parser,
 )
 from stellarcode.trace import TraceRecorder
+
+
+def test_sidecar_forces_utf8_for_jsonl_standard_streams(monkeypatch):
+    class ReconfigurableStream:
+        def __init__(self):
+            self.calls: list[dict[str, str]] = []
+
+        def reconfigure(self, **kwargs):
+            self.calls.append(kwargs)
+
+    streams = [ReconfigurableStream() for _ in range(3)]
+    monkeypatch.setattr(sys, "stdin", streams[0])
+    monkeypatch.setattr(sys, "stdout", streams[1])
+    monkeypatch.setattr(sys, "stderr", streams[2])
+
+    _configure_jsonl_standard_streams()
+
+    assert [stream.calls for stream in streams] == [
+        [{"encoding": "utf-8", "errors": "strict"}],
+        [{"encoding": "utf-8", "errors": "strict"}],
+        [{"encoding": "utf-8", "errors": "strict"}],
+    ]
 
 
 def test_transcript_entry_persists_task_identity_for_assistant_answers():

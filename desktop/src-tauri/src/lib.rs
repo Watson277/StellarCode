@@ -30,6 +30,31 @@ const CREATE_NO_WINDOW: u32 = 0x08000000;
 #[cfg(target_os = "windows")]
 const CREATE_NEW_PROCESS_GROUP: u32 = 0x00000200;
 
+const USER_ENV_TEMPLATE: &str = "# StellarCode user configuration (secrets stay on this device)\n\
+# Configure any OpenAI-compatible Chat Completions endpoint.\n\
+# LLM_API_KEY=\n\
+# LLM_BASE_URL=\n\
+# LLM_MODEL_NAME=\n\
+\n\
+# Optional OpenAI-compatible vision endpoint. Leave URL and model empty to disable.\n\
+# VISION_API_KEY=\n\
+# VISION_BASE_URL=\n\
+# VISION_MODEL_NAME=\n\
+\n\
+# Optional OpenAI-compatible embedding endpoint. Leave URL empty for local hashing.\n\
+# EMBEDDING_API_KEY=\n\
+# EMBEDDING_BASE_URL=\n\
+# EMBEDDING_MODEL_NAME=\n";
+
+const LEGACY_USER_ENV_TEMPLATE: &str =
+    "# StellarCode user configuration (API keys are stored locally)\n\
+# Choose one provider and fill in its key.\n\
+# LLM_PROVIDER=glm\n\
+# GLM_API_KEY=\n\
+# DEEPSEEK_API_KEY=\n\
+# AGNES_API_KEY=\n\
+# EMBEDDING_API_KEY=\n";
+
 struct RuntimeProcess {
     child: Child,
     stdin: ChildStdin,
@@ -88,6 +113,16 @@ const MAX_ATTACHMENTS: usize = 10;
 const MAX_ATTACHMENT_BYTES: u64 = 50 * 1024 * 1024;
 const MAX_PREVIEW_BYTES: u64 = 20 * 1024 * 1024;
 const MAX_WORKSPACE_FILE_PREVIEW_BYTES: u64 = 2 * 1024 * 1024;
+const MAX_WORKSPACE_FILE_SEARCH_ENTRIES: usize = 25_000;
+const WORKSPACE_FILE_SEARCH_IGNORED_DIRS: &[&str] = &[
+    ".git",
+    ".venv",
+    "node_modules",
+    "target",
+    "__pycache__",
+    ".pytest_cache",
+    ".ruff_cache",
+];
 
 const REVIEWABLE_TEXT_EXTENSIONS: &[&str] = &[
     "c",
@@ -282,8 +317,14 @@ fn resolve_reviewable_workspace_file(
     {
         return Err("reviewed file path must remain inside the project workspace".into());
     }
-    let resolved = fs::canonicalize(root.join(relative))
-        .map_err(|error| format!("cannot resolve reviewed file {relative_path}: {error}"))?;
+    let resolved = match fs::canonicalize(root.join(relative)) {
+        Ok(path) => path,
+        Err(exact_error) => {
+            resolve_unique_workspace_file_suffix(&root, relative)?.ok_or_else(|| {
+                format!("cannot resolve reviewed file {relative_path}: {exact_error}")
+            })?
+        }
+    };
     if !resolved.starts_with(&root) || !resolved.is_file() {
         return Err("reviewed file is outside the project workspace or is not a file".into());
     }
@@ -291,6 +332,101 @@ fn resolve_reviewable_workspace_file(
         return Err("only recognized source, configuration, and text files can be opened in the desktop file viewer".into());
     }
     Ok(resolved)
+}
+
+/// Resolves model-rendered shorthand such as `base.py` to `tools/base.py` only
+/// when exactly one safe workspace file has that path suffix. This keeps file
+/// links useful without guessing when two directories contain the same name.
+fn resolve_unique_workspace_file_suffix(
+    root: &Path,
+    requested: &Path,
+) -> Result<Option<PathBuf>, String> {
+    let mut directories = vec![root.to_path_buf()];
+    let mut visited = 0usize;
+    let mut match_path: Option<PathBuf> = None;
+
+    while let Some(directory) = directories.pop() {
+        let entries = fs::read_dir(&directory).map_err(|error| {
+            format!(
+                "cannot search workspace directory {}: {error}",
+                directory.display()
+            )
+        })?;
+        for entry in entries {
+            let entry = entry.map_err(|error| format!("cannot search workspace files: {error}"))?;
+            visited += 1;
+            if visited > MAX_WORKSPACE_FILE_SEARCH_ENTRIES {
+                return Err(format!(
+                    "workspace file search exceeded {MAX_WORKSPACE_FILE_SEARCH_ENTRIES} entries; use a more specific path"
+                ));
+            }
+            let file_type = entry
+                .file_type()
+                .map_err(|error| format!("cannot inspect workspace entry: {error}"))?;
+            if file_type.is_symlink() {
+                continue;
+            }
+            let path = entry.path();
+            if file_type.is_dir() {
+                let name = entry.file_name().to_string_lossy().to_ascii_lowercase();
+                if !WORKSPACE_FILE_SEARCH_IGNORED_DIRS.contains(&name.as_str()) {
+                    directories.push(path);
+                }
+                continue;
+            }
+            if !file_type.is_file() || !is_reviewable_text_file(&path) {
+                continue;
+            }
+            let relative = path.strip_prefix(root).map_err(|error| {
+                format!("cannot compare workspace file {}: {error}", path.display())
+            })?;
+            if !workspace_path_has_suffix(relative, requested) {
+                continue;
+            }
+            let canonical = fs::canonicalize(&path).map_err(|error| {
+                format!("cannot resolve reviewed file {}: {error}", path.display())
+            })?;
+            if !canonical.starts_with(root) {
+                continue;
+            }
+            if match_path.is_some() {
+                return Err(format!(
+                    "reviewed file path {} is ambiguous; use a path including its parent directory",
+                    requested.display()
+                ));
+            }
+            match_path = Some(canonical);
+        }
+    }
+    Ok(match_path)
+}
+
+fn workspace_path_has_suffix(candidate: &Path, requested: &Path) -> bool {
+    let candidate_parts = candidate
+        .components()
+        .filter_map(|component| match component {
+            std::path::Component::Normal(value) => Some(value.to_string_lossy().into_owned()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    let requested_parts = requested
+        .components()
+        .filter_map(|component| match component {
+            std::path::Component::Normal(value) => Some(value.to_string_lossy().into_owned()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    if requested_parts.is_empty() || requested_parts.len() > candidate_parts.len() {
+        return false;
+    }
+    let suffix = &candidate_parts[candidate_parts.len() - requested_parts.len()..];
+    suffix.iter().zip(&requested_parts).all(|(left, right)| {
+        if cfg!(windows) {
+            left.eq_ignore_ascii_case(right)
+        } else {
+            left == right
+        }
+    })
 }
 
 fn decode_text_preview(bytes: &[u8]) -> String {
@@ -538,18 +674,141 @@ fn ensure_environment_file(root: &Path) -> std::io::Result<()> {
     if !env_path.exists() {
         // Never copy a developer `.env`: it may contain real API keys. A release
         // creates this safe template in the user's application-data directory.
-        fs::write(
-            env_path,
-            "# StellarCode user configuration (API keys are stored locally)\n\
-# Choose one provider and fill in its key.\n\
-# LLM_PROVIDER=glm\n\
-# GLM_API_KEY=\n\
-# DEEPSEEK_API_KEY=\n\
-# AGNES_API_KEY=\n\
-# EMBEDDING_API_KEY=\n",
-        )?;
+        fs::write(env_path, USER_ENV_TEMPLATE)?;
+    } else {
+        let existing = fs::read_to_string(&env_path)?;
+        if existing.trim() == LEGACY_USER_ENV_TEMPLATE.trim() {
+            // Safely migrate the untouched template created by older releases.
+            fs::write(env_path, USER_ENV_TEMPLATE)?;
+        } else {
+            let legacy_text_provider = env_text_value(&existing, "LLM_PROVIDER");
+            let legacy_vision_provider = env_text_value(&existing, "VISION_PROVIDER");
+            // Provider selection was removed in schema v2. Preserve endpoint
+            // credentials while dropping obsolete selector lines.
+            let mut migrated = existing
+                .lines()
+                .filter(|line| {
+                    let key = line.trim().trim_start_matches('#').trim();
+                    !key.starts_with("LLM_PROVIDER=")
+                        && !key.starts_with("VISION_PROVIDER=")
+                        && !key.starts_with("EMBEDDING_PROVIDER=")
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            migrate_legacy_model_values(
+                &existing,
+                &mut migrated,
+                &legacy_text_provider,
+                &legacy_vision_provider,
+            );
+            if !migrated.ends_with('\n') {
+                migrated.push('\n');
+            }
+            if !migrated.contains("LLM_API_KEY") {
+                // Preserve customized legacy values and append the current
+                // schema so users can migrate without losing working credentials.
+                migrated.push_str("\n# Provider-free configuration (preferred)\n");
+                migrated.push_str(USER_ENV_TEMPLATE);
+            }
+            if migrated != existing {
+                fs::write(env_path, migrated)?;
+            }
+        }
     }
     Ok(())
+}
+
+fn migrate_legacy_model_values(
+    original: &str,
+    migrated: &mut String,
+    text_provider: &str,
+    vision_provider: &str,
+) {
+    let text_prefix = legacy_provider_prefix(text_provider);
+    if !text_prefix.is_empty() {
+        append_env_value_if_missing(
+            migrated,
+            "LLM_API_KEY",
+            &env_text_value(original, &format!("{text_prefix}_API_KEY")),
+        );
+        append_env_value_if_missing(
+            migrated,
+            "LLM_BASE_URL",
+            &env_text_value(original, &format!("{text_prefix}_BASE_URL")),
+        );
+        append_env_value_if_missing(
+            migrated,
+            "LLM_MODEL_NAME",
+            &env_text_value(original, &format!("{text_prefix}_MODEL")),
+        );
+    }
+    let vision_prefix = legacy_provider_prefix(vision_provider);
+    if !vision_prefix.is_empty() {
+        let legacy_vision_key =
+            env_text_value(original, &format!("{vision_prefix}_VISION_API_KEY"));
+        let fallback_key = env_text_value(original, &format!("{vision_prefix}_API_KEY"));
+        append_env_value_if_missing(
+            migrated,
+            "VISION_API_KEY",
+            if legacy_vision_key.is_empty() {
+                &fallback_key
+            } else {
+                &legacy_vision_key
+            },
+        );
+        append_env_value_if_missing(
+            migrated,
+            "VISION_BASE_URL",
+            &env_text_value(original, &format!("{vision_prefix}_BASE_URL")),
+        );
+        append_env_value_if_missing(
+            migrated,
+            "VISION_MODEL_NAME",
+            &env_text_value(original, &format!("{vision_prefix}_VISION_MODEL")),
+        );
+    }
+    append_env_value_if_missing(
+        migrated,
+        "EMBEDDING_MODEL_NAME",
+        &env_text_value(original, "EMBEDDING_MODEL"),
+    );
+}
+
+fn append_env_value_if_missing(content: &mut String, name: &str, value: &str) {
+    if value.is_empty() || !env_text_value(content, name).is_empty() {
+        return;
+    }
+    if !content.ends_with('\n') {
+        content.push('\n');
+    }
+    content.push_str(name);
+    content.push('=');
+    content.push_str(value);
+    content.push('\n');
+}
+
+fn env_text_value(content: &str, name: &str) -> String {
+    content
+        .lines()
+        .filter_map(|line| {
+            let trimmed = line.trim();
+            if trimmed.is_empty() || trimmed.starts_with('#') {
+                return None;
+            }
+            let (key, value) = trimmed.split_once('=')?;
+            (key.trim() == name).then(|| value.trim().trim_matches('"').to_string())
+        })
+        .next()
+        .unwrap_or_default()
+}
+
+fn legacy_provider_prefix(value: &str) -> String {
+    let normalized = value.trim().to_ascii_uppercase().replace('-', "_");
+    if ["DEEPSEEK", "GLM", "AGNES"].contains(&normalized.as_str()) {
+        normalized
+    } else {
+        String::new()
+    }
 }
 
 fn python_executable(root: &Path, configured: &str) -> PathBuf {
@@ -783,50 +1042,24 @@ fn runtime_start(
 
 fn apply_model_settings(command: &mut Command, settings: &AppSettings) {
     let models = &settings.models;
-    if models.provider != "environment" {
-        command.env("LLM_PROVIDER", &models.provider);
-        if !models.model.trim().is_empty() {
-            let variable = match models.provider.as_str() {
-                "deepseek" => "DEEPSEEK_MODEL",
-                "glm" => "GLM_MODEL",
-                "agnes" => "AGNES_MODEL",
-                _ => return,
-            };
-            command.env(variable, models.model.trim());
-        }
-        if !models.base_url.trim().is_empty() {
-            let variable = match models.provider.as_str() {
-                "deepseek" => "DEEPSEEK_BASE_URL",
-                "glm" => "GLM_BASE_URL",
-                "agnes" => "AGNES_BASE_URL",
-                _ => return,
-            };
-            command.env(variable, models.base_url.trim());
-        }
+    if !models.model.trim().is_empty() {
+        command.env("LLM_MODEL_NAME", models.model.trim());
     }
-    if models.vision_provider != "environment" {
-        command.env("VISION_PROVIDER", &models.vision_provider);
-        if !models.vision_model.trim().is_empty() {
-            let variable = match models.vision_provider.as_str() {
-                "glm" => Some("GLM_VISION_MODEL"),
-                "agnes" => Some("AGNES_VISION_MODEL"),
-                _ => None,
-            };
-            if let Some(variable) = variable {
-                command.env(variable, models.vision_model.trim());
-            }
-        }
+    if !models.base_url.trim().is_empty() {
+        command.env("LLM_BASE_URL", models.base_url.trim());
+    }
+    if !models.vision_model.trim().is_empty() {
+        command.env("VISION_MODEL_NAME", models.vision_model.trim());
+    }
+    if !models.vision_base_url.trim().is_empty() {
+        command.env("VISION_BASE_URL", models.vision_base_url.trim());
     }
 }
 
 fn apply_rag_settings(command: &mut Command, settings: &AppSettings) {
     let rag = &settings.rag;
-    if rag.provider == "environment" {
-        return;
-    }
-    command.env("EMBEDDING_PROVIDER", &rag.provider);
     if !rag.model.trim().is_empty() {
-        command.env("EMBEDDING_MODEL", rag.model.trim());
+        command.env("EMBEDDING_MODEL_NAME", rag.model.trim());
     }
     if !rag.base_url.trim().is_empty() {
         command.env("EMBEDDING_BASE_URL", rag.base_url.trim());
@@ -967,11 +1200,68 @@ pub fn run() {
 mod attachment_tests {
     use super::{
         apply_model_settings, apply_rag_settings, attachment_type, decode_text_preview,
-        encode_base64, is_reviewable_text_file, tag_runtime_message,
+        encode_base64, ensure_environment_file, is_reviewable_text_file,
+        resolve_reviewable_workspace_file, tag_runtime_message, LEGACY_USER_ENV_TEMPLATE,
     };
+    use crate::project_store::ProjectStore;
     use crate::settings_store::AppSettings;
     use std::path::Path;
     use std::process::Command;
+
+    #[test]
+    fn creates_and_migrates_provider_neutral_environment_template() {
+        let root = std::env::temp_dir().join(format!(
+            "stellarcode-env-template-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+
+        ensure_environment_file(&root).unwrap();
+        let env_path = root.join(".env");
+        let created = std::fs::read_to_string(&env_path).unwrap();
+        assert!(created.contains("# LLM_API_KEY="));
+        assert!(created.contains("# LLM_BASE_URL="));
+        assert!(created.contains("# LLM_MODEL_NAME="));
+        assert!(created.contains("# VISION_MODEL_NAME="));
+        assert!(created.contains("# EMBEDDING_MODEL_NAME="));
+        assert!(!created.contains("# DEEPSEEK_API_KEY="));
+
+        std::fs::write(&env_path, LEGACY_USER_ENV_TEMPLATE).unwrap();
+        ensure_environment_file(&root).unwrap();
+        let migrated = std::fs::read_to_string(&env_path).unwrap();
+        assert!(migrated.contains("# LLM_API_KEY="));
+        assert!(!migrated.contains("# DEEPSEEK_API_KEY="));
+
+        std::fs::write(&env_path, "DEEPSEEK_API_KEY=keep-me\n").unwrap();
+        ensure_environment_file(&root).unwrap();
+        let preserved = std::fs::read_to_string(&env_path).unwrap();
+        assert!(preserved.contains("DEEPSEEK_API_KEY=keep-me"));
+        assert!(preserved.contains("# LLM_API_KEY="));
+
+        std::fs::write(
+            &env_path,
+            "LLM_PROVIDER=deepseek\nLLM_API_KEY=keep-generic\nVISION_PROVIDER=disabled\n",
+        )
+        .unwrap();
+        ensure_environment_file(&root).unwrap();
+        let provider_free = std::fs::read_to_string(&env_path).unwrap();
+        assert!(!provider_free.contains("LLM_PROVIDER"));
+        assert!(!provider_free.contains("VISION_PROVIDER"));
+        assert!(provider_free.contains("LLM_API_KEY=keep-generic"));
+
+        std::fs::write(
+            &env_path,
+            "LLM_PROVIDER=deepseek\nDEEPSEEK_API_KEY=legacy-key\nDEEPSEEK_BASE_URL=https://legacy.example/v1\nDEEPSEEK_MODEL=legacy-model\n",
+        )
+        .unwrap();
+        ensure_environment_file(&root).unwrap();
+        let converted = std::fs::read_to_string(&env_path).unwrap();
+        assert!(!converted.contains("LLM_PROVIDER"));
+        assert!(converted.contains("LLM_API_KEY=legacy-key"));
+        assert!(converted.contains("LLM_BASE_URL=https://legacy.example/v1"));
+        assert!(converted.contains("LLM_MODEL_NAME=legacy-model"));
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn classifies_image_text_and_binary_attachments() {
@@ -1008,6 +1298,51 @@ mod attachment_tests {
     }
 
     #[test]
+    fn resolves_a_unique_nested_workspace_file_from_model_shorthand() {
+        let root = std::env::temp_dir().join(format!(
+            "stellarcode-nested-preview-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let data = root.join("data");
+        let workspace = root.join("workspace");
+        let tools = workspace.join("tools");
+        std::fs::create_dir_all(&tools).unwrap();
+        std::fs::write(tools.join("read_file.py"), "print('nested')\n").unwrap();
+        let store = ProjectStore::load(&data, None).unwrap();
+        let project = store.register(&workspace).unwrap();
+
+        let resolved =
+            resolve_reviewable_workspace_file(&store, &project.id, "read_file.py").unwrap();
+        assert_eq!(
+            resolved,
+            std::fs::canonicalize(tools.join("read_file.py")).unwrap()
+        );
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn rejects_ambiguous_nested_workspace_file_shorthand() {
+        let root = std::env::temp_dir().join(format!(
+            "stellarcode-ambiguous-preview-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let data = root.join("data");
+        let workspace = root.join("workspace");
+        std::fs::create_dir_all(workspace.join("backend")).unwrap();
+        std::fs::create_dir_all(workspace.join("scripts")).unwrap();
+        std::fs::write(workspace.join("backend/app.py"), "backend = True\n").unwrap();
+        std::fs::write(workspace.join("scripts/app.py"), "script = True\n").unwrap();
+        let store = ProjectStore::load(&data, None).unwrap();
+        let project = store.register(&workspace).unwrap();
+
+        let error = resolve_reviewable_workspace_file(&store, &project.id, "app.py").unwrap_err();
+        assert!(error.contains("ambiguous"));
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn decodes_utf8_and_utf16_workspace_previews() {
         assert_eq!(decode_text_preview(b"hello"), "hello");
         assert_eq!(decode_text_preview(&[0xef, 0xbb, 0xbf, b'o', b'k']), "ok");
@@ -1018,11 +1353,10 @@ mod attachment_tests {
     #[test]
     fn applies_non_secret_model_overrides_to_runtime_process() {
         let mut settings = AppSettings::default();
-        settings.models.provider = "deepseek".into();
         settings.models.model = "deepseek-test".into();
         settings.models.base_url = "https://example.test/v1".into();
-        settings.models.vision_provider = "glm".into();
         settings.models.vision_model = "glm-vision-test".into();
+        settings.models.vision_base_url = "https://vision.example.test/v1".into();
         let mut command = Command::new("python");
 
         apply_model_settings(&mut command, &settings);
@@ -1031,16 +1365,18 @@ mod attachment_tests {
             .get_envs()
             .filter_map(|(key, value)| Some((key.to_str()?, value?.to_str()?)))
             .collect::<std::collections::HashMap<_, _>>();
-        assert_eq!(values.get("LLM_PROVIDER"), Some(&"deepseek"));
-        assert_eq!(values.get("DEEPSEEK_MODEL"), Some(&"deepseek-test"));
-        assert_eq!(values.get("VISION_PROVIDER"), Some(&"glm"));
-        assert_eq!(values.get("GLM_VISION_MODEL"), Some(&"glm-vision-test"));
+        assert_eq!(values.get("LLM_MODEL_NAME"), Some(&"deepseek-test"));
+        assert_eq!(values.get("LLM_BASE_URL"), Some(&"https://example.test/v1"));
+        assert_eq!(values.get("VISION_MODEL_NAME"), Some(&"glm-vision-test"));
+        assert_eq!(
+            values.get("VISION_BASE_URL"),
+            Some(&"https://vision.example.test/v1")
+        );
     }
 
     #[test]
     fn applies_non_secret_rag_overrides_to_runtime_process() {
         let mut settings = AppSettings::default();
-        settings.rag.provider = "ollama".into();
         settings.rag.model = "nomic-embed-text".into();
         settings.rag.base_url = "http://localhost:11434".into();
         let mut command = Command::new("python");
@@ -1051,8 +1387,10 @@ mod attachment_tests {
             .get_envs()
             .filter_map(|(key, value)| Some((key.to_str()?, value?.to_str()?)))
             .collect::<std::collections::HashMap<_, _>>();
-        assert_eq!(values.get("EMBEDDING_PROVIDER"), Some(&"ollama"));
-        assert_eq!(values.get("EMBEDDING_MODEL"), Some(&"nomic-embed-text"));
+        assert_eq!(
+            values.get("EMBEDDING_MODEL_NAME"),
+            Some(&"nomic-embed-text")
+        );
         assert_eq!(
             values.get("EMBEDDING_BASE_URL"),
             Some(&"http://localhost:11434")

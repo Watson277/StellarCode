@@ -1,75 +1,95 @@
-"""Create the configured text/vision provider without leaking provider details upward."""
+"""Assemble provider-free text and optional vision endpoints."""
 
 from __future__ import annotations
 
 import os
 
-from stellarcode.llm.agnes_client import AgnesClient
-from stellarcode.llm.deepseek_client import DeepSeekClient
-from stellarcode.llm.glm_client import GLMClient
+from stellarcode.llm.compatible_client import OpenAICompatibleClient
+from stellarcode.llm.environment import first_env
 from stellarcode.llm.vision_router import VisionRoutingClient
 
 
-def create_chat_client(
-    provider: str | None = None,
-) -> AgnesClient | DeepSeekClient | GLMClient | VisionRoutingClient:
-    selected = (provider or os.getenv("LLM_PROVIDER", "glm")).strip().lower()
-    aliases = {
-        "agnes-ai": "agnes",
-        "agnes_ai": "agnes",
-        "sapiens": "agnes",
-        "sapiens-ai": "agnes",
-    }
-    selected = aliases.get(selected, selected)
-    if selected == "agnes":
-        return AgnesClient()
-    if selected == "deepseek":
-        return _with_external_vision_routing(DeepSeekClient())
-    if selected == "glm":
-        client = GLMClient()
-        client.provider_name = "glm"
-        return client
-    raise ValueError(
-        f"Unsupported LLM_PROVIDER: {selected}. Supported providers: glm, agnes, deepseek."
+def create_chat_client() -> OpenAICompatibleClient | VisionRoutingClient:
+    text = _text_configuration()
+    primary = OpenAICompatibleClient(
+        api_key=text["api_key"],
+        base_url=text["base_url"],
+        model=text["model"],
+        role_name="llm",
     )
-
-
-def _with_external_vision_routing(primary: object) -> object:
-    selected = os.getenv("VISION_PROVIDER", "auto").strip().lower()
-    aliases = {"zhipu": "glm", "bigmodel": "glm", "agnes-ai": "agnes"}
-    selected = aliases.get(selected, selected)
-    if selected in {"", "off", "none", "disabled"}:
+    vision = _vision_configuration()
+    if not vision["base_url"] and not vision["model"]:
         return primary
-    if selected == "auto":
-        if _vision_enabled("GLM_API_KEY", "GLM_VISION_MODEL"):
-            selected = "glm"
-        elif _vision_enabled("AGNES_API_KEY", "AGNES_VISION_MODEL"):
-            selected = "agnes"
-        else:
-            return primary
-    if selected == "glm":
-        model = os.getenv("GLM_VISION_MODEL", GLMClient.DEFAULT_VISION_MODEL).strip()
-        if _disabled(model):
-            return primary
-        vision = GLMClient(model=model, vision_model=model)
-        vision.provider_name = "glm"
-        return VisionRoutingClient(primary, vision)
-    if selected == "agnes":
-        model = os.getenv("AGNES_VISION_MODEL", AgnesClient.DEFAULT_MODEL).strip()
-        if _disabled(model):
-            return primary
-        return VisionRoutingClient(
-            primary,
-            AgnesClient(model=model, vision_model=model),
+    if not vision["base_url"] or not vision["model"]:
+        raise ValueError(
+            "VISION_BASE_URL and VISION_MODEL_NAME must both be configured to enable images."
         )
-    raise ValueError(
-        f"Unsupported VISION_PROVIDER: {selected}. Supported providers: auto, glm, agnes."
+    vision_client = OpenAICompatibleClient(
+        api_key=vision["api_key"],
+        base_url=vision["base_url"],
+        model=vision["model"],
+        supports_images=True,
+        role_name="vision",
     )
+    return VisionRoutingClient(primary, vision_client)
 
 
-def _vision_enabled(api_key_name: str, model_name: str) -> bool:
-    return bool(os.getenv(api_key_name)) and not _disabled(os.getenv(model_name, ""))
+def _text_configuration() -> dict[str, str]:
+    legacy_prefix = _legacy_prefix(os.getenv("LLM_PROVIDER", ""))
+    legacy_defaults = {
+        "DEEPSEEK": ("https://api.deepseek.com", "deepseek-v4-flash"),
+        "GLM": ("https://open.bigmodel.cn/api/coding/paas/v4", "glm-5.1"),
+        "AGNES": ("https://apihub.agnes-ai.com/v1", "agnes-2.0-flash"),
+    }
+    default_url, default_model = legacy_defaults.get(legacy_prefix, ("", ""))
+    return {
+        "api_key": str(
+            first_env("LLM_API_KEY", f"{legacy_prefix}_API_KEY" if legacy_prefix else "")
+            or ""
+        ),
+        "base_url": str(
+            first_env(
+                "LLM_BASE_URL",
+                f"{legacy_prefix}_BASE_URL" if legacy_prefix else "",
+                default=default_url,
+            )
+            or ""
+        ),
+        "model": str(
+            first_env(
+                "LLM_MODEL_NAME",
+                f"{legacy_prefix}_MODEL" if legacy_prefix else "",
+                default=default_model,
+            )
+            or ""
+        ),
+    }
 
 
-def _disabled(value: str) -> bool:
-    return value.strip().lower() in {"off", "none", "disabled"}
+def _vision_configuration() -> dict[str, str]:
+    legacy_prefix = _legacy_prefix(os.getenv("VISION_PROVIDER", ""))
+    legacy_default_urls = {
+        "GLM": "https://open.bigmodel.cn/api/paas/v4",
+        "AGNES": "https://apihub.agnes-ai.com/v1",
+    }
+    legacy_model = f"{legacy_prefix}_VISION_MODEL" if legacy_prefix else ""
+    legacy_key = f"{legacy_prefix}_VISION_API_KEY" if legacy_prefix else ""
+    if legacy_prefix and not first_env(legacy_key):
+        legacy_key = f"{legacy_prefix}_API_KEY"
+    return {
+        "api_key": str(first_env("VISION_API_KEY", legacy_key) or ""),
+        "base_url": str(
+            first_env(
+                "VISION_BASE_URL",
+                f"{legacy_prefix}_BASE_URL" if legacy_prefix else "",
+                default=legacy_default_urls.get(legacy_prefix, ""),
+            )
+            or ""
+        ),
+        "model": str(first_env("VISION_MODEL_NAME", legacy_model) or ""),
+    }
+
+
+def _legacy_prefix(value: str) -> str:
+    selected = value.strip().upper().replace("-", "_")
+    return selected if selected in {"DEEPSEEK", "GLM", "AGNES"} else ""

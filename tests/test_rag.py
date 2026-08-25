@@ -42,7 +42,7 @@ def build_service() -> UserService:
 
 class StubEmbeddingClient(EmbeddingClient):
     def __init__(self, vector: list[float] | None = None) -> None:
-        super().__init__(provider="local")
+        super().__init__()
         self.vector = vector or [1.0, 0.0]
 
     def embed(self, text: str | None) -> list[float]:
@@ -109,7 +109,7 @@ def test_python_analyzer_extracts_imports_inheritance_contains_and_calls(tmp_pat
 
 
 def test_embedding_client_supports_empty_and_local_vectors():
-    client = EmbeddingClient(provider="local")
+    client = EmbeddingClient()
 
     assert client.embed("") == []
     first = client.embed("Agent run tool call")
@@ -118,25 +118,10 @@ def test_embedding_client_supports_empty_and_local_vectors():
     assert first == second
 
 
-def test_embedding_client_supports_ollama_and_openai_compatible_payloads(monkeypatch):
+def test_embedding_client_supports_openai_compatible_payload(monkeypatch):
     calls: list[tuple[str, dict[str, object], bool]] = []
 
-    ollama = EmbeddingClient(
-        provider="ollama",
-        model="nomic-embed-text",
-        base_url="http://ollama.test",
-    )
-    monkeypatch.setattr(
-        ollama,
-        "_post_json",
-        lambda url, payload, use_auth: (
-            calls.append((url, payload, use_auth)) or {"embedding": [0.1, 0.2]}
-        ),
-    )
-    assert ollama.embed("hello") == [0.1, 0.2]
-
     compatible = EmbeddingClient(
-        provider="glm",
         model="embedding-3",
         base_url="https://embedding.test/v1",
         api_key="test-key",
@@ -151,11 +136,6 @@ def test_embedding_client_supports_ollama_and_openai_compatible_payloads(monkeyp
     assert compatible.embed("world") == [0.3, 0.4]
 
     assert calls == [
-        (
-            "http://ollama.test/api/embeddings",
-            {"model": "nomic-embed-text", "prompt": "hello"},
-            False,
-        ),
         (
             "https://embedding.test/v1/embeddings",
             {"model": "embedding-3", "input": "world"},
@@ -295,7 +275,7 @@ def test_code_index_service_and_search_code_tool_work_end_to_end(tmp_path: Path)
     service = RagService(
         project,
         storage_dir=storage,
-        embedding_client=EmbeddingClient(provider="local"),
+        embedding_client=EmbeddingClient(),
     )
 
     index_result = service.index(progress_callback=progress.append)
@@ -342,7 +322,7 @@ def test_rag_service_can_switch_to_an_external_index_project(tmp_path: Path):
     service = RagService(
         workspace,
         storage_dir=tmp_path / "rag",
-        embedding_client=EmbeddingClient(provider="local"),
+        embedding_client=EmbeddingClient(),
     )
 
     result = service.index(external)
@@ -365,7 +345,7 @@ def test_desktop_rag_indexes_multiple_sources_in_workspace_namespace(tmp_path: P
     service = RagService(
         workspace,
         storage_dir=tmp_path / "rag",
-        embedding_client=EmbeddingClient(provider="local"),
+        embedding_client=EmbeddingClient(),
     )
 
     result = service.index_sources([local_file, external_file, workspace])
@@ -407,7 +387,7 @@ def test_search_code_schema_is_a_static_single_tool_contract(tmp_path: Path):
         rag_service=RagService(
             tmp_path,
             storage_dir=tmp_path / "rag",
-            embedding_client=EmbeddingClient(provider="local"),
+            embedding_client=EmbeddingClient(),
         ),
     )
 
@@ -426,7 +406,7 @@ def test_search_code_schema_is_a_static_single_tool_contract(tmp_path: Path):
     service = RagService(
         tmp_path,
         storage_dir=tmp_path / "rag",
-        embedding_client=EmbeddingClient(provider="local"),
+        embedding_client=EmbeddingClient(),
     )
     service.set_readiness_check(lambda: "Rebuild the desktop RAG index first.")
     guarded_registry = build_default_registry(tmp_path, rag_service=service)

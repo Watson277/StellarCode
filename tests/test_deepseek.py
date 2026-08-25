@@ -3,7 +3,12 @@ from __future__ import annotations
 import httpx
 import pytest
 
-from stellarcode.llm import DeepSeekApiError, DeepSeekClient, create_chat_client
+from stellarcode.llm import (
+    DeepSeekApiError,
+    DeepSeekClient,
+    OpenAICompatibleClient,
+    create_chat_client,
+)
 from stellarcode.llm.message_history import (
     INTERRUPTED_TOOL_RESULT,
     repair_tool_message_history,
@@ -145,16 +150,18 @@ def test_deepseek_reports_api_error(monkeypatch):
         client.chat([{"role": "user", "content": "hello"}])
 
 
-def test_factory_selects_deepseek_from_environment(monkeypatch):
-    monkeypatch.setenv("LLM_PROVIDER", "deepseek")
-    monkeypatch.setenv("DEEPSEEK_API_KEY", "test")
-    monkeypatch.setenv("DEEPSEEK_MODEL", "deepseek-v4-flash")
-    monkeypatch.setenv("VISION_PROVIDER", "disabled")
+def test_factory_uses_provider_free_text_environment(monkeypatch):
+    monkeypatch.setenv("LLM_API_KEY", "test")
+    monkeypatch.setenv("LLM_BASE_URL", "https://chat.example/v1")
+    monkeypatch.setenv("LLM_MODEL_NAME", "user-model")
+    monkeypatch.delenv("VISION_BASE_URL", raising=False)
+    monkeypatch.delenv("VISION_MODEL_NAME", raising=False)
 
     client = create_chat_client()
 
-    assert isinstance(client, DeepSeekClient)
-    assert client.model == "deepseek-v4-flash"
+    assert isinstance(client, OpenAICompatibleClient)
+    assert client.model == "user-model"
+    assert client.base_url == "https://chat.example/v1/chat/completions"
 
 
 def test_history_repair_synthesizes_missing_tool_result_before_next_user():

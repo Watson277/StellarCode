@@ -97,9 +97,10 @@ Conversation messages no longer reserve an avatar gutter for the user or Agent. 
 Markdown uses the selected primary font color consistently for headings, list markers,
 links, emphasis, and code. Table headers and cells use the same base background as the
 client, while borders preserve the table structure.
-- Models selects an optional text-provider/model/Base URL override and vision routing. The
-  default `From .env` mode preserves the existing environment configuration. API keys are
-  detected for status display but are never copied into the settings file.
+- Models configures provider-free OpenAI-compatible text and optional vision endpoints.
+  Text uses `LLM_API_KEY` / `LLM_BASE_URL` / `LLM_MODEL_NAME`; a separate visual endpoint
+  uses the matching `VISION_*` names. The Settings page contains no provider selector.
+  API keys are detected for status display but are never copied into the settings file.
 - Agent configures the default mode for new conversations, maximum iterations, parallel
   tools, tool timeout, Plan workers, Team workers, Team retries, and the model context window
   used by the Runtime's preflight compression threshold.
@@ -113,8 +114,9 @@ client, while borders preserve the table structure.
 - Code RAG selects files, folders, or the complete workspace as project-scoped semantic
   search sources. It shows live background-index progress and persisted file/chunk/relation
   counts, and supports source removal, rebuild, and generated-index clearing. Embedding
-  provider/model/Base URL overrides are passed to the next Runtime while `EMBEDDING_API_KEY`
-  remains in `.env`. Automatic retrieval lets the Agent call `search_code` proactively;
+  model/Base URL overrides are passed to the next Runtime as `EMBEDDING_MODEL_NAME` and
+  `EMBEDDING_BASE_URL`, while `EMBEDDING_API_KEY` remains in
+  `.env`. Automatic retrieval lets the Agent call `search_code` proactively;
   disabling it restricts RAG use to an explicit user request. Changing an Embedding model
   requires a Runtime restart and rebuild.
 - MCP Servers shows every user/project server, live startup/error state, transport, discovered
@@ -156,10 +158,9 @@ text and source files are inlined for the Agent, including files outside the wor
 the user explicitly selected. Individual files are limited to 50 MB, inline text to 1 MB,
 and total inlined attachment text to 300,000 characters.
 
-When the primary provider is text-only, such as DeepSeek, Desktop uses the Python Runtime's
-cross-provider vision router. `VISION_PROVIDER=glm` sends image-bearing turns to
-`GLM_VISION_MODEL` while ordinary turns remain on `DEEPSEEK_MODEL`; `auto` discovers an
-available GLM or Agnes vision configuration. The Runtime context displays a combined
+When a separate vision endpoint is configured, Desktop uses the Python Runtime's automatic
+vision router. Image-bearing turns use `VISION_MODEL_NAME`, while ordinary turns remain on
+`LLM_MODEL_NAME`. The Runtime context displays a combined
 provider label such as `deepseek+glm-vlm` when this route is active.
 
 Each conversation has an independent `Trace On/Off` control in the composer. The setting is

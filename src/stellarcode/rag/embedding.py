@@ -18,46 +18,33 @@ class EmbeddingClient:
 
     def __init__(
         self,
-        provider: str | None = None,
         model: str | None = None,
         base_url: str | None = None,
         api_key: str | None = None,
         timeout_seconds: float = 120.0,
     ) -> None:
-        self.provider = (provider or os.getenv("EMBEDDING_PROVIDER", "ollama")).lower()
-        self.model = model or os.getenv("EMBEDDING_MODEL") or _default_model(self.provider)
-        self.base_url = (
-            base_url
-            or os.getenv("EMBEDDING_BASE_URL")
-            or _default_base_url(self.provider)
-        ).rstrip("/")
+        self.model = (
+            model
+            or os.getenv("EMBEDDING_MODEL_NAME")
+            or os.getenv("EMBEDDING_MODEL")
+            or "local-hash-256"
+        )
+        self.base_url = (base_url or os.getenv("EMBEDDING_BASE_URL") or "").rstrip("/")
         self.api_key = api_key if api_key is not None else os.getenv("EMBEDDING_API_KEY", "")
         self.timeout_seconds = timeout_seconds
+        self.provider = "openai-compatible" if self.base_url else "local"
 
     def embed(self, text: str | None) -> list[float]:
         if not text:
             return []
         content = text[: self.MAX_INPUT_CHARS]
-        if self.provider == "local":
+        if not self.base_url:
             return _local_hash_embedding(content)
-        if self.provider == "ollama":
-            return self._embed_ollama(content)
-        if self.provider in {"openai", "zhipu", "glm"}:
-            return self._embed_openai_compatible(content)
-        raise EmbeddingError(f"Unsupported embedding provider: {self.provider}")
-
-    def _embed_ollama(self, text: str) -> list[float]:
-        data = self._post_json(
-            f"{self.base_url}/api/embeddings",
-            {"model": self.model, "prompt": text},
-            use_auth=False,
-        )
-        embedding = data.get("embedding")
-        return _parse_embedding(embedding, "Ollama")
+        return self._embed_openai_compatible(content)
 
     def _embed_openai_compatible(self, text: str) -> list[float]:
         data = self._post_json(
-            f"{self.base_url}/embeddings",
+            _embeddings_url(self.base_url),
             {"model": self.model, "input": text},
             use_auth=True,
         )
@@ -93,22 +80,11 @@ class EmbeddingClient:
         return data
 
 
-def _default_model(provider: str) -> str:
-    if provider == "local":
-        return "hash-embedding-256"
-    if provider in {"zhipu", "glm"}:
-        return "embedding-3"
-    if provider == "openai":
-        return "text-embedding-3-small"
-    return "nomic-embed-text:latest"
-
-
-def _default_base_url(provider: str) -> str:
-    if provider in {"zhipu", "glm"}:
-        return "https://open.bigmodel.cn/api/paas/v4"
-    if provider == "openai":
-        return "https://api.openai.com/v1"
-    return "http://localhost:11434"
+def _embeddings_url(base_url: str) -> str:
+    normalized = base_url.strip().rstrip("/")
+    if normalized.endswith("/embeddings"):
+        return normalized
+    return normalized + "/embeddings"
 
 
 def _parse_embedding(value: object, provider_name: str) -> list[float]:

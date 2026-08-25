@@ -2,11 +2,11 @@
 
 from __future__ import annotations
 
-import os
 import time
 from typing import Any, Callable
 
 from stellarcode.image import strip_images_for_text_model
+from stellarcode.llm.environment import first_env
 from stellarcode.llm.openai_stream import consume_chat_completion_stream
 from stellarcode.llm.types import ChatResult, TokenUsage
 
@@ -44,22 +44,31 @@ class AgnesClient:
         timeout_seconds: float = 120.0,
         *,
         vision_model: str | None = None,
+        vision_api_key: str | None = None,
+        vision_base_url: str | None = None,
         max_retries: int = 2,
         retry_base_seconds: float = 1.0,
     ) -> None:
-        self.api_key = api_key or os.getenv("AGNES_API_KEY")
-        self.model = model or os.getenv("AGNES_MODEL", self.DEFAULT_MODEL)
-        configured_vision_model = vision_model or os.getenv(
-            "AGNES_VISION_MODEL",
-            self.model,
+        self.api_key = api_key or first_env("LLM_API_KEY", "AGNES_API_KEY")
+        self.model = model or first_env(
+            "LLM_MODEL_NAME", "AGNES_MODEL", default=self.DEFAULT_MODEL
+        )
+        configured_vision_model = vision_model or first_env(
+            "VISION_MODEL_NAME", "AGNES_VISION_MODEL", default=self.model
         )
         self.vision_model = (
             ""
             if configured_vision_model.strip().lower() in {"off", "none", "disabled"}
             else configured_vision_model.strip()
         )
-        self.base_url = _chat_completions_url(
-            base_url or os.getenv("AGNES_BASE_URL", self.DEFAULT_BASE_URL)
+        self.vision_api_key = vision_api_key or first_env("VISION_API_KEY") or self.api_key
+        configured_base_url = base_url or first_env(
+            "LLM_BASE_URL", "AGNES_BASE_URL", default=self.DEFAULT_BASE_URL
+        )
+        configured_vision_base_url = vision_base_url or first_env("VISION_BASE_URL")
+        self.base_url = _chat_completions_url(configured_base_url)
+        self.vision_base_url = _chat_completions_url(
+            configured_vision_base_url or configured_base_url
         )
         self.timeout_seconds = timeout_seconds
         self.max_retries = max(0, max_retries)
@@ -67,7 +76,10 @@ class AgnesClient:
         self.provider_name = "agnes"
 
         if not self.api_key:
-            raise ValueError("AGNES_API_KEY is required when LLM_PROVIDER=agnes.")
+            raise ValueError(
+                "LLM_API_KEY is required when LLM_PROVIDER=agnes "
+                "(legacy AGNES_API_KEY is also supported)."
+            )
 
     def chat(
         self,
@@ -81,6 +93,7 @@ class AgnesClient:
         except ModuleNotFoundError as exc:
             raise RuntimeError("Missing dependency: install httpx with `pip install -e .`.") from exc
 
+        vision_request = _messages_have_images(messages) and bool(self.vision_model)
         request_model = self.model_for_messages(messages)
         prepared_messages = messages
         if _messages_have_images(messages) and not self.vision_model:
@@ -98,21 +111,23 @@ class AgnesClient:
             payload["stream_options"] = {"include_usage": True}
 
         headers = {
-            "Authorization": f"Bearer {self.api_key}",
+            "Authorization": f"Bearer {self.vision_api_key if vision_request else self.api_key}",
             "Content-Type": "application/json",
         }
+        request_url = self.vision_base_url if vision_request else self.base_url
         if on_delta is not None:
             message, raw_usage = self._stream_chat(
                 httpx,
                 payload,
                 headers,
                 request_model,
+                request_url,
                 on_delta,
             )
         else:
             with httpx.Client(timeout=self.timeout_seconds) as client:
                 for attempt in range(self.max_retries + 1):
-                    response = client.post(self.base_url, headers=headers, json=payload)
+                    response = client.post(request_url, headers=headers, json=payload)
                     if not response.is_error:
                         break
                     error = _agnes_api_error(response, request_model)
@@ -148,6 +163,7 @@ class AgnesClient:
         payload: dict[str, Any],
         headers: dict[str, str],
         request_model: str,
+        request_url: str,
         on_delta: Callable[[str], None],
     ) -> tuple[dict[str, Any], dict[str, Any] | None]:
         attempt = 0
@@ -155,7 +171,7 @@ class AgnesClient:
             while True:
                 with client.stream(
                     "POST",
-                    self.base_url,
+                    request_url,
                     headers=headers,
                     json=payload,
                 ) as response:

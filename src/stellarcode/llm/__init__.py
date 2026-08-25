@@ -1,6 +1,7 @@
 """Provider-neutral LLM contracts plus concrete text and vision adapters."""
 
 from stellarcode.llm.agnes_client import AgnesApiError, AgnesClient
+from stellarcode.llm.compatible_client import CompatibleApiError, OpenAICompatibleClient
 from stellarcode.llm.deepseek_client import DeepSeekApiError, DeepSeekClient
 from stellarcode.llm.factory import create_chat_client
 from stellarcode.llm.glm_client import GLMApiError, GLMClient
@@ -11,6 +12,8 @@ from stellarcode.llm.vision_router import VisionRoutingClient
 __all__ = [
     "AgnesApiError",
     "AgnesClient",
+    "CompatibleApiError",
+    "OpenAICompatibleClient",
     "DeepSeekApiError",
     "DeepSeekClient",
     "GLMApiError",

@@ -47,11 +47,10 @@ export interface AppSettings {
     client_font_size: number;
   };
   models: {
-    provider: "environment" | "deepseek" | "glm" | "agnes";
     model: string;
     base_url: string;
-    vision_provider: "environment" | "auto" | "glm" | "agnes" | "disabled";
     vision_model: string;
+    vision_base_url: string;
   };
   agent: {
     default_mode: AgentMode;
@@ -64,7 +63,6 @@ export interface AppSettings {
     context_window: number;
   };
   rag: {
-    provider: "environment" | "local" | "ollama" | "openai" | "glm";
     model: string;
     base_url: string;
     automatic_retrieval: boolean;
@@ -89,7 +87,7 @@ export interface SettingsSnapshot {
 }
 
 export const DEFAULT_APP_SETTINGS: AppSettings = {
-  schema_version: 1,
+  schema_version: 2,
   general: {
     reopen_last_project: true,
     language: "zh-CN",
@@ -108,11 +106,10 @@ export const DEFAULT_APP_SETTINGS: AppSettings = {
     client_font_size: 12,
   },
   models: {
-    provider: "environment",
     model: "",
     base_url: "",
-    vision_provider: "environment",
     vision_model: "",
+    vision_base_url: "",
   },
   agent: {
     default_mode: "react",
@@ -125,7 +122,6 @@ export const DEFAULT_APP_SETTINGS: AppSettings = {
     context_window: 200000,
   },
   rag: {
-    provider: "environment",
     model: "",
     base_url: "",
     automatic_retrieval: true,
@@ -354,15 +350,12 @@ export function SettingsPage({
   }
 
   function checkModelConfiguration() {
-    const provider = draft.models.provider;
-    if (provider === "environment") {
-      const available = Object.entries(snapshot.api_keys).filter(([, configured]) => configured).map(([name]) => name);
-      setNotice(available.length ? t("Configured API keys: {providers}.", { providers: available.join(", ") }) : t("No configured model API key was detected in the environment or .env file."));
-      return;
-    }
-    setNotice(snapshot.api_keys[provider]
-      ? t("{provider} API key is configured. Restart Runtime to test the selected model.", { provider })
-      : t("{provider} API key is missing. Add it to .env before restarting Runtime.", { provider }));
+    const available = [["llm", "Text"], ["vision", "Vision"], ["embedding", "Embedding"]]
+      .filter(([key]) => snapshot.api_keys[key])
+      .map(([, label]) => t(label));
+    setNotice(available.length
+      ? t("Configured API keys: {categories}.", { categories: available.join(", ") })
+      : t("No API key is configured. This is valid only for a keyless local endpoint."));
   }
 
   const immediateManagement = IMMEDIATE_MANAGEMENT_SECTIONS.has(section);
@@ -528,12 +521,11 @@ function ModelSettingsForm({ draft, setDraft, apiKeys, onCheck, onOpenEnv }: For
   const t = translator(draft.general.language);
   const update = (patch: Partial<AppSettings["models"]>) => setDraft((current) => ({ ...current, models: { ...current.models, ...patch } }));
   return <SettingsSectionView title={t("Models")} description={t("Select text and vision routing. Secrets continue to load from .env or system environment variables.")}>
-    <div className="settings-key-strip">{["deepseek", "glm", "agnes"].map((provider) => <span className={apiKeys[provider] ? "configured" : "missing"} key={provider}><i />{t(apiKeys[provider] ? "{provider} key configured" : "{provider} key missing", { provider: titleCase(provider) })}</span>)}</div>
-    <SettingsRow label={t("Text provider")} description={t("Use .env to preserve the current configuration, or override the provider here.")}><select value={models.provider} onChange={(event) => update({ provider: event.target.value as AppSettings["models"]["provider"] })}><option value="environment">{t("From .env")}</option><option value="deepseek">DeepSeek</option><option value="glm">GLM</option><option value="agnes">Agnes</option></select></SettingsRow>
-    <SettingsRow label={t("Text model")} description={t("Leave empty to use the selected provider's configured/default model.")}><input value={models.model} onChange={(event) => update({ model: event.target.value })} placeholder={t("Provider default")} disabled={models.provider === "environment"} /></SettingsRow>
-    <SettingsRow label={t("Base URL")} description={t("Optional OpenAI-compatible endpoint override.")}><input value={models.base_url} onChange={(event) => update({ base_url: event.target.value })} placeholder={t("Provider default endpoint")} disabled={models.provider === "environment"} /></SettingsRow>
-    <SettingsRow label={t("Vision provider")} description={t("Auto chooses the first configured VLM; Disabled strips image input.")}><select value={models.vision_provider} onChange={(event) => update({ vision_provider: event.target.value as AppSettings["models"]["vision_provider"] })}><option value="environment">{t("From .env")}</option><option value="auto">{t("Auto")}</option><option value="glm">GLM</option><option value="agnes">Agnes</option><option value="disabled">{t("Disabled")}</option></select></SettingsRow>
-    <SettingsRow label={t("Vision model")} description={t("Leave empty to use GLM_VISION_MODEL or AGNES_VISION_MODEL.")}><input value={models.vision_model} onChange={(event) => update({ vision_model: event.target.value })} placeholder={t("Vision provider default")} disabled={!['glm', 'agnes'].includes(models.vision_provider)} /></SettingsRow>
+    <div className="settings-key-strip">{[["llm", "Text"], ["vision", "Vision"], ["embedding", "Embedding"]].map(([key, label]) => <span className={apiKeys[key] ? "configured" : "unset"} key={key}><i />{t(apiKeys[key] ? "{category} key configured" : "{category} key not set", { category: t(label) })}</span>)}</div>
+    <SettingsRow label={t("Text model")} description={t("OpenAI-compatible model name. Leave empty to read LLM_MODEL_NAME from .env.")}><input value={models.model} onChange={(event) => update({ model: event.target.value })} placeholder="LLM_MODEL_NAME" /></SettingsRow>
+    <SettingsRow label={t("Base URL")} description={t("OpenAI-compatible base URL. Leave empty to read LLM_BASE_URL from .env.")}><input value={models.base_url} onChange={(event) => update({ base_url: event.target.value })} placeholder="https://example.com/v1" /></SettingsRow>
+    <SettingsRow label={t("Vision model")} description={t("Optional vision model name. Leave both vision fields empty to disable image routing.")}><input value={models.vision_model} onChange={(event) => update({ vision_model: event.target.value })} placeholder="VISION_MODEL_NAME" /></SettingsRow>
+    <SettingsRow label={t("Vision base URL")} description={t("OpenAI-compatible vision endpoint. Leave empty to read VISION_BASE_URL from .env.")}><input value={models.vision_base_url} onChange={(event) => update({ vision_base_url: event.target.value })} placeholder="https://example.com/v1" /></SettingsRow>
     <div className="settings-inline-actions"><button className="secondary-button" onClick={onCheck}>{t("Check configuration")}</button><button className="secondary-button" onClick={onOpenEnv}>{t("Show .env")}</button><small>{t("API keys are never copied into settings.json.")}</small></div>
   </SettingsSectionView>;
 }
@@ -724,14 +716,13 @@ function RagSettingsForm({ draft, setDraft, snapshot, runtimeOnline, busy, confi
   }
 
   return <SettingsSectionView title={t("Code RAG")} description={t("Select project knowledge sources, build a semantic code index, and choose the Embedding model used by search_code.")}>
-    <SettingsRow label={t("Embedding provider")} description={t("From .env uses EMBEDDING_PROVIDER. Local uses the built-in deterministic hash model without downloads.")}><select value={rag.provider} onChange={(event) => update({ provider: event.target.value as AppSettings["rag"]["provider"] })}><option value="environment">{t("From .env")}</option><option value="local">{t("Local hash (no download)")}</option><option value="ollama">Ollama</option><option value="openai">{t("OpenAI compatible")}</option><option value="glm">{t("GLM embedding")}</option></select></SettingsRow>
-    <SettingsRow label={t("Embedding model")} description={t("Changing the provider or model requires a Runtime restart and index rebuild.")}><input value={rag.model} onChange={(event) => update({ model: event.target.value })} placeholder={t("Provider default")} disabled={rag.provider === "environment"} /></SettingsRow>
-    <SettingsRow label={t("Embedding base URL")} description={t("Ollama or OpenAI-compatible endpoint. API keys remain in EMBEDDING_API_KEY, never settings.json.")}><input value={rag.base_url} onChange={(event) => update({ base_url: event.target.value })} placeholder={t("Provider default endpoint")} disabled={["environment", "local"].includes(rag.provider)} /></SettingsRow>
+    <SettingsRow label={t("Embedding model")} description={t("Leave empty with no base URL to use local deterministic hashing.")}><input value={rag.model} onChange={(event) => update({ model: event.target.value })} placeholder="EMBEDDING_MODEL_NAME" /></SettingsRow>
+    <SettingsRow label={t("Embedding base URL")} description={t("OpenAI-compatible embedding endpoint. Leave empty to use local hashing.")}><input value={rag.base_url} onChange={(event) => update({ base_url: event.target.value })} placeholder="https://example.com/v1" /></SettingsRow>
     <SettingsRow label={t("Automatic retrieval")} description={t("Allow the Agent to call search_code proactively for architecture, behavior, and symbol-location questions. When off, it only uses RAG when you explicitly request it.")}><Toggle checked={rag.automatic_retrieval} onChange={(checked) => update({ automatic_retrieval: checked })} /></SettingsRow>
 
     <div className="rag-runtime-summary">
       <div><span>{t("Index status")}</span><strong><span className={`rag-status-badge ${indexState.tone}`}>{indexState.label}</span></strong></div>
-      <div><span>{t("Runtime model")}</span><strong>{snapshot.embedding_provider} / {snapshot.embedding_model}</strong></div>
+      <div><span>{t("Runtime model")}</span><strong>{snapshot.embedding_model}</strong></div>
       <div><span>{t("Indexed")}</span><strong>{t("{files} files / {chunks} chunks", { files: snapshot.indexed_file_count, chunks: snapshot.chunk_count })}</strong></div>
       <div><span>{t("Relations")}</span><strong>{snapshot.relation_count}</strong></div>
       <div><span>{t("Last rebuild")}</span><strong>{snapshot.last_indexed_at ? new Date(snapshot.last_indexed_at).toLocaleString(draft.general.language) : t("Never")}</strong></div>
@@ -1442,7 +1433,6 @@ function NumberSetting({ label, description, value, min, max, suffix, onChange }
 function PathRow({ label, path, t }: { label: string; path: string; t: ReturnType<typeof translator> }) { return <SettingsRow label={label} description={path || t("Not available until a project is open.")}><button className="secondary-button" onClick={() => void revealItemInDir(path)} disabled={!path}>{t("Reveal")}</button></SettingsRow>; }
 function settingsIcon(section: SettingsSection) { return { general: "◎", appearance: "◐", models: "◇", agent: "✦", prompt: "P", memory: "M", skills: "S", mcp: "⌘", browser: "B", rag: "⌕", diagnostics: "⚙" }[section]; }
 function settingsSectionLabel(section: SettingsSection) { return { general: "General", appearance: "Appearance", models: "Models", agent: "Agent", prompt: "Prompt", memory: "Memory", skills: "Skills", mcp: "MCP Servers", browser: "Browser", rag: "Code RAG", diagnostics: "Data & Diagnostics" }[section]; }
-function titleCase(value: string) { return value.charAt(0).toUpperCase() + value.slice(1); }
 function abbreviateText(value: string, limit: number) { return value.length <= limit ? value : `${value.slice(0, limit)}...`; }
 function shortHash(value?: string | null) { return value ? value.slice(0, 12) : "—"; }
 function visibleSkillDiff(value: string, truncated: boolean) {

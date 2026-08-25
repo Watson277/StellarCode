@@ -671,6 +671,7 @@ button { border: 0; }
 .settings-key-strip i { width: 6px; height: 6px; border-radius: 50%; background: var(--danger); }
 .settings-key-strip .configured { border-color: #315340; color: var(--text-soft); }
 .settings-key-strip .configured i { background: var(--good); }
+.settings-key-strip .unset i { background: var(--text-faint); }
 .settings-inline-actions { display: flex; align-items: center; gap: 7px; padding: 15px 0; }
 .settings-inline-actions small { margin-left: auto; color: var(--text-faint); font-size: 8px; }
 .worktree-location-control { display: grid; gap: 7px; min-width: min(360px, 42vw); }

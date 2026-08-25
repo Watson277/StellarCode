@@ -6,6 +6,7 @@ import os
 import re
 from dataclasses import dataclass
 
+from stellarcode.llm.environment import first_env
 from stellarcode.llm.types import TokenUsage
 
 
@@ -81,7 +82,9 @@ def resolve_usage_cost(
 def _builtin_rates(provider: str, model: str) -> TokenRates | None:
     normalized_provider = provider.strip().lower()
     if normalized_provider == "deepseek":
-        configured_url = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com")
+        configured_url = first_env(
+            "LLM_BASE_URL", "DEEPSEEK_BASE_URL", default="https://api.deepseek.com"
+        )
         normalized_url = configured_url.strip().lower().rstrip("/")
         if normalized_url not in {
             "https://api.deepseek.com",

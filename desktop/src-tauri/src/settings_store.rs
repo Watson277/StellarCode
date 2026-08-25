@@ -9,7 +9,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard};
 
-const SETTINGS_SCHEMA_VERSION: u32 = 1;
+const SETTINGS_SCHEMA_VERSION: u32 = 2;
 const MAX_AGENT_ITERATIONS: u16 = 128;
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -65,21 +65,19 @@ impl Default for AppearanceSettings {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(default)]
 pub struct ModelSettings {
-    pub provider: String,
     pub model: String,
     pub base_url: String,
-    pub vision_provider: String,
     pub vision_model: String,
+    pub vision_base_url: String,
 }
 
 impl Default for ModelSettings {
     fn default() -> Self {
         Self {
-            provider: "environment".into(),
             model: String::new(),
             base_url: String::new(),
-            vision_provider: "environment".into(),
             vision_model: String::new(),
+            vision_base_url: String::new(),
         }
     }
 }
@@ -100,7 +98,6 @@ pub struct AgentSettings {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(default)]
 pub struct RagSettings {
-    pub provider: String,
     pub model: String,
     pub base_url: String,
     pub automatic_retrieval: bool,
@@ -109,7 +106,6 @@ pub struct RagSettings {
 impl Default for RagSettings {
     fn default() -> Self {
         Self {
-            provider: "environment".into(),
             model: String::new(),
             base_url: String::new(),
             automatic_retrieval: true,
@@ -291,24 +287,9 @@ fn validate(settings: &AppSettings) -> Result<(), String> {
         return Err("client font size must be between 10 and 16".into());
     }
     one_of(
-        "model provider",
-        &settings.models.provider,
-        &["environment", "deepseek", "glm", "agnes"],
-    )?;
-    one_of(
-        "vision provider",
-        &settings.models.vision_provider,
-        &["environment", "auto", "glm", "agnes", "disabled"],
-    )?;
-    one_of(
         "default mode",
         &settings.agent.default_mode,
         &["react", "plan", "team"],
-    )?;
-    one_of(
-        "embedding provider",
-        &settings.rag.provider,
-        &["environment", "local", "ollama", "openai", "glm"],
     )?;
     bounded(
         "max iterations",
@@ -439,20 +420,40 @@ fn bounded(label: &str, value: u16, minimum: u16, maximum: u16) -> Result<(), St
 
 fn configured_api_keys(project_root: &Path) -> BTreeMap<String, bool> {
     let env_file = read_env_file(&project_root.join(".env"));
-    [
-        ("deepseek", "DEEPSEEK_API_KEY"),
-        ("glm", "GLM_API_KEY"),
-        ("agnes", "AGNES_API_KEY"),
-    ]
-    .into_iter()
-    .map(|(provider, variable)| {
-        let value = std::env::var(variable)
+    let value = |variable: &str| {
+        std::env::var(variable)
             .ok()
             .or_else(|| env_file.get(variable).cloned())
-            .unwrap_or_default();
-        (provider.to_string(), is_real_secret(&value))
-    })
-    .collect()
+            .unwrap_or_default()
+    };
+    let mut configured = BTreeMap::new();
+    configured.insert(
+        "llm".into(),
+        [
+            "LLM_API_KEY",
+            "DEEPSEEK_API_KEY",
+            "GLM_API_KEY",
+            "AGNES_API_KEY",
+        ]
+        .iter()
+        .any(|name| is_real_secret(&value(name))),
+    );
+    configured.insert(
+        "vision".into(),
+        [
+            "VISION_API_KEY",
+            "GLM_VISION_API_KEY",
+            "GLM_API_KEY",
+            "AGNES_API_KEY",
+        ]
+        .iter()
+        .any(|name| is_real_secret(&value(name))),
+    );
+    configured.insert(
+        "embedding".into(),
+        is_real_secret(&value("EMBEDDING_API_KEY")),
+    );
+    configured
 }
 
 fn read_env_file(path: &Path) -> BTreeMap<String, String> {
@@ -526,7 +527,7 @@ mod tests {
         ));
         let app_data = root.join("app-data");
         fs::create_dir_all(&root).unwrap();
-        fs::write(root.join(".env"), "GLM_API_KEY=test-secret\n").unwrap();
+        fs::write(root.join(".env"), "LLM_API_KEY=test-secret\n").unwrap();
         let store = SettingsStore::load(&app_data, &root).unwrap();
         let mut settings = store.current().unwrap();
         settings.general.conversation_font_size = 14;
@@ -538,7 +539,6 @@ mod tests {
         settings.appearance.text_color = "#242a33".into();
         settings.appearance.client_font_size = 13;
         settings.agent.max_iterations = 64;
-        settings.rag.provider = "local".into();
         settings.rag.automatic_retrieval = false;
         let worktrees = root.join("worktrees");
         fs::create_dir_all(&worktrees).unwrap();
@@ -552,13 +552,12 @@ mod tests {
         assert_eq!(snapshot.settings.appearance.panel_color, "#e8ebf0");
         assert_eq!(snapshot.settings.appearance.client_font_size, 13);
         assert_eq!(snapshot.settings.agent.max_iterations, 64);
-        assert_eq!(snapshot.settings.rag.provider, "local");
         assert!(!snapshot.settings.rag.automatic_retrieval);
         assert_eq!(
             snapshot.settings.general.worktree_directory,
             worktrees.display().to_string()
         );
-        assert_eq!(snapshot.api_keys.get("glm"), Some(&true));
+        assert_eq!(snapshot.api_keys.get("llm"), Some(&true));
         let persisted = fs::read_to_string(app_data.join("settings.json")).unwrap();
         assert!(!persisted.contains("test-secret"));
 

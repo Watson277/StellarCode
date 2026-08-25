@@ -51,6 +51,7 @@ import {
   selectConversationReplaying,
   selectStaleProjectTaskRoutes,
   reconcileReplayedTask,
+  shouldOpenActivatedWorkspace,
   transitionFrontendRuntime,
   type FrontendRuntimeAction,
 } from "./runtime/frontendRuntimeMachine";
@@ -1141,7 +1142,13 @@ function App() {
       );
       let currentOpened = false;
       try {
-        if (current && !workspaceOpenRequest.current) {
+        if (current && shouldOpenActivatedWorkspace({
+          connection: runtimeControlRef.current.connection,
+          activeProjectId: projectIdRef.current,
+          targetProjectId: current.projectId,
+          pendingActivationProjectId: pendingWorkspaceActivation.current?.targetProjectId,
+          workspaceOpenRequestId: workspaceOpenRequest.current,
+        })) {
           const id = requestId("workspace-open");
           workspaceOpenRequest.current = id;
           const response = await sendRequest(
@@ -3362,6 +3369,26 @@ function App() {
         setRuntimePython(started.python);
         setRuntimeSettingsDirty(false);
         runtimeStarted.current = true;
+        // The first project has no already-running Sidecar, so activation used
+        // to depend entirely on the timing of runtime.ready. Ensure the
+        // workspace is opened after the process is registered as a fallback;
+        // the guard coalesces this with an early runtime.ready handler.
+        if (shouldOpenActivatedWorkspace({
+          connection: runtimeControlRef.current.connection,
+          activeProjectId: projectIdRef.current,
+          targetProjectId: project.id,
+          pendingActivationProjectId: pendingWorkspaceActivation.current?.targetProjectId,
+          workspaceOpenRequestId: workspaceOpenRequest.current,
+        })) {
+          const id = requestId("workspace-open");
+          workspaceOpenRequest.current = id;
+          const openResponse = await sendRequest(
+            "workspace.open",
+            { project_id: project.id, workspace: project.path },
+            id,
+          );
+          if (!openResponse.ok) return;
+        }
       }
     } catch (error) {
       const failedActivation = pendingWorkspaceActivation.current;
@@ -3966,7 +3993,6 @@ function App() {
           }, decision, "supervision")}
         />
         <span className={`connection-state ${connection}`}><i /> {connectionLabel}</span>
-        <button className="icon-button" aria-label={t("Open management center")} onClick={() => setSettingsTarget("memory")}>{t("Manage")}</button>
         <button className="icon-button" aria-label={t("Open settings")} onClick={() => setSettingsTarget("general")}>{t("Settings")}</button>
       </header>
 

@@ -186,6 +186,30 @@ export function selectConversationReplaying(state: FrontendRuntimeState) {
   return Boolean(state.replaySessionId);
 }
 
+export type WorkspaceOpenGuard = {
+  connection: RuntimeConnectionState;
+  activeProjectId: string;
+  targetProjectId: string;
+  pendingActivationProjectId?: string;
+  workspaceOpenRequestId?: string;
+};
+
+/**
+ * Decides whether the active project still needs an authoritative
+ * `workspace.open` request.
+ *
+ * A freshly spawned Sidecar can publish `runtime.ready` before the Tauri
+ * `runtime_start` invocation resolves. Both paths are therefore allowed to
+ * request the workspace, but an in-flight request or an already-confirmed
+ * online activation must suppress duplicates.
+ */
+export function shouldOpenActivatedWorkspace(guard: WorkspaceOpenGuard) {
+  if (!guard.targetProjectId || guard.activeProjectId !== guard.targetProjectId) return false;
+  if (guard.workspaceOpenRequestId) return false;
+  return guard.connection !== "online"
+    || guard.pendingActivationProjectId === guard.targetProjectId;
+}
+
 export function reconcileReplayedTask(
   previousActiveTaskId: string,
   recoveryTaskId: string | undefined,

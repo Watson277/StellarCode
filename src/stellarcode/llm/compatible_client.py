@@ -1,4 +1,4 @@
-"""DeepSeek provider adapter with request/history compatibility safeguards."""
+"""Provider-free OpenAI-compatible chat client used by the Runtime."""
 
 from __future__ import annotations
 
@@ -6,13 +6,12 @@ import time
 from typing import Any, Callable
 
 from stellarcode.image import strip_images_for_text_model
-from stellarcode.llm.environment import first_env
 from stellarcode.llm.message_history import repair_tool_message_history
 from stellarcode.llm.openai_stream import consume_chat_completion_stream
 from stellarcode.llm.types import ChatResult, TokenUsage
 
 
-class DeepSeekApiError(RuntimeError):
+class CompatibleApiError(RuntimeError):
     def __init__(
         self,
         status_code: int,
@@ -26,45 +25,38 @@ class DeepSeekApiError(RuntimeError):
         self.message = message
         self.retryable = retryable
         super().__init__(
-            f"DeepSeek API request failed: HTTP {status_code}, model={model}, "
-            f"message={message}"
+            f"OpenAI-compatible API request failed: HTTP {status_code}, "
+            f"model={model}, message={message}"
         )
 
 
-class DeepSeekClient:
-    """OpenAI-compatible client for DeepSeek text and reasoning models."""
-
-    DEFAULT_BASE_URL = "https://api.deepseek.com"
-    DEFAULT_MODEL = "deepseek-v4-flash"
+class OpenAICompatibleClient:
+    """Chat Completions client configured only by key, URL, and model name."""
 
     def __init__(
         self,
-        api_key: str | None = None,
-        model: str | None = None,
-        base_url: str | None = None,
-        timeout_seconds: float = 120.0,
         *,
+        api_key: str = "",
+        model: str,
+        base_url: str,
+        supports_images: bool = False,
+        timeout_seconds: float = 120.0,
         max_retries: int = 2,
         retry_base_seconds: float = 1.0,
+        role_name: str = "llm",
     ) -> None:
-        self.api_key = api_key or first_env("LLM_API_KEY", "DEEPSEEK_API_KEY")
-        self.model = model or first_env(
-            "LLM_MODEL_NAME", "DEEPSEEK_MODEL", default=self.DEFAULT_MODEL
-        )
-        self.base_url = _chat_completions_url(
-            base_url
-            or first_env("LLM_BASE_URL", "DEEPSEEK_BASE_URL", default=self.DEFAULT_BASE_URL)
-        )
+        self.api_key = api_key.strip()
+        self.model = model.strip()
+        self.base_url = chat_completions_url(base_url)
+        self._supports_images = supports_images
         self.timeout_seconds = timeout_seconds
         self.max_retries = max(0, max_retries)
         self.retry_base_seconds = max(0.0, retry_base_seconds)
-        self.provider_name = "deepseek"
-
-        if not self.api_key:
-            raise ValueError(
-                "LLM_API_KEY is required when LLM_PROVIDER=deepseek "
-                "(legacy DEEPSEEK_API_KEY is also supported)."
-            )
+        self.provider_name = role_name
+        if not self.model:
+            raise ValueError("LLM_MODEL_NAME is required.")
+        if not self.base_url:
+            raise ValueError("LLM_BASE_URL is required.")
 
     def chat(
         self,
@@ -80,9 +72,10 @@ class DeepSeekClient:
                 "Missing dependency: install httpx with `pip install -e .`."
             ) from exc
 
-        prepared_messages, _ = repair_tool_message_history(
-            strip_images_for_text_model(messages)
+        input_messages = (
+            messages if self._supports_images else strip_images_for_text_model(messages)
         )
+        prepared_messages, _ = repair_tool_message_history(input_messages)
         payload: dict[str, Any] = {
             "model": self.model,
             "messages": prepared_messages,
@@ -95,10 +88,9 @@ class DeepSeekClient:
             payload["stream"] = True
             payload["stream_options"] = {"include_usage": True}
 
-        headers = {
-            "Authorization": f"Bearer {self.api_key}",
-            "Content-Type": "application/json",
-        }
+        headers = {"Content-Type": "application/json"}
+        if self.api_key:
+            headers["Authorization"] = f"Bearer {self.api_key}"
         if on_delta is not None:
             message, raw_usage = self._stream_chat(httpx, payload, headers, on_delta)
         else:
@@ -107,20 +99,20 @@ class DeepSeekClient:
                     response = client.post(self.base_url, headers=headers, json=payload)
                     if not response.is_error:
                         break
-                    error = _deepseek_api_error(response, self.model)
+                    error = compatible_api_error(response, self.model)
                     if not error.retryable or attempt >= self.max_retries:
                         raise error
-                    delay = _retry_delay_seconds(response, attempt, self.retry_base_seconds)
+                    delay = retry_delay_seconds(response, attempt, self.retry_base_seconds)
                     if delay > 0:
                         time.sleep(delay)
                 data = response.json()
 
             choices = data.get("choices") or []
             if not choices:
-                raise RuntimeError(f"DeepSeek response has no choices: {data}")
+                raise RuntimeError(f"LLM response has no choices: {data}")
             message = choices[0].get("message")
             if not isinstance(message, dict):
-                raise RuntimeError(f"DeepSeek response has no message: {data}")
+                raise RuntimeError(f"LLM response has no message: {data}")
             raw_usage = data.get("usage")
         return ChatResult(
             message=message,
@@ -156,29 +148,31 @@ class DeepSeekClient:
                     if response.status_code == 400 and "stream_options" in payload:
                         payload.pop("stream_options", None)
                         continue
-                    error = _deepseek_api_error(response, self.model)
+                    error = compatible_api_error(response, self.model)
                     if not error.retryable or attempt >= self.max_retries:
                         raise error
-                    delay = _retry_delay_seconds(response, attempt, self.retry_base_seconds)
+                    delay = retry_delay_seconds(response, attempt, self.retry_base_seconds)
                 attempt += 1
                 if delay > 0:
                     time.sleep(delay)
 
     def supports_image_input(self) -> bool:
-        return False
+        return self._supports_images
 
     def model_for_messages(self, _messages: list[dict[str, Any]]) -> str:
         return self.model
 
 
-def _chat_completions_url(base_url: str) -> str:
+def chat_completions_url(base_url: str) -> str:
     normalized = base_url.strip().rstrip("/")
+    if not normalized:
+        return ""
     if normalized.endswith("/chat/completions"):
         return normalized
     return normalized + "/chat/completions"
 
 
-def _deepseek_api_error(response: Any, model: str) -> DeepSeekApiError:
+def compatible_api_error(response: Any, model: str) -> CompatibleApiError:
     message = ""
     try:
         payload = response.json()
@@ -196,16 +190,15 @@ def _deepseek_api_error(response: Any, model: str) -> DeepSeekApiError:
         message = str(getattr(response, "text", "") or "").strip()[:1000]
     if not message:
         message = getattr(response, "reason_phrase", "") or "unknown API error"
-    retryable = response.status_code == 429 or response.status_code >= 500
-    return DeepSeekApiError(
+    return CompatibleApiError(
         response.status_code,
         model,
         message,
-        retryable=retryable,
+        retryable=response.status_code == 429 or response.status_code >= 500,
     )
 
 
-def _retry_delay_seconds(response: Any, attempt: int, base_seconds: float) -> float:
+def retry_delay_seconds(response: Any, attempt: int, base_seconds: float) -> float:
     retry_after = str(response.headers.get("Retry-After") or "").strip()
     if retry_after:
         try:

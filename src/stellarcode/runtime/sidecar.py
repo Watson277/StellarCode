@@ -1921,7 +1921,24 @@ def create_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _configure_jsonl_standard_streams() -> None:
+    """Force the desktop JSONL transport to use UTF-8 in frozen builds.
+
+    PyInstaller's embedded Python can initialize standard streams with the
+    Windows ANSI code page even when the parent process sets PYTHONUTF8 and
+    PYTHONIOENCODING. ASCII protocol messages then work until a response contains
+    Chinese text, at which point Rust rejects the non-UTF-8 line and closes the
+    pipe. Reconfigure the actual TextIOWrapper objects before any protocol I/O.
+    """
+
+    for stream in (sys.stdin, sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if callable(reconfigure):
+            reconfigure(encoding="utf-8", errors="strict")
+
+
 def main() -> None:
+    _configure_jsonl_standard_streams()
     args = create_parser().parse_args()
     try:
         raw_lsp_args = json.loads(args.diagnostics_lsp_args_json)
