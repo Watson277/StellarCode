@@ -1,3 +1,5 @@
+"""Browser-control abstractions and safety checks for Chrome DevTools access."""
+
 from stellarcode.browser.connectivity import BrowserConnectivityCheck, BrowserProbe
 from stellarcode.browser.controller import BrowserController, register_browser_tools
 from stellarcode.browser.guard import BrowserGuard

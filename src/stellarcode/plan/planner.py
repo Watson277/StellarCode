@@ -1,22 +1,36 @@
+"""LLM plan generation and strict conversion into the executable DAG model."""
+
 from __future__ import annotations
 
 import json
 import re
 import threading
 import uuid
+from collections.abc import Callable
 from pathlib import Path
 
-from stellarcode.agent import ChatClient, runtime_context
+from stellarcode.agent import ChatClient
 from stellarcode.cancellation import cancellable_call
 from stellarcode.image import ImageReferenceParser
-from stellarcode.llm.types import llm_operation, normalize_chat_result
+from stellarcode.llm.types import chat_with_optional_delta, llm_operation, normalize_chat_result
 from stellarcode.plan.execution_plan import ExecutionPlan, PlanValidationError
 from stellarcode.plan.task import Task, TaskType
+from stellarcode.prompt import (
+    PromptAssembler,
+    PromptContext,
+    PromptMode,
+    publish_prompt_snapshot,
+    runtime_context,
+    strip_internal_context_metadata,
+)
 
 
-PLANNING_PROMPT = """You are StellarCode's planner.
+PLANNING_PROMPT = """## Plan builder role
 
-Split the user's complex goal into a small executable DAG. Return JSON only.
+You are StellarCode's planner.
+
+Split the user's complex goal into the smallest useful executable DAG. Return JSON only;
+do not call tools, execute commands, or claim that work has already been performed.
 
 Available task types:
 - PLANNING: clarify strategy or structure.
@@ -29,8 +43,10 @@ Available task types:
 Rules:
 1. Every task must have an id like task_1, task_2.
 2. dependencies must contain only earlier task ids.
-3. Keep the plan focused; prefer 3 to 7 tasks.
-4. Include verification when the goal changes code or files.
+3. Keep the plan focused; prefer 3 to 7 concrete, reviewable tasks and avoid work outside
+   the user's requested scope.
+4. Include verification when the goal changes code or files. A verification task must
+   check observable results rather than repeat the implementation description.
 5. Return exactly this JSON shape:
 {
   "summary": "short plan summary",
@@ -51,31 +67,64 @@ class Planner:
         self,
         llm_client: ChatClient,
         workspace: str | Path | None = None,
+        prompt_assembler: PromptAssembler | None = None,
     ) -> None:
         self.llm_client = llm_client
         self.image_parser = ImageReferenceParser(workspace or ".")
+        self.prompt_assembler = prompt_assembler or PromptAssembler()
+
+    def prompt_snapshot(self, *, include_sensitive: bool = False) -> dict[str, object]:
+        """Preview the plan-builder prompt without issuing an LLM request."""
+
+        assembly = self.prompt_assembler.assemble(
+            PromptMode.PLAN_BUILDER,
+            PromptContext(
+                base_prompt=PLANNING_PROMPT,
+                runtime_context=runtime_context(),
+            ),
+        )
+        return assembly.snapshot(PromptMode.PLAN_BUILDER).to_dict(
+            include_sensitive=include_sensitive
+        )
 
     def create_plan(
         self,
         goal: str,
         cancellation_event: threading.Event | None = None,
+        on_delta: Callable[[str], None] | None = None,
     ) -> ExecutionPlan:
+        assembly = self.prompt_assembler.assemble(
+            PromptMode.PLAN_BUILDER,
+            PromptContext(
+                base_prompt=PLANNING_PROMPT,
+                runtime_context=runtime_context(),
+            ),
+        )
+        publish_prompt_snapshot(
+            self.llm_client,
+            assembly.snapshot(PromptMode.PLAN_BUILDER),
+        )
         messages = [
-            {
-                "role": "system",
-                "content": f"{PLANNING_PROMPT}\n\n{runtime_context()}",
-            },
+            {"role": "system", "content": assembly.system_prompt},
+            *assembly.context_messages,
             self.image_parser.user_message(f"Create an execution plan for this goal:\n{goal}"),
         ]
+        provider_messages = strip_internal_context_metadata(messages)
         with llm_operation("plan-planner"):
             raw = cancellable_call(
-                lambda: self.llm_client.chat(messages, tools=None),
+                lambda: chat_with_optional_delta(
+                    self.llm_client,
+                    provider_messages,
+                    tools=None,
+                    temperature=0.2,
+                    on_delta=on_delta,
+                ),
                 cancellation_event,
             )
         response = normalize_chat_result(
             raw,
             client=self.llm_client,
-            messages=messages,
+            messages=provider_messages,
             tools=None,
         ).message
         return self.parse_plan(goal, str(response.get("content") or ""))
@@ -122,9 +171,7 @@ class Planner:
             raw_dependencies = item.get("dependencies") or []
             if not isinstance(raw_dependencies, list):
                 raise PlanValidationError(f"Task {task.id} dependencies must be a list.")
-            task.dependencies = [
-                id_mapping.get(str(dep), str(dep)) for dep in raw_dependencies
-            ]
+            task.dependencies = [id_mapping.get(str(dep), str(dep)) for dep in raw_dependencies]
 
         plan.compute_execution_order()
         return plan

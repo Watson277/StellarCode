@@ -1,3 +1,5 @@
+"""Deterministic risk classification used before a tool reaches its real handler."""
+
 from __future__ import annotations
 
 import json
@@ -14,6 +16,7 @@ class ApprovalPolicy:
     DANGEROUS_TOOLS = frozenset(
         {
             "write_file",
+            "apply_patch",
             "delete_file",
             "execute_command",
             "create_project",
@@ -24,6 +27,7 @@ class ApprovalPolicy:
         "execute_command": "high",
         "delete_file": "high",
         "write_file": "medium",
+        "apply_patch": "medium",
         "create_project": "medium",
     }
 
@@ -33,6 +37,7 @@ class ApprovalPolicy:
         ),
         "delete_file": "将永久删除磁盘上的文件。",
         "write_file": "将写入或覆盖文件内容，原有内容可能丢失。",
+        "apply_patch": "将修改现有文件内容。",
         "create_project": "将在磁盘上创建文件和目录。",
     }
 

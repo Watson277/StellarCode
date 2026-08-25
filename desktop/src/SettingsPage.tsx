@@ -1,3 +1,10 @@
+/**
+ * Settings and management center.
+ *
+ * Preferences are edited locally, while Memory/Skill/MCP/Browser actions are immediate
+ * Runtime operations. Keeping those two models distinct avoids implying that a second
+ * "Save" click is required after an operational action has already taken effect.
+ */
 import { useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { confirm as confirmDialog, open } from "@tauri-apps/plugin-dialog";
@@ -8,10 +15,12 @@ import type {
   BrowserSnapshot,
   DiagnosticsSnapshot,
   MemorySnapshot,
+  PromptSnapshot,
   McpInstallConfig,
   McpServerInfo,
   McpSnapshot,
   RagSnapshot,
+  SkillDiff,
   SkillSnapshot,
   SkillDirectoryResult,
   SkillInstallScope,
@@ -27,6 +36,7 @@ export interface AppSettings {
     conversation_font_size: number;
     compact_tools: boolean;
     compact_plans: boolean;
+    worktree_directory: string;
   };
   appearance: {
     theme: "dark" | "light";
@@ -74,6 +84,7 @@ export interface SettingsSnapshot {
   env_path: string;
   app_data_path: string;
   image_cache_path: string;
+  default_worktree_path: string;
   api_keys: Record<string, boolean>;
 }
 
@@ -86,6 +97,7 @@ export const DEFAULT_APP_SETTINGS: AppSettings = {
     conversation_font_size: 12,
     compact_tools: true,
     compact_plans: true,
+    worktree_directory: "",
   },
   appearance: {
     theme: "dark",
@@ -134,6 +146,7 @@ export type SettingsSection =
   | "appearance"
   | "models"
   | "agent"
+  | "prompt"
   | "memory"
   | "skills"
   | "mcp"
@@ -146,6 +159,7 @@ const SETTINGS_SECTIONS: SettingsSection[] = [
   "appearance",
   "models",
   "agent",
+  "prompt",
   "memory",
   "skills",
   "mcp",
@@ -159,6 +173,7 @@ const IMMEDIATE_MANAGEMENT_SECTIONS = new Set<SettingsSection>([
   "skills",
   "mcp",
   "browser",
+  "prompt",
 ]);
 
 export interface SettingsPageProps {
@@ -192,9 +207,14 @@ export interface SettingsPageProps {
   onMemorySave: (content: string) => Promise<MemorySnapshot>;
   onMemoryDelete: (id: string) => Promise<MemorySnapshot>;
   onMemoryClear: (confirmed: boolean) => Promise<MemorySnapshot>;
+  onPromptRefresh: (includeMemory: boolean) => Promise<PromptSnapshot>;
   onSkillRefresh: () => Promise<SkillSnapshot>;
+  onSkillDiff: (name: string) => Promise<SkillDiff>;
   onSkillSetEnabled: (name: string, enabled: boolean) => Promise<SkillSnapshot>;
   onSkillReload: () => Promise<SkillSnapshot>;
+  onSkillUpdate: (name: string, currentHash: string, builtinHash: string) => Promise<SkillSnapshot>;
+  onSkillKeepCustom: (name: string, currentHash: string, builtinHash: string) => Promise<SkillSnapshot>;
+  onSkillRestoreDefault: (name: string, currentHash: string, builtinHash: string) => Promise<SkillSnapshot>;
   onSkillPrepareDirectory: (scope: SkillInstallScope) => Promise<SkillDirectoryResult>;
   onBrowserRefresh: () => Promise<BrowserSnapshot>;
   onBrowserProbe: (port: number) => Promise<BrowserProbeSnapshot>;
@@ -237,9 +257,14 @@ export function SettingsPage({
   onMemorySave,
   onMemoryDelete,
   onMemoryClear,
+  onPromptRefresh,
   onSkillRefresh,
+  onSkillDiff,
   onSkillSetEnabled,
   onSkillReload,
+  onSkillUpdate,
+  onSkillKeepCustom,
+  onSkillRestoreDefault,
   onSkillPrepareDirectory,
   onBrowserRefresh,
   onBrowserProbe,
@@ -352,10 +377,15 @@ export function SettingsPage({
           <small>{t("Protocol v{version}", { version: 1 })}<br />{t("Settings schema v{version}", { version: draft.schema_version })}</small>
         </nav>
         <main className="settings-content">
-          {section === "general" && <GeneralSettingsForm draft={draft} setDraft={setDraft} />}
+          {section === "general" && <GeneralSettingsForm draft={draft} setDraft={setDraft} defaultWorktreePath={snapshot.default_worktree_path} />}
           {section === "appearance" && <AppearanceSettingsForm draft={draft} setDraft={setDraft} />}
           {section === "models" && <ModelSettingsForm draft={draft} setDraft={setDraft} apiKeys={snapshot.api_keys} onCheck={checkModelConfiguration} onOpenEnv={() => void revealItemInDir(snapshot.env_path)} />}
           {section === "agent" && <AgentSettingsForm draft={draft} setDraft={setDraft} />}
+          {section === "prompt" && <PromptObservabilityForm
+            language={draft.general.language}
+            runtimeOnline={runtimeOnline}
+            onRefresh={onPromptRefresh}
+          />}
           {section === "memory" && <MemoryManagementForm
             language={draft.general.language}
             snapshot={memorySnapshot}
@@ -372,8 +402,12 @@ export function SettingsPage({
             runtimeOnline={runtimeOnline}
             busy={busy}
             onRefresh={onSkillRefresh}
+            onDiff={onSkillDiff}
             onSetEnabled={onSkillSetEnabled}
             onReload={onSkillReload}
+            onUpdate={onSkillUpdate}
+            onKeepCustom={onSkillKeepCustom}
+            onRestoreDefault={onSkillRestoreDefault}
             onPrepareDirectory={onSkillPrepareDirectory}
           />}
           {section === "rag" && <RagSettingsForm
@@ -443,17 +477,27 @@ export function SettingsPage({
   </div>;
 }
 
-function GeneralSettingsForm({ draft, setDraft }: FormProps) {
+function GeneralSettingsForm({ draft, setDraft, defaultWorktreePath }: FormProps & { defaultWorktreePath: string }) {
   const general = draft.general;
   const t = translator(general.language);
   const update = (patch: Partial<AppSettings["general"]>) => setDraft((current) => ({ ...current, general: { ...current.general, ...patch } }));
-  return <SettingsSectionView title={t("General")} description={t("Conversation appearance and desktop behavior. These settings apply immediately after saving.")}>
+  const chooseWorktreeDirectory = async () => {
+    const selected = await open({ directory: true, multiple: false, title: t("Choose temporary worktree folder") });
+    if (typeof selected === "string") update({ worktree_directory: selected });
+  };
+  return <SettingsSectionView title={t("General")} description={t("Conversation appearance and desktop behavior. Worktree storage changes require a Runtime restart.")}>
     <SettingsRow label={t("Language")} description={t("Controls every built-in label, status, dialog, and settings page in the desktop client.")}><select value={general.language} onChange={(event) => update({ language: event.target.value as AppSettings["general"]["language"] })}><option value="zh-CN">{t("Chinese")}</option><option value="en">{t("English")}</option></select></SettingsRow>
     <SettingsRow label={t("Reopen last project")} description={t("Start the most recently used workspace when StellarCode opens.")}><Toggle checked={general.reopen_last_project} onChange={(checked) => update({ reopen_last_project: checked })} /></SettingsRow>
     <SettingsRow label={t("Send message")} description={t("Choose whether Enter sends or inserts a new line.")}><select value={general.send_shortcut} onChange={(event) => update({ send_shortcut: event.target.value as AppSettings["general"]["send_shortcut"] })}><option value="enter">{t("Enter")}</option><option value="ctrl-enter">{t("Ctrl+Enter")}</option></select></SettingsRow>
     <SettingsRow label={t("Conversation font")} description={t("Controls message, Markdown, composer, and plan text size.")}><div className="range-control"><input type="range" min="10" max="16" value={general.conversation_font_size} onChange={(event) => update({ conversation_font_size: Number(event.target.value) })} /><strong>{general.conversation_font_size}px</strong></div></SettingsRow>
     <SettingsRow label={t("Compact tool activity")} description={t("Reduce padding around tool calls and progress messages.")}><Toggle checked={general.compact_tools} onChange={(checked) => update({ compact_tools: checked })} /></SettingsRow>
     <SettingsRow label={t("Compact plans")} description={t("Keep Plan steps dense while retaining live status and dependencies.")}><Toggle checked={general.compact_plans} onChange={(checked) => update({ compact_plans: checked })} /></SettingsRow>
+    <SettingsRow label={t("Temporary worktree location")} description={t("Leave empty to use the default C drive application data directory. New tasks use this location after Runtime restarts; existing task data is not moved.")}>
+      <div className="worktree-location-control">
+        <input value={general.worktree_directory} onChange={(event) => update({ worktree_directory: event.target.value })} placeholder={defaultWorktreePath} aria-label={t("Temporary worktree location")} />
+        <div><button className="secondary-button" type="button" onClick={() => void chooseWorktreeDirectory()}>{t("Browse")}</button><button className="secondary-button" type="button" onClick={() => update({ worktree_directory: "" })} disabled={!general.worktree_directory}>{t("Use default")}</button></div>
+      </div>
+    </SettingsRow>
   </SettingsSectionView>;
 }
 
@@ -510,6 +554,104 @@ function AgentSettingsForm({ draft, setDraft }: FormProps) {
   </SettingsSectionView>;
 }
 
+interface PromptObservabilityFormProps {
+  language: AppSettings["general"]["language"];
+  runtimeOnline: boolean;
+  onRefresh: (includeMemory: boolean) => Promise<PromptSnapshot>;
+}
+
+function PromptObservabilityForm({ language, runtimeOnline, onRefresh }: PromptObservabilityFormProps) {
+  const t = translator(language);
+  const [snapshot, setSnapshot] = useState<PromptSnapshot | null>(null);
+  const [includeMemory, setIncludeMemory] = useState(false);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState("");
+
+  async function load(showSensitive: boolean): Promise<boolean> {
+    if (!runtimeOnline || loading) return false;
+    setLoading(true);
+    setError("");
+    try {
+      setSnapshot(await onRefresh(showSensitive));
+      return true;
+    } catch (loadError) {
+      setError(loadError instanceof Error ? loadError.message : String(loadError));
+      return false;
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  useEffect(() => {
+    setIncludeMemory(false);
+    void load(false);
+    // This form is mounted only while the Prompt page is visible. Reloading here
+    // guarantees every visit starts from a backend-redacted snapshot.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [runtimeOnline]);
+
+  async function changeMemoryVisibility(checked: boolean) {
+    if (!checked) {
+      setIncludeMemory(false);
+      // Remove the sensitive response from component state before the redacted
+      // replacement completes, so switching off never leaves visible stale data.
+      setSnapshot(null);
+      await load(false);
+      return;
+    }
+    setIncludeMemory(await load(true));
+  }
+
+  return <SettingsSectionView
+    title={t("Prompt observability")}
+    description={t("Inspect the exact layered Prompt used by the current conversation. Token counts are preflight estimates; provider usage remains authoritative.")}
+  >
+    <div className="prompt-observability-toolbar">
+      <div>
+        <strong>{t("Current assembled Prompt")}</strong>
+        <small>{snapshot ? t("Generated {time}", { time: new Date(snapshot.generated_at).toLocaleString(language) }) : t("No Prompt snapshot loaded.")}</small>
+      </div>
+      <button className="secondary-button" onClick={() => void load(includeMemory)} disabled={!runtimeOnline || loading}>{t(loading ? "Loading..." : "Refresh")}</button>
+    </div>
+
+    {!runtimeOnline && <div className="management-empty">{t("Open a project and wait for Python Runtime first.")}</div>}
+    {error && <p className="management-error">{error}</p>}
+    {snapshot && <>
+      <div className="prompt-metrics-grid">
+        <div><span>{t("Prompt version")}</span><strong>{snapshot.version}</strong></div>
+        <div><span>{t("Mode")}</span><strong>{snapshot.mode}</strong></div>
+        <div><span>{t("Characters")}</span><strong>{snapshot.total.char_count.toLocaleString(language)}</strong></div>
+        <div><span>{t("Estimated tokens")}</span><strong>{snapshot.total.estimated_tokens.toLocaleString(language)}</strong></div>
+        <div className="wide"><span>SHA-256</span><code title={snapshot.total.sha256}>{snapshot.total.sha256}</code></div>
+      </div>
+
+      <SettingsRow
+        label={t("Show Memory sensitive content")}
+        description={t("Off by default. When enabled, retrieved Memory and compressed conversation summaries are returned by Runtime and displayed locally until this page closes.")}
+      >
+        <Toggle checked={includeMemory} onChange={(checked) => void changeMemoryVisibility(checked)} disabled={loading} />
+      </SettingsRow>
+
+      <section className="prompt-layer-panel">
+        <header><div><h3>{t("Prompt layers")}</h3><p>{t("Each layer records its role, size, estimated tokens, and content hash.")}</p></div><span>{t("{count} layers", { count: snapshot.layers.length })}</span></header>
+        <div className="prompt-layer-list">
+          {snapshot.layers.map((layer) => <article key={`${layer.role}-${layer.name}`}>
+            <div><strong>{layer.name}</strong><small>{layer.role}{layer.sensitive ? ` · ${t("sensitive")}` : ""}</small></div>
+            <span>{layer.char_count.toLocaleString(language)} {t("chars")}</span>
+            <span>{layer.estimated_tokens.toLocaleString(language)} {t("tokens")}</span>
+            <code title={layer.sha256}>{layer.sha256.slice(0, 12)}</code>
+          </article>)}
+        </div>
+      </section>
+
+      <section className="prompt-preview-panel">
+        <header><div><h3>{t("Assembled preview")}</h3><p>{snapshot.memory_hidden ? t("Memory and summary bodies are hidden by Runtime.") : t("Sensitive Memory and summary bodies are currently visible.")}</p></div></header>
+        <pre>{snapshot.assembled_preview}</pre>
+      </section>
+    </>}
+  </SettingsSectionView>;
+}
+
 interface RagSettingsFormProps extends FormProps {
   snapshot: RagSnapshot;
   runtimeOnline: boolean;
@@ -529,6 +671,7 @@ function RagSettingsForm({ draft, setDraft, snapshot, runtimeOnline, busy, confi
   const t = translator(draft.general.language);
   const indexing = snapshot.status === "indexing";
   const controlsDisabled = busy || Boolean(working) || !runtimeOnline || indexing;
+  const indexState = ragIndexState(snapshot, t);
   const update = (patch: Partial<AppSettings["rag"]>) => setDraft((current) => ({
     ...current,
     rag: { ...current.rag, ...patch },
@@ -587,6 +730,7 @@ function RagSettingsForm({ draft, setDraft, snapshot, runtimeOnline, busy, confi
     <SettingsRow label={t("Automatic retrieval")} description={t("Allow the Agent to call search_code proactively for architecture, behavior, and symbol-location questions. When off, it only uses RAG when you explicitly request it.")}><Toggle checked={rag.automatic_retrieval} onChange={(checked) => update({ automatic_retrieval: checked })} /></SettingsRow>
 
     <div className="rag-runtime-summary">
+      <div><span>{t("Index status")}</span><strong><span className={`rag-status-badge ${indexState.tone}`}>{indexState.label}</span></strong></div>
       <div><span>{t("Runtime model")}</span><strong>{snapshot.embedding_provider} / {snapshot.embedding_model}</strong></div>
       <div><span>{t("Indexed")}</span><strong>{t("{files} files / {chunks} chunks", { files: snapshot.indexed_file_count, chunks: snapshot.chunk_count })}</strong></div>
       <div><span>{t("Relations")}</span><strong>{snapshot.relation_count}</strong></div>
@@ -601,7 +745,7 @@ function RagSettingsForm({ draft, setDraft, snapshot, runtimeOnline, busy, confi
       </div></header>
       <div className="rag-source-list">
         {snapshot.sources.length === 0 && <div className="rag-empty">{t("No sources selected. Add files, folders, or the full workspace.")}</div>}
-        {snapshot.sources.map((source) => <div className="rag-source-row" key={source.path}><span className="rag-source-kind">{t(source.kind === "directory" ? "Directory" : "File")}</span><code title={source.path}>{source.path}</code><button className="secondary-button" onClick={() => void run("Remove source", () => onRemoveSource(source.path))} disabled={controlsDisabled}>{t("Remove")}</button></div>)}
+        {snapshot.sources.map((source) => <div className="rag-source-row" key={source.path}><span className="rag-source-kind">{t(source.kind === "directory" ? "Directory" : "File")}</span><code title={source.path}>{source.path}</code><span className={`rag-source-status ${indexState.tone}`} title={indexState.detail}>{indexState.label}</span><button className="secondary-button" onClick={() => void run("Remove source", () => onRemoveSource(source.path))} disabled={controlsDisabled}>{t("Remove")}</button></div>)}
       </div>
     </section>
 
@@ -616,6 +760,15 @@ function RagSettingsForm({ draft, setDraft, snapshot, runtimeOnline, busy, confi
     {(snapshot.error || notice) && <p className={`mcp-notice ${snapshot.error ? "error" : ""}`}>{snapshot.error || notice}</p>}
     <PathRow label={t("RAG database")} path={snapshot.storage_path} t={t} />
   </SettingsSectionView>;
+}
+
+function ragIndexState(snapshot: RagSnapshot, t: ReturnType<typeof translator>): { label: string; tone: "ready" | "working" | "warning" | "error" | "muted"; detail: string } {
+  if (snapshot.status === "indexing") return { label: t("Indexing..."), tone: "working", detail: snapshot.progress || t("Building semantic index...") };
+  if (snapshot.status === "error" || ((snapshot.last_result?.error_count ?? 0) > 0 && snapshot.chunk_count === 0)) return { label: t("Index failed"), tone: "error", detail: snapshot.error || snapshot.last_result?.message || t("No code chunks were created.") };
+  if ((snapshot.last_result?.error_count ?? 0) > 0) return { label: t("Indexed with errors"), tone: "warning", detail: snapshot.last_result?.message || t("Some selected files could not be indexed.") };
+  if (snapshot.needs_rebuild) return { label: t("Needs rebuild"), tone: "warning", detail: t("Source/model changes require a rebuild.") };
+  if (snapshot.chunk_count > 0) return { label: t("Search ready"), tone: "ready", detail: snapshot.last_result?.message || t("The current sources are available to search_code.") };
+  return { label: t("Not indexed"), tone: "muted", detail: t("Add a source and build the index.") };
 }
 
 interface McpSettingsFormProps {
@@ -888,24 +1041,43 @@ export interface SkillManagementFormProps {
   runtimeOnline: boolean;
   busy: boolean;
   onRefresh: () => Promise<SkillSnapshot>;
+  onDiff: (name: string) => Promise<SkillDiff>;
   onSetEnabled: (name: string, enabled: boolean) => Promise<SkillSnapshot>;
   onReload: () => Promise<SkillSnapshot>;
+  onUpdate: (name: string, currentHash: string, builtinHash: string) => Promise<SkillSnapshot>;
+  onKeepCustom: (name: string, currentHash: string, builtinHash: string) => Promise<SkillSnapshot>;
+  onRestoreDefault: (name: string, currentHash: string, builtinHash: string) => Promise<SkillSnapshot>;
   onPrepareDirectory: (scope: SkillInstallScope) => Promise<SkillDirectoryResult>;
 }
 
-export function SkillManagementForm({ language, snapshot, runtimeOnline, busy, onRefresh, onSetEnabled, onReload, onPrepareDirectory }: SkillManagementFormProps) {
+export function SkillManagementForm({
+  language,
+  snapshot,
+  runtimeOnline,
+  busy,
+  onRefresh,
+  onDiff,
+  onSetEnabled,
+  onReload,
+  onUpdate,
+  onKeepCustom,
+  onRestoreDefault,
+  onPrepareDirectory,
+}: SkillManagementFormProps) {
   const t = translator(language);
   const [filter, setFilter] = useState("");
   const [working, setWorking] = useState("");
   const [notice, setNotice] = useState("");
   const [noticeIsError, setNoticeIsError] = useState(false);
+  const [activeDiff, setActiveDiff] = useState<SkillDiff | null>(null);
   const [installScope, setInstallScope] = useState<SkillInstallScope>("project");
   const [directoryNotice, setDirectoryNotice] = useState("");
   const [directoryNoticeIsError, setDirectoryNoticeIsError] = useState(false);
   const controlsDisabled = busy || Boolean(working) || !runtimeOnline;
+  const viewDisabled = Boolean(working) || !runtimeOnline;
   const normalizedFilter = filter.trim().toLocaleLowerCase(language);
   const skills = normalizedFilter
-    ? snapshot.skills.filter((skill) => [skill.name, skill.description, skill.source, ...skill.tags]
+    ? snapshot.skills.filter((skill) => [skill.name, skill.description, skill.source, skill.upgrade_state || "", ...skill.tags]
       .some((value) => value.toLocaleLowerCase(language).includes(normalizedFilter)))
     : snapshot.skills;
 
@@ -923,6 +1095,59 @@ export function SkillManagementForm({ language, snapshot, runtimeOnline, busy, o
     } finally {
       setWorking("");
     }
+  }
+
+  async function openSkillDiff(name: string) {
+    if (viewDisabled) return;
+    setWorking(`View diff:${name}`);
+    setNotice("");
+    setNoticeIsError(false);
+    try {
+      setActiveDiff(await onDiff(name));
+    } catch (error) {
+      setNoticeIsError(true);
+      setNotice(error instanceof Error ? error.message : String(error));
+    } finally {
+      setWorking("");
+    }
+  }
+
+  async function applyDiffAction(action: "update" | "keep_custom" | "restore_default") {
+    if (!activeDiff || controlsDisabled) return;
+    if (action === "update") {
+      const confirmed = await confirmDialog(
+        t("Update {name} to built-in version {version}? Your customized Skill files will be replaced.", {
+          name: activeDiff.name,
+          version: activeDiff.builtin_version || "—",
+        }),
+        { title: t("Update built-in Skill"), kind: "warning" },
+      );
+      if (!confirmed) return;
+    }
+    if (action === "restore_default") {
+      const confirmed = await confirmDialog(
+        t("Restore {name} to the latest built-in default? Your customized Skill files will be replaced.", {
+          name: activeDiff.name,
+        }),
+        { title: t("Restore built-in Skill"), kind: "warning" },
+      );
+      if (!confirmed) return;
+    }
+
+    const label = action === "update"
+      ? "Update built-in Skill"
+      : action === "keep_custom"
+        ? "Keep custom Skill"
+        : "Restore built-in Skill";
+    const operation = action === "update"
+      ? () => onUpdate(activeDiff.name, activeDiff.current_hash, activeDiff.builtin_hash)
+      : action === "keep_custom"
+        ? () => onKeepCustom(activeDiff.name, activeDiff.current_hash, activeDiff.builtin_hash)
+        : () => onRestoreDefault(activeDiff.name, activeDiff.current_hash, activeDiff.builtin_hash);
+    await run(label, async () => {
+      await operation();
+      setActiveDiff(null);
+    });
   }
 
   async function openInstallDirectory() {
@@ -946,58 +1171,119 @@ export function SkillManagementForm({ language, snapshot, runtimeOnline, busy, o
     }
   }
 
-  return <SettingsSectionView title={t("Skills")} description={t("Inspect built-in, user, and project skills and control which instructions the Agent may load on its next turn.")}>
-    <div className="management-summary">
-      <div><span>{t("Enabled")}</span><strong>{snapshot.enabled_count}</strong></div>
-      <div><span>{t("Discovered")}</span><strong>{snapshot.total_count}</strong></div>
-      <div><span>{t("Warnings")}</span><strong>{snapshot.warnings.length}</strong></div>
-      <div className="management-summary-actions"><button className="secondary-button" onClick={() => void run("Refresh skills", onRefresh)} disabled={controlsDisabled}>{t("Refresh")}</button><button className="primary-button" onClick={() => void run("Reload skills", onReload)} disabled={controlsDisabled}>{t(working === "Reload skills" ? "Reloading..." : "Reload")}</button></div>
-    </div>
-    <div className="management-callout skill-installer-panel">
-      <strong>{t("Install a custom skill")}</strong>
-      <p>{t("Choose where the skill should be available. The folder is created when you open it; add one subfolder containing SKILL.md, then select Reload.")}</p>
-      <div className="skill-install-targets" role="radiogroup" aria-label={t("Skill installation scope")}>
-        {(["user", "project"] as const).map((scope) => {
-          const selected = installScope === scope;
-          const path = scope === "user" ? snapshot.user_dir : snapshot.project_dir;
-          return <button
-            className={`skill-install-target ${selected ? "selected" : ""}`}
-            type="button"
-            role="radio"
-            aria-checked={selected}
-            onClick={() => {
-              setInstallScope(scope);
-              setDirectoryNotice("");
-              setDirectoryNoticeIsError(false);
-            }}
-            disabled={!path}
-            key={scope}
-          >
-            <span className="skill-install-radio">{selected ? "✓" : ""}</span>
-            <span><strong>{t(scope === "user" ? "User Skills" : "Project Skills")}</strong><small>{t(scope === "user" ? "Available in every project" : "Available only in the current project")}</small><code title={path}>{path || t("Path unavailable")}</code></span>
-          </button>;
+  return <>
+    <SettingsSectionView title={t("Skills")} description={t("Inspect built-in, user, and project skills and control which instructions the Agent may load on its next turn.")}>
+      <div className="management-summary">
+        <div><span>{t("Enabled")}</span><strong>{snapshot.enabled_count}</strong></div>
+        <div><span>{t("Discovered")}</span><strong>{snapshot.total_count}</strong></div>
+        <div><span>{t("Updates")}</span><strong className={(snapshot.updates_available ?? 0) > 0 ? "status-warning" : ""}>{snapshot.updates_available ?? 0}</strong></div>
+        <div className="management-summary-actions"><button className="secondary-button" onClick={() => void run("Refresh skills", onRefresh)} disabled={controlsDisabled}>{t("Refresh")}</button><button className="primary-button" onClick={() => void run("Reload skills", onReload)} disabled={controlsDisabled}>{t(working === "Reload skills" ? "Reloading..." : "Reload")}</button></div>
+      </div>
+      <div className="management-callout skill-installer-panel">
+        <strong>{t("Install a custom skill")}</strong>
+        <p>{t("Choose where the skill should be available. The folder is created when you open it; add one subfolder containing SKILL.md, then select Reload.")}</p>
+        <div className="skill-install-targets" role="radiogroup" aria-label={t("Skill installation scope")}>
+          {(["user", "project"] as const).map((scope) => {
+            const selected = installScope === scope;
+            const path = scope === "user" ? snapshot.user_dir : snapshot.project_dir;
+            return <button
+              className={`skill-install-target ${selected ? "selected" : ""}`}
+              type="button"
+              role="radio"
+              aria-checked={selected}
+              onClick={() => {
+                setInstallScope(scope);
+                setDirectoryNotice("");
+                setDirectoryNoticeIsError(false);
+              }}
+              disabled={!path}
+              key={scope}
+            >
+              <span className="skill-install-radio">{selected ? "✓" : ""}</span>
+              <span><strong>{t(scope === "user" ? "User Skills" : "Project Skills")}</strong><small>{t(scope === "user" ? "Available in every project" : "Available only in the current project")}</small><code title={path}>{path || t("Path unavailable")}</code></span>
+            </button>;
+          })}
+        </div>
+        <div className="skill-install-actions">
+          <span>{t("Selected: {scope}", { scope: t(installScope === "project" ? "Project Skills" : "User Skills") })}</span>
+          <button className="primary-button" type="button" onClick={() => void openInstallDirectory()} disabled={controlsDisabled || !(installScope === "user" ? snapshot.user_dir : snapshot.project_dir)}>{t(working === "Open Skill directory" ? "Opening..." : "Open selected folder")}</button>
+        </div>
+        {directoryNotice && <p className={`skill-install-notice ${directoryNoticeIsError ? "error" : "success"}`}>{directoryNotice}</p>}
+      </div>
+      <div className="management-toolbar"><input value={filter} onChange={(event) => setFilter(event.target.value)} placeholder={t("Filter skills by name, tag, or source")} /><span>{t("Showing {shown} of {total}", { shown: skills.length, total: snapshot.skills.length })}</span></div>
+      {snapshot.warnings.length > 0 && <details className="management-warnings"><summary>{t("View {count} loading warnings", { count: snapshot.warnings.length })}</summary><pre>{snapshot.warnings.join("\n")}</pre></details>}
+      <div className="management-card-list skill-list">
+        {skills.length === 0 && <div className="management-empty">{t(normalizedFilter ? "No skills match this filter." : "No skills were discovered.")}</div>}
+        {skills.map((skill) => {
+          const upgradeState = skill.upgrade_state || (skill.builtin ? "error" : "not_bundled");
+          const stateLabel = {
+            not_bundled: "Custom Skill",
+            current: "Up to date",
+            customized: "Customized",
+            update_available: "New version available",
+            custom_kept: "Custom version kept",
+            error: "Upgrade status error",
+          }[upgradeState];
+          const canViewDiff = skill.builtin && ["customized", "update_available", "custom_kept"].includes(upgradeState);
+          const diffLoading = working === `View diff:${skill.name}`;
+          return <article className={`management-card skill-card ${skill.enabled ? "enabled" : "disabled"}`} key={skill.name}>
+            <header>
+              <div>
+                <strong>{skill.name}</strong>
+                <small>{t(skill.source)}{skill.current_version ? ` · v${skill.current_version}` : skill.version ? ` · v${skill.version}` : ""}{skill.author ? ` · ${skill.author}` : ""}</small>
+              </div>
+              <span className={`skill-upgrade-state ${upgradeState}`}>{t(stateLabel)}</span>
+              <Toggle checked={skill.enabled} disabled={controlsDisabled} onChange={(enabled) => void run(`${enabled ? "Enable" : "Disable"} skill`, () => onSetEnabled(skill.name, enabled))} />
+            </header>
+            <p>{skill.description || t("No description supplied by this skill.")}</p>
+            {skill.tags.length > 0 && <div className="management-tags">{skill.tags.map((tag) => <span key={tag}>{tag}</span>)}</div>}
+            {skill.builtin && <div className={`skill-upgrade-panel ${upgradeState}`}>
+              <div>
+                <span>{t(skillUpgradeDescription(upgradeState))}</span>
+                <code title={`${skill.current_hash} -> ${skill.builtin_hash}`}>{shortHash(skill.current_hash)} → {shortHash(skill.builtin_hash)}</code>
+              </div>
+              {canViewDiff && <button className="secondary-button" type="button" onClick={() => void openSkillDiff(skill.name)} disabled={viewDisabled}>{t(diffLoading ? "Loading Diff..." : "View diff")}</button>}
+              {upgradeState === "error" && skill.error && <small>{skill.error}</small>}
+            </div>}
+            <footer><code title={skill.skill_md_path}>{skill.skill_md_path}</code><button className="secondary-button" onClick={() => void revealItemInDir(skill.skill_md_path)}>{t("Reveal")}</button></footer>
+          </article>;
         })}
       </div>
-      <div className="skill-install-actions">
-        <span>{t("Selected: {scope}", { scope: t(installScope === "project" ? "Project Skills" : "User Skills") })}</span>
-        <button className="primary-button" type="button" onClick={() => void openInstallDirectory()} disabled={controlsDisabled || !(installScope === "user" ? snapshot.user_dir : snapshot.project_dir)}>{t(working === "Open Skill directory" ? "Opening..." : "Open selected folder")}</button>
+      <div className="management-paths"><PathRow label={t("Skill state file")} path={snapshot.state_path} t={t} /></div>
+      <p className={`mcp-notice ${noticeIsError ? "error" : ""}`}>{notice || t(!runtimeOnline ? "Python Runtime must be online to manage skills." : "Skill enablement and reload changes apply on the next Agent turn.")}</p>
+    </SettingsSectionView>
+    {activeDiff && <section className="diff-overlay" role="dialog" aria-modal="true" aria-label={t("Skill update Diff")}>
+      <div className="diff-dialog skill-diff-dialog">
+        <header>
+          <div>
+            <strong>{t("Skill update Diff")}: {activeDiff.name}</strong>
+            <span>{t("Current v{current} → built-in v{builtin} · +{additions} -{deletions}", {
+              current: activeDiff.current_version || "—",
+              builtin: activeDiff.builtin_version || "—",
+              additions: activeDiff.additions,
+              deletions: activeDiff.deletions,
+            })}</span>
+          </div>
+          <button className="secondary-button" type="button" onClick={() => setActiveDiff(null)} disabled={Boolean(working)}>{t("Close")}</button>
+        </header>
+        <pre className="task-diff-content">{visibleSkillDiff(activeDiff.diff, activeDiff.truncated) || t("No Skill differences are available.")}</pre>
+        <footer className="skill-diff-footer">
+          <div>
+            <code title={activeDiff.current_hash}>{t("Current hash")}: {shortHash(activeDiff.current_hash)}</code>
+            <code title={activeDiff.builtin_hash}>{t("Built-in hash")}: {shortHash(activeDiff.builtin_hash)}</code>
+            {activeDiff.truncated && <small>{t("The displayed Skill Diff was truncated. Update safety still uses the complete content hashes.")}</small>}
+          </div>
+          <div className="skill-upgrade-actions">
+            {snapshot.skills.find((skill) => skill.name === activeDiff.name)?.upgrade_state === "update_available" && <>
+              <button className="secondary-button" type="button" onClick={() => void applyDiffAction("keep_custom")} disabled={controlsDisabled}>{t("Keep custom")}</button>
+              <button className="primary-button" type="button" onClick={() => void applyDiffAction("update")} disabled={controlsDisabled}>{t("Update")}</button>
+            </>}
+            {["customized", "custom_kept"].includes(snapshot.skills.find((skill) => skill.name === activeDiff.name)?.upgrade_state || "") && <button className="secondary-button danger-button" type="button" onClick={() => void applyDiffAction("restore_default")} disabled={controlsDisabled}>{t("Restore default")}</button>}
+          </div>
+        </footer>
       </div>
-      {directoryNotice && <p className={`skill-install-notice ${directoryNoticeIsError ? "error" : "success"}`}>{directoryNotice}</p>}
-    </div>
-    <div className="management-toolbar"><input value={filter} onChange={(event) => setFilter(event.target.value)} placeholder={t("Filter skills by name, tag, or source")} /><span>{t("Showing {shown} of {total}", { shown: skills.length, total: snapshot.skills.length })}</span></div>
-    {snapshot.warnings.length > 0 && <details className="management-warnings"><summary>{t("View {count} loading warnings", { count: snapshot.warnings.length })}</summary><pre>{snapshot.warnings.join("\n")}</pre></details>}
-    <div className="management-card-list skill-list">
-      {skills.length === 0 && <div className="management-empty">{t(normalizedFilter ? "No skills match this filter." : "No skills were discovered.")}</div>}
-      {skills.map((skill) => <article className={`management-card skill-card ${skill.enabled ? "enabled" : "disabled"}`} key={skill.name}>
-        <header><div><strong>{skill.name}</strong><small>{t(skill.source)}{skill.version ? ` · v${skill.version}` : ""}{skill.author ? ` · ${skill.author}` : ""}</small></div><Toggle checked={skill.enabled} disabled={controlsDisabled} onChange={(enabled) => void run(`${enabled ? "Enable" : "Disable"} skill`, () => onSetEnabled(skill.name, enabled))} /></header>
-        <p>{skill.description || t("No description supplied by this skill.")}</p>
-        {skill.tags.length > 0 && <div className="management-tags">{skill.tags.map((tag) => <span key={tag}>{tag}</span>)}</div>}
-        <footer><code title={skill.skill_md_path}>{skill.skill_md_path}</code><button className="secondary-button" onClick={() => void revealItemInDir(skill.skill_md_path)}>{t("Reveal")}</button></footer>
-      </article>)}
-    </div>
-    <div className="management-paths"><PathRow label={t("Skill state file")} path={snapshot.state_path} t={t} /></div>
-    <p className={`mcp-notice ${noticeIsError ? "error" : ""}`}>{notice || t(!runtimeOnline ? "Python Runtime must be online to manage skills." : "Skill enablement and reload changes apply on the next Agent turn.")}</p>
-  </SettingsSectionView>;
+    </section>}
+  </>;
 }
 
 export interface BrowserManagementFormProps {
@@ -1154,10 +1440,25 @@ function NumberSetting({ label, description, value, min, max, suffix, onChange }
   return <SettingsRow label={label} description={description}><label className="number-control"><input type="number" min={min} max={max} step={1} value={value} onInput={(event) => updateValue(event.currentTarget)} onChange={(event) => updateValue(event.currentTarget)} />{suffix && <span>{suffix}</span>}</label></SettingsRow>;
 }
 function PathRow({ label, path, t }: { label: string; path: string; t: ReturnType<typeof translator> }) { return <SettingsRow label={label} description={path || t("Not available until a project is open.")}><button className="secondary-button" onClick={() => void revealItemInDir(path)} disabled={!path}>{t("Reveal")}</button></SettingsRow>; }
-function settingsIcon(section: SettingsSection) { return { general: "◎", appearance: "◐", models: "◇", agent: "✦", memory: "M", skills: "S", mcp: "⌘", browser: "B", rag: "⌕", diagnostics: "⚙" }[section]; }
-function settingsSectionLabel(section: SettingsSection) { return { general: "General", appearance: "Appearance", models: "Models", agent: "Agent", memory: "Memory", skills: "Skills", mcp: "MCP Servers", browser: "Browser", rag: "Code RAG", diagnostics: "Data & Diagnostics" }[section]; }
+function settingsIcon(section: SettingsSection) { return { general: "◎", appearance: "◐", models: "◇", agent: "✦", prompt: "P", memory: "M", skills: "S", mcp: "⌘", browser: "B", rag: "⌕", diagnostics: "⚙" }[section]; }
+function settingsSectionLabel(section: SettingsSection) { return { general: "General", appearance: "Appearance", models: "Models", agent: "Agent", prompt: "Prompt", memory: "Memory", skills: "Skills", mcp: "MCP Servers", browser: "Browser", rag: "Code RAG", diagnostics: "Data & Diagnostics" }[section]; }
 function titleCase(value: string) { return value.charAt(0).toUpperCase() + value.slice(1); }
 function abbreviateText(value: string, limit: number) { return value.length <= limit ? value : `${value.slice(0, limit)}...`; }
+function shortHash(value?: string | null) { return value ? value.slice(0, 12) : "—"; }
+function visibleSkillDiff(value: string, truncated: boolean) {
+  const normalized = truncated ? value.replace(/\n*\[diff truncated\]\s*$/i, "") : value;
+  return normalized.trim() === "No differences." ? "" : normalized;
+}
+function skillUpgradeDescription(state: NonNullable<SkillSnapshot["skills"][number]["upgrade_state"]>) {
+  return {
+    not_bundled: "This is a user or project Skill and is not managed by built-in upgrades.",
+    current: "This managed built-in Skill is up to date and has not been modified.",
+    customized: "This Skill differs from its installed built-in default.",
+    update_available: "A newer built-in version is available. Review the Diff before choosing an action.",
+    custom_kept: "The customized copy is being kept for the current built-in version.",
+    error: "StellarCode could not verify this built-in Skill's upgrade state.",
+  }[state];
+}
 function formatMemoryTimestamp(timestamp: number, language: AppSettings["general"]["language"]) {
   const milliseconds = timestamp > 10_000_000_000 ? timestamp : timestamp * 1000;
   const date = new Date(milliseconds);
@@ -1171,7 +1472,7 @@ function translateActionLabel(label: string, t: ReturnType<typeof translator>) {
   const prefix = ["Install", "Load", "Remove", "Enable", "Disable", "Restart", "Save", "Delete", "Clear", "Refresh", "Reload", "Connect", "Disconnect", "Probe"].find((item) => label.startsWith(`${item} `));
   return prefix ? `${t(prefix)} ${label.slice(prefix.length + 1)}` : t(label);
 }
-function runtimeSettingsChanged(left: AppSettings, right: AppSettings) { return JSON.stringify([left.models, left.agent, left.rag, left.diagnostics]) !== JSON.stringify([right.models, right.agent, right.rag, right.diagnostics]); }
+function runtimeSettingsChanged(left: AppSettings, right: AppSettings) { return JSON.stringify([left.general.worktree_directory, left.models, left.agent, left.rag, left.diagnostics]) !== JSON.stringify([right.general.worktree_directory, right.models, right.agent, right.rag, right.diagnostics]); }
 
 function parseStringMap(raw: string, label: string): Record<string, string> {
   const parsed: unknown = JSON.parse(raw || "{}");

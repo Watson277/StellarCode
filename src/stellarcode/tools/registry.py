@@ -1,3 +1,9 @@
+"""Shared tool catalog and bounded parallel execution engine.
+
+All Agent modes use this registry so schema generation, cancellation, tracing, timeout
+handling, and ordered result assembly have one implementation.
+"""
+
 from __future__ import annotations
 
 import contextvars
@@ -196,10 +202,7 @@ class ToolRegistry:
             }
         except ToolExecutionError:
             return {"value": str(arguments or "")[:2_000]}
-        if name == "write_file" and isinstance(parsed.get("content"), str):
-            content = str(parsed["content"])
-            parsed["content"] = f"[full content omitted: {len(content)} characters]"
-        return parsed
+        return _sanitize_file_mutation_arguments(name, parsed)
 
     @staticmethod
     def sanitize_event_arguments(
@@ -213,10 +216,7 @@ class ToolRegistry:
         except ToolExecutionError:
             return {"value": str(arguments or "")[:2_000]}
         safe = {key: value for key, value in parsed.items() if not key.startswith("__")}
-        if name == "write_file" and isinstance(safe.get("content"), str):
-            content = str(safe["content"])
-            safe["content"] = f"[full content omitted: {len(content)} characters]"
-        return safe
+        return _sanitize_file_mutation_arguments(name, safe)
 
     def execute(self, name: str, arguments: str | dict[str, Any] | None) -> str:
         started_at = time.monotonic()
@@ -376,6 +376,9 @@ class ToolRegistry:
         if batch_timeout <= 0:
             raise ValueError("timeout_seconds must be greater than 0.")
 
+        # Workers consume in parallel, but results are stored at their original
+        # indexes so the next LLM request receives tool messages in call order.
+        # This is required by OpenAI-compatible tool-call protocols.
         work_queue: queue.Queue[tuple[int, ToolInvocation]] = queue.Queue()
         for index, invocation in enumerate(invocations):
             work_queue.put((index, invocation))
@@ -427,6 +430,9 @@ class ToolRegistry:
             for thread in threads:
                 thread.join(min(0.05, max(0.0, deadline - time.monotonic())))
 
+        # Do not wait indefinitely for an uncooperative tool process.  Mark its
+        # individual cancellation token, synthesize an ordered error result, and
+        # let the detached worker finish its own cleanup in the background.
         unfinished_indexes = {
             index for index, result in enumerate(results) if result is None
         }
@@ -579,3 +585,33 @@ class ToolRegistry:
         if not isinstance(parsed, dict):
             raise ToolExecutionError("Tool arguments must decode to a JSON object.")
         return parsed
+
+
+def _sanitize_file_mutation_arguments(
+    name: str,
+    arguments: dict[str, Any],
+) -> dict[str, Any]:
+    if name == "write_file" and isinstance(arguments.get("content"), str):
+        content = str(arguments["content"])
+        arguments["content"] = f"[full content omitted: {len(content)} characters]"
+    if name == "apply_patch" and isinstance(arguments.get("edits"), list):
+        edits = arguments["edits"]
+        old_chars = 0
+        new_chars = 0
+        replace_all_count = 0
+        for edit in edits:
+            if not isinstance(edit, dict):
+                continue
+            old_text = edit.get("old_text")
+            new_text = edit.get("new_text")
+            old_chars += len(old_text) if isinstance(old_text, str) else 0
+            new_chars += len(new_text) if isinstance(new_text, str) else 0
+            replace_all_count += edit.get("replace_all") is True
+        arguments["edits"] = {
+            "edit_count": len(edits),
+            "old_chars": old_chars,
+            "new_chars": new_chars,
+            "replace_all_count": replace_all_count,
+            "content": "[exact patch text omitted]",
+        }
+    return arguments

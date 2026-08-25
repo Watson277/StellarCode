@@ -1,3 +1,5 @@
+"""Routes image-bearing requests to a vision-capable model when configured."""
+
 from __future__ import annotations
 
 from typing import Any, Callable

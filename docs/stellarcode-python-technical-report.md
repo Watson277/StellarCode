@@ -136,14 +136,21 @@ ToolDefinition(
 
 - `read_file`
 - `write_file`
+- `apply_patch`
 - `delete_file`
 - `list_dir`
+- `glob_files`
+- `grep_code`
 - `execute_command`
 - `search_code`
 - `web_search`
 - `web_fetch`
 
 动态 MCP 工具和 `load_skill` 也会注册到同一个 Registry，因此 Agent 不需要为不同来源的工具编写不同的推理循环。
+
+桌面 Runtime 中，每个任务会在 Side-Git PRE 快照对应的独立 Git worktree 内运行这些
+内置文件工具和 `execute_command`。终态通过 binary patch 预检后串行合并回项目；冲突
+不会覆盖项目现状。详细边界见 `docs/task-git-worktree-isolation.md`。
 
 ### 1.4 文件访问设计
 
@@ -252,7 +259,7 @@ Memory 分为两层：
 
 ### 3.4 记忆检索
 
-`MemoryRetriever` 使用 `jieba` 和正则切词，分别匹配内容与 metadata。长期记忆权重为 1.2，短期记忆权重为 1.0。默认最多向 system prompt 注入约 500 tokens 的相关记忆。
+`MemoryRetriever` 使用 `jieba` 和正则切词，分别匹配内容与 metadata。长期记忆权重为 1.2，短期记忆权重为 1.0。默认最多检索约 500 tokens 的相关记忆。检索结果不会进入 system prompt，而是紧邻当前真实请求，以 `user` role 的 `stellarcode.context/v1` JSON 数据消息注入，并显式标记 `trusted=false`。上下文压缩摘要使用同一边界；Runtime 私有类型字段会在调用模型前移除，避免兼容 API 拒绝未知字段，同时保持 system 前缀稳定、降低 Memory Prompt Injection 风险。
 
 `/clear` 会清空当前 Agent 上下文和短期记忆，但保留长期 JSON。
 
@@ -299,7 +306,13 @@ flowchart LR
 
 未通过时，Worker 根据反馈重试，默认最多 2 次。Reviewer 输出损坏或不可用时，系统会保留 Worker 结果，但标记审阅不可用。
 
-### 4.3 隔离与共享
+### 4.3 MessageBus 与可靠消费
+
+Lead、Planner、Worker 和 Reviewer 不再以 Python 函数返回值作为跨角色通信通道，而是通过每次 Team 运行独立的 `FileMessageBus` 通信。每个角色拥有一个 append-only `.jsonl` 邮箱：Lead 生产 `task` / `review_request`，角色消费者以租约 claim 消息，完成后先向 Lead 邮箱追加 `*_result`，再确认原消息。
+
+邮箱记录不会采用“读取后删除”的方式消费。确认状态、尝试次数和租约单独保存；Sidecar 或 Worker 崩溃后，过期租约会重新投递，超过最大尝试次数才写入 `dead-letter.jsonl`。因此协议提供 at-least-once delivery，带文件副作用的消费者仍需依据 `message.id` / `correlation_id` 保持幂等。
+
+### 4.4 隔离与共享
 
 Worker 在并行任务前后清空历史，避免一个步骤的上下文泄漏到另一个步骤。每个角色还拥有独立的 `SkillContextBuffer`，通过 `contextvars` 在工具线程中传播，避免并发 Worker 相互消费 Skill 内容。
 
@@ -375,9 +388,9 @@ CLI 默认使用 `restricted` 模式，高风险工具自动审批，不需要 `
 
 | 工具 | 风险等级 | 默认处理 |
 | --- | --- | --- |
-| `read_file`、`list_dir` | safe | 直接执行 |
+| `read_file`、`list_dir`、`glob_files`、`grep_code` | safe | 直接执行 |
 | `web_search`、`web_fetch` | safe | 直接执行 |
-| `write_file`、`create_project` | medium | 请求审批 |
+| `write_file`、`apply_patch`、`create_project` | medium | 请求审批 |
 | `delete_file`、`execute_command` | high | 请求审批 |
 | 普通 `mcp__*` | medium | 请求审批 |
 | `mcp__chrome-devtools__*` | safe | 直接执行 |
@@ -526,7 +539,7 @@ MCP 文本返回普通 Tool Result；`structuredContent` 在无正文时格式�
 
 ### 9.5 Chrome DevTools MCP
 
-Chrome DevTools MCP 与其他 MCP 工具使用同一注册机制。Prompt 的默认策略是：
+Chrome DevTools MCP 与其他 MCP 工具使用同一注册机制。跨工具选择流程只由 `web-access` Skill 维护：
 
 1. 普通公开 URL 先 `web_fetch`；
 2. JavaScript、交互、网络日志或静态抓取失败时使用 Chrome；
@@ -565,21 +578,20 @@ Agent 侧对应内置工具 `browser_status`、`browser_connect`、`browser_tabs
 
 `BrowserGuard` 跟踪 Agent 在 shared 会话中新建的标签页。`close_page` 只能关闭 Agent 自己创建的页面，不能关闭用户原有标签页。完成需要登录态的任务后，Agent 应调用 `browser_disconnect` 返回 isolated 模式。
 
-## 第十一章：web-access Skill
+## 第十一章：工作流 Skills
 
 ### 11.1 Skill 的定位
 
-Skill 不是可执行函数，而是一组按需加载的领域指引。工具负责“能做什么”，Skill 负责“在什么情况下以什么顺序做”。内置 `web-access` Skill 描述了 `web_search`、`web_fetch`、Chrome isolated/shared 和典型站点的选择策略。
+Skill 不是可执行函数，而是一组按需加载的领域指引。工具 Schema 负责“单个工具能做什么”，Skill 负责“在什么情况下以什么顺序组合工具”。内置 `web-access` Skill 描述联网和浏览器选择策略；`code-exploration` Skill 描述文件发现、精确搜索、RAG、读取、修改与验证流程。system prompt 只保留安全、权限、验证等全局规则和 RAG 当前运行模式，不重复这些工作流。
 
-### 11.2 三层发现
+### 11.2 模板与两层发现
 
-Skill 按以下顺序加载，后层同名 Skill 覆盖前层：
+运行时只扫描两个可编辑层，后层同名 Skill 覆盖前层：
 
-1. 内置 `src/stellarcode/skills`；
-2. 用户 `~/.stellarcode/skills`；
-3. 项目 `.stellarcode/skills`。
+1. 用户 `~/.stellarcode/skills`；
+2. 项目 `.stellarcode/skills`。
 
-每个 Skill 目录包含 `SKILL.md`，可包含 frontmatter、正文和 `references/`。解析警告会在启动和 Skill 命令中展示。启用状态写入 `~/.stellarcode/skills.json`，写入失败会作为可见警告返回。
+发行包中的 `src/stellarcode/skills` 是模板来源；启动和 reload 会把缺失模板复制到用户层，但不会覆盖用户已有版本。每个 Skill 目录包含 `SKILL.md`，可包含 frontmatter、正文和 `references/`。解析警告会在启动和 Skill 命令中展示。启用状态写入 `~/.stellarcode/skills.json`，写入失败会作为可见警告返回。
 
 ### 11.3 Prompt 索引与懒加载
 
@@ -598,9 +610,7 @@ system prompt 只注入 Skill 名称和简介索引，而不是完整正文：
 }
 ```
 
-正文最多加载 5 KB，写入 `SkillContextBuffer`。Buffer 最多保留 3 个 Skill，`drain()` 后清空，并以前置内容形式加入下一条 user message。这样避免动态修改 system prompt，减少缓存前缀失效和每轮 token 开销。
-
-当前实现的边界是：`load_skill` 在本轮内部工具循环中只写入 Buffer，正文会在下一次外部 `Agent.run()` 的用户消息前注入，而不是立即进入同一任务的下一次 LLM 调用。后续可以把 drain 移到每次内部 LLM 调用之前，实现真正的同任务即时生效。
+正文最多加载 5 KB，写入 `SkillContextBuffer`。Buffer 最多保留 3 个 Skill；工具批次完成后立即 `drain()`，并以前置 user-role 上下文进入当前任务的下一次 LLM 调用。这样既不动态修改 system prompt，也不需要用户额外发送“继续”，同时减少稳定前缀失效和常规轮次 token 开销。
 
 ### 11.4 Multi-Agent Buffer
 
@@ -727,7 +737,7 @@ stellarcode `
 | `test_web.py` | 搜索质量、fallback、SSRF 和正文抓取 |
 | `test_mcp.py` | JSON-RPC、Transport、动态工具和审计 |
 | `test_browser.py` | isolated/shared、CDP 和标签页保护 |
-| `test_skill.py` | 三层 Skill、Buffer、warning 和状态 |
+| `test_skill.py` | Skill 模板、两层覆盖、即时 Buffer、warning 和状态 |
 | `test_image.py` | 图片引用、压缩、模型路由和 API 错误 |
 
 当前验证命令：
@@ -737,7 +747,7 @@ stellarcode `
 .\.venv\Scripts\python.exe -m pytest -q
 ```
 
-当前全量结果为 `156 passed`，Ruff 检查通过。
+当前全量结果为 `405 passed, 1 skipped`，Ruff 检查通过。
 
 ## 当前边界与后续方向
 
@@ -746,13 +756,12 @@ stellarcode `
 3. `.txt` 尚未进入 RAG 默认索引后缀。
 4. Ctrl+V 图片不能被 `input()` 直接捕获，仍需 `@clipboard`。
 5. 自动长期事实提取基于关键词，可能保存不稳定信息。
-6. Skill 正文当前在下一次外部用户输入时注入，同任务即时注入仍待调整。
-7. 设置固定 `GLM_BASE_URL` 后，文本和视觉请求都会使用同一端点。
-8. MCP Server 自动重启、OAuth、sampling 和资源订阅尚未实现。
-9. CLI 会话历史不跨进程持久化，跨会话信息主要依赖长期记忆 JSON。
+6. 设置固定 `GLM_BASE_URL` 后，文本和视觉请求都会使用同一端点。
+7. MCP Server 自动重启、OAuth、sampling 和资源订阅尚未实现。
+8. CLI 会话历史不跨进程持久化，跨会话信息主要依赖长期记忆 JSON。
 
 ## 结论
 
 StellarCode Python 已形成一个可运行、可测试、可扩展的 Agent 框架。十二个阶段并不是彼此孤立的功能：ReAct 提供统一循环，Plan 和 Multi-Agent 复用该循环，Memory 与 RAG 提供上下文，HITL 和网络策略控制风险，并发提高吞吐，MCP 和 Chrome 扩展环境能力，Skill 提供按需方法论，多模态则把工具结果和视觉输入纳入同一消息协议。
 
-Python 版本的主要工程价值在于模块边界清楚、依赖较轻、测试速度快，并且可通过 Protocol、dataclass、contextvars 和标准库并发能力快速验证 Agent 架构。下一步应优先完善真正的安全沙箱、Skill 同任务即时注入、持久化会话管理和多 Provider 模型路由。
+Python 版本的主要工程价值在于模块边界清楚、依赖较轻、测试速度快，并且可通过 Protocol、dataclass、contextvars 和标准库并发能力快速验证 Agent 架构。下一步应优先完善真正的安全沙箱、持久化会话管理和更完整的多 Provider 路由。

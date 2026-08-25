@@ -1,3 +1,5 @@
+"""Conservative command classification used before terminal execution."""
+
 from __future__ import annotations
 
 import re

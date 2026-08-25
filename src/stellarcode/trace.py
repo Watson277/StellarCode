@@ -1,3 +1,5 @@
+"""Scoped JSONL tracing for LLM, tool, approval, and Runtime diagnostic events."""
+
 from __future__ import annotations
 
 import json
@@ -28,6 +30,14 @@ _INLINE_SECRET = re.compile(
     r"(\s*[:=]\s*)([^\s,;]+)"
 )
 _DATA_IMAGE = re.compile(r"data:image/([^;,]+);base64,([A-Za-z0-9+/=]+)")
+_NON_SECRET_TOKEN_KEYS = {
+    "cached_input_tokens",
+    "estimated_tokens",
+    "input_tokens",
+    "output_tokens",
+    "reasoning_tokens",
+    "total_tokens",
+}
 TraceTarget = tuple[int, Path]
 ScopedTraceTarget = tuple[str, TraceTarget]
 
@@ -295,6 +305,42 @@ class TracingChatClient:
         self.delegate = delegate
         self.recorder = recorder
         self.usage_callback = usage_callback
+        self._prompt_snapshot_lock = threading.RLock()
+        self._prompt_snapshots: dict[str, object] = {}
+
+    def record_prompt_snapshot(self, snapshot: object) -> None:
+        """Retain the latest Prompt snapshot and write only its metadata to Trace."""
+
+        metadata_builder = getattr(snapshot, "trace_metadata", None)
+        if not callable(metadata_builder):
+            raise TypeError("prompt snapshot must provide trace_metadata()")
+        session_id, task_id = current_llm_scope()
+        key = session_id or "__default__"
+        with self._prompt_snapshot_lock:
+            self._prompt_snapshots[key] = snapshot
+        trace_target = self.recorder.capture_target()
+        self.recorder.record_for(
+            trace_target,
+            "prompt_assembled",
+            task_id=task_id,
+            prompt=metadata_builder(),
+        )
+
+    def prompt_snapshot(
+        self,
+        session_id: str = "",
+        *,
+        include_sensitive: bool = False,
+    ) -> dict[str, Any] | None:
+        """Return a backend-redacted snapshot for one desktop conversation."""
+
+        key = session_id or "__default__"
+        with self._prompt_snapshot_lock:
+            snapshot = self._prompt_snapshots.get(key)
+        serializer = getattr(snapshot, "to_dict", None)
+        if not callable(serializer):
+            return None
+        return serializer(include_sensitive=include_sensitive)
 
     def chat(
         self,
@@ -373,7 +419,7 @@ def _request_model(client: object, messages: list[dict[str, Any]]) -> str:
 
 
 def _sanitize(value: object, key: str = "") -> object:
-    if key and _SENSITIVE_KEY.search(key):
+    if key and key.lower() not in _NON_SECRET_TOKEN_KEYS and _SENSITIVE_KEY.search(key):
         return "[REDACTED]"
     if key in {"data_base64", "base64_data"} and isinstance(value, str):
         return f"[IMAGE DATA OMITTED: {len(value)} chars]"

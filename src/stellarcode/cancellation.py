@@ -1,3 +1,5 @@
+"""Cooperative cancellation helpers for provider calls and tool worker threads."""
+
 from __future__ import annotations
 
 import threading

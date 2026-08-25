@@ -1,3 +1,5 @@
+"""Serializable approval requests and decisions shared by CLI and desktop HITL."""
+
 from __future__ import annotations
 
 import json

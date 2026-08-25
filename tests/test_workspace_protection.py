@@ -31,6 +31,345 @@ def _service(workspace: Path, storage: Path) -> WorkspaceProtectionService:
     return service
 
 
+def test_isolated_task_worktree_keeps_changes_private_until_finalize(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    target = workspace / "app.py"
+    target.write_text("value = 1\n", encoding="utf-8")
+    service = _service(workspace, tmp_path / "protection")
+
+    started = service.begin_task("task-isolated", "session-one", isolated=True)
+    worktree = service.task_workspace("task-isolated", "session-one")
+    assert worktree is not None
+    (worktree / "app.py").write_text("value = 2\n", encoding="utf-8")
+
+    assert started["worktree_isolated"] is True
+    assert target.read_text(encoding="utf-8") == "value = 1\n"
+    finalized = service.finalize_task("task-isolated", "completed")
+
+    assert finalized["merge_state"] == "merged"
+    assert finalized["has_changes"] is True
+    assert finalized["rollback_available"] is True
+    assert finalized["worktree_path"] == ""
+    assert target.read_text(encoding="utf-8") == "value = 2\n"
+
+
+def test_isolated_worktree_uses_short_git_paths_in_deep_runtime_storage(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    (workspace / "app.py").write_text("value = 1\n", encoding="utf-8")
+    storage = tmp_path
+    depth = 0
+    while len(str(storage / "workspace-protection")) < 150:
+        storage /= f"runtime-project-storage-{depth:02d}"
+        depth += 1
+    storage /= "workspace-protection"
+    service = _service(workspace, storage)
+    task_id = "task-" + "0123456789abcdef" * 3
+
+    started = service.begin_task(task_id, "session-one", isolated=True)
+    worktree = service.task_workspace(task_id, "session-one")
+
+    assert worktree is not None
+    assert len(worktree.name) == 16
+    pointer_value = (worktree / ".git").read_text(encoding="utf-8").removeprefix(
+        "gitdir: "
+    ).strip()
+    if os.name == "nt":
+        assert len(pointer_value) < 220
+    (worktree / "app.py").write_text("value = 2\n", encoding="utf-8")
+    finalized = service.finalize_task(task_id, "completed")
+    assert started["worktree_isolated"] is True
+    assert finalized["merge_state"] == "merged", finalized["error"]
+    assert (workspace / "app.py").read_text(encoding="utf-8") == "value = 2\n"
+
+
+def test_isolated_task_can_store_its_worktree_under_a_custom_root(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    (workspace / "app.py").write_text("before\n", encoding="utf-8")
+    storage = tmp_path / "runtime" / "workspace-protection"
+    custom_root = tmp_path / "custom-worktrees" / "projects" / "project-one" / "w"
+    service = WorkspaceProtectionService(
+        workspace,
+        storage,
+        worktree_root=custom_root,
+    )
+    if not service.available:
+        pytest.skip("Git-backed workspace protection is unavailable in this environment")
+
+    started = service.begin_task("task-custom-root", "session-one", isolated=True)
+    worktree = Path(started["worktree_path"])
+
+    assert worktree.parent == custom_root.resolve()
+    assert not (storage / "w").exists()
+    (worktree / "app.py").write_text("after\n", encoding="utf-8")
+    finalized = service.finalize_task("task-custom-root", "completed")
+    assert finalized["merge_state"] == "merged"
+    assert (workspace / "app.py").read_text(encoding="utf-8") == "after\n"
+    assert not worktree.exists()
+
+
+def test_custom_worktree_root_cannot_be_inside_the_project(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+
+    with pytest.raises(WorkspaceProtectionError, match="separate from the project"):
+        WorkspaceProtectionService(
+            workspace,
+            tmp_path / "runtime" / "workspace-protection",
+            worktree_root=workspace / ".stellarcode-worktrees",
+        )
+
+
+def test_startup_removes_an_unreferenced_legacy_task_repository(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    storage = tmp_path / "protection"
+    service = _service(workspace, storage)
+    service.close()
+    legacy_root = storage / "task-repositories"
+    orphan = legacy_root / f"{_task_token('task-' + 'a' * 48)}.git"
+    object_dir = orphan / "objects" / "aa"
+    object_dir.mkdir(parents=True)
+    object_file = object_dir / ("b" * 38)
+    object_file.write_bytes(b"orphaned failed worktree data")
+    if os.name == "nt":
+        os.chmod(object_file, 0o444)
+
+    restarted = _service(workspace, storage)
+
+    assert restarted.available is True
+    assert not orphan.exists()
+
+
+def test_startup_retries_cleanup_for_an_already_merged_worktree(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    (workspace / "app.py").write_text("before\n", encoding="utf-8")
+    storage = tmp_path / "protection"
+    service = _service(workspace, storage)
+    started = service.begin_task("task-cleanup-retry", "session-one", isolated=True)
+    worktree = Path(started["worktree_path"])
+    repository = storage / "r" / f"{worktree.name}.git"
+    (worktree / "app.py").write_text("after\n", encoding="utf-8")
+
+    monkeypatch.setattr(service, "_remove_task_worktree", lambda _record: None)
+    finalized = service.finalize_task("task-cleanup-retry", "completed")
+    assert finalized["merge_state"] == "merged"
+    assert worktree.exists()
+    assert repository.exists()
+    service.close()
+
+    restarted = _service(workspace, storage)
+
+    assert restarted.available is True
+    assert not worktree.exists()
+    assert not repository.exists()
+
+
+def test_isolated_concurrent_tasks_merge_disjoint_changes_with_exact_attribution(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    (workspace / "one.txt").write_text("one old\n", encoding="utf-8")
+    (workspace / "two.txt").write_text("two old\n", encoding="utf-8")
+    service = _service(workspace, tmp_path / "protection")
+    service.begin_task("task-one", "session-one", isolated=True)
+    service.begin_task("task-two", "session-two", isolated=True)
+    first = service.task_workspace("task-one", "session-one")
+    second = service.task_workspace("task-two", "session-two")
+    assert first is not None and second is not None
+    (first / "one.txt").write_text("one new\n", encoding="utf-8")
+    (second / "two.txt").write_text("two new\n", encoding="utf-8")
+
+    first_result = service.finalize_task("task-one", "completed")
+    second_result = service.finalize_task("task-two", "completed")
+
+    assert [item["path"] for item in first_result["changed_files"]] == ["one.txt"]
+    assert [item["path"] for item in second_result["changed_files"]] == ["two.txt"]
+    assert first_result["concurrent_task_ids"] == []
+    assert second_result["concurrent_task_ids"] == []
+    assert first_result["rollback_available"] is True
+    assert second_result["rollback_available"] is True
+    assert (workspace / "one.txt").read_text(encoding="utf-8") == "one new\n"
+    assert (workspace / "two.txt").read_text(encoding="utf-8") == "two new\n"
+
+
+def test_isolated_task_merge_conflict_preserves_project_and_retains_worktree(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    target = workspace / "shared.txt"
+    target.write_text("shared baseline\n", encoding="utf-8")
+    service = _service(workspace, tmp_path / "protection")
+    service.begin_task("task-a", "session-a", isolated=True)
+    service.begin_task("task-b", "session-b", isolated=True)
+    task_a = service.task_workspace("task-a", "session-a")
+    task_b = service.task_workspace("task-b", "session-b")
+    assert task_a is not None and task_b is not None
+    (task_a / "shared.txt").write_text("result from a\n", encoding="utf-8")
+    (task_b / "shared.txt").write_text("result from b\n", encoding="utf-8")
+
+    service.finalize_task("task-a", "completed")
+    conflict = service.finalize_task("task-b", "completed")
+
+    assert conflict["merge_conflict"] is True
+    assert conflict["status"] == "failed"
+    assert conflict["rollback_available"] is False
+    assert conflict["worktree_path"]
+    assert Path(conflict["worktree_path"]).is_dir()
+    assert target.read_text(encoding="utf-8") == "result from a\n"
+
+
+def test_isolated_task_worktree_survives_runtime_restart(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    target = workspace / "resume.txt"
+    target.write_text("baseline\n", encoding="utf-8")
+    storage = tmp_path / "protection"
+    first_service = _service(workspace, storage)
+    started = first_service.begin_task("task-resume", "session-one", isolated=True)
+    worktree = first_service.task_workspace("task-resume", "session-one")
+    assert worktree is not None
+    (worktree / "resume.txt").write_text("changed before crash\n", encoding="utf-8")
+    first_service.close()
+
+    restarted = _service(workspace, storage)
+    recovered = restarted.validate_recovery_baseline(
+        "task-resume",
+        "session-one",
+        started["snapshot_id"],
+    )
+    recovered_worktree = restarted.task_workspace("task-resume", "session-one")
+
+    assert recovered["worktree_isolated"] is True
+    assert recovered_worktree == worktree
+    assert (recovered_worktree / "resume.txt").read_text(encoding="utf-8") == (
+        "changed before crash\n"
+    )
+    finalized = restarted.finalize_task("task-resume", "completed")
+    assert finalized["merge_state"] == "merged"
+    assert target.read_text(encoding="utf-8") == "changed before crash\n"
+
+
+def test_isolated_tasks_use_private_git_repositories(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    target = workspace / "app.py"
+    target.write_text("value = 1\n", encoding="utf-8")
+    service = _service(workspace, tmp_path / "protection")
+    service.begin_task("task-private-a", "session-a", isolated=True)
+    service.begin_task("task-private-b", "session-b", isolated=True)
+    first = service.task_workspace("task-private-a", "session-a")
+    assert first is not None
+    first_record = service._load_record("task-private-a")
+    second_record = service._load_record("task-private-b")
+    assert first_record is not None and second_record is not None
+    first_repository = Path(str(first_record["worktree_repository_path"])).resolve()
+    second_repository = Path(str(second_record["worktree_repository_path"])).resolve()
+    assert first_repository != second_repository
+    assert first_repository != service.repository_dir.resolve()
+    assert second_repository != service.repository_dir.resolve()
+
+    target_ref = f"refs/stellarcode/tasks/{_task_token('task-private-b')}/before"
+    shared_target = service._existing_snapshot_ref(target_ref)
+    (first / "app.py").write_text("value = 2\n", encoding="utf-8")
+    _git(first, "add", "app.py")
+    _git(
+        first,
+        "-c",
+        "user.name=Task Agent",
+        "-c",
+        "user.email=task@stellarcode.local",
+        "commit",
+        "-m",
+        "task-local commit",
+    )
+    # A task may freely use Git, including creating Side-Git-looking refs.  Its
+    # repository is private, so this must not alter another task's baseline.
+    _git(first, "update-ref", target_ref, "HEAD")
+
+    assert service._existing_snapshot_ref(target_ref) == shared_target
+    finalized = service.finalize_task("task-private-a", "completed")
+    assert finalized["merge_state"] == "merged"
+    assert target.read_text(encoding="utf-8") == "value = 2\n"
+
+
+def test_terminal_merge_rejects_a_rewritten_worktree_git_pointer(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    target = workspace / "app.py"
+    target.write_text("value = 1\n", encoding="utf-8")
+    service = _service(workspace, tmp_path / "protection")
+    service.begin_task("task-git-pointer", "session-one", isolated=True)
+    worktree = service.task_workspace("task-git-pointer", "session-one")
+    assert worktree is not None
+    (worktree / "app.py").write_text("value = 2\n", encoding="utf-8")
+    pointer = worktree / ".git"
+    original_pointer = pointer.read_text(encoding="utf-8")
+    if os.name == "nt":
+        attrib = Path(os.environ.get("SystemRoot") or r"C:\Windows") / "System32" / "attrib.exe"
+        subprocess.run([str(attrib), "-H", str(pointer)], check=True)
+    os.chmod(pointer, 0o666)
+    pointer.write_text(f"gitdir: {service.repository_dir}\n", encoding="utf-8")
+
+    result = service.finalize_task("task-git-pointer", "completed")
+
+    assert result["merge_conflict"] is True
+    assert result["status"] == "failed"
+    assert "untrusted" in result["error"]
+    assert target.read_text(encoding="utf-8") == "value = 1\n"
+
+    # Restore the pointer only to clean up the retained forensic worktree in
+    # this test; production intentionally leaves a conflict worktree intact.
+    pointer.write_text(original_pointer, encoding="utf-8")
+    record = service._load_record("task-git-pointer")
+    assert record is not None
+    service._remove_task_worktree(record)
+
+
+def test_isolated_post_snapshot_excludes_edits_arriving_during_finalization(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    target = workspace / "app.py"
+    target.write_text("value = 1\n", encoding="utf-8")
+    unrelated = workspace / "editor-note.txt"
+    service = _service(workspace, tmp_path / "protection")
+    service.begin_task("task-finalize-window", "session-one", isolated=True)
+    worktree = service.task_workspace("task-finalize-window", "session-one")
+    assert worktree is not None
+    (worktree / "app.py").write_text("value = 2\n", encoding="utf-8")
+    original_capture = service._capture_commit
+
+    def edit_after_pre_merge_snapshot(message: str, ref: str) -> str:
+        revision = original_capture(message, ref)
+        if "pre-merge baseline" in message:
+            unrelated.write_text("arrived during finalization\n", encoding="utf-8")
+        return revision
+
+    monkeypatch.setattr(service, "_capture_commit", edit_after_pre_merge_snapshot)
+
+    finalized = service.finalize_task("task-finalize-window", "completed")
+
+    assert [item["path"] for item in finalized["changed_files"]] == ["app.py"]
+    assert target.read_text(encoding="utf-8") == "value = 2\n"
+    assert unrelated.read_text(encoding="utf-8") == "arrived during finalization\n"
+    service.rollback_task("task-finalize-window", "session-one")
+    assert target.read_text(encoding="utf-8") == "value = 1\n"
+    assert unrelated.read_text(encoding="utf-8") == "arrived during finalization\n"
+
+
 def _git(repository: Path, *arguments: str) -> bytes:
     executable = shutil.which("git")
     if executable is None:
@@ -99,6 +438,23 @@ def test_sensitive_file_preview_and_tool_event_arguments_hide_contents(tmp_path:
     assert secret not in str(event_arguments)
     assert event_arguments["path"] == ".env.production"
     assert event_arguments["content"] == f"[full content omitted: {len(secret)} characters]"
+
+    patch_arguments = registry.event_arguments(
+        "apply_patch",
+        {
+            "path": ".env.production",
+            "edits": [{"old_text": secret, "new_text": "TOKEN=replaced"}],
+        },
+    )
+    assert secret not in str(patch_arguments)
+    assert patch_arguments["path"] == ".env.production"
+    assert patch_arguments["edits"] == {
+        "edit_count": 1,
+        "old_chars": len(secret),
+        "new_chars": len("TOKEN=replaced"),
+        "replace_all_count": 0,
+        "content": "[exact patch text omitted]",
+    }
 
 
 def test_overlapping_conversation_tasks_disable_ambiguous_task_rollback(
@@ -774,7 +1130,7 @@ class _EditDuringApproval:
         return ApprovalResult.approved()
 
 
-@pytest.mark.parametrize("tool_name", ["write_file", "delete_file"])
+@pytest.mark.parametrize("tool_name", ["write_file", "apply_patch", "delete_file"])
 def test_approval_to_execution_guard_rejects_changed_target(
     tmp_path: Path,
     tool_name: str,
@@ -785,11 +1141,20 @@ def test_approval_to_execution_guard_rejects_changed_target(
         lambda: target.write_text("manual edit after approval preview\n", encoding="utf-8")
     )
     registry = build_default_registry(tmp_path, hitl_handler=handler)
-    arguments = (
-        {"path": "guarded.txt", "content": "agent replacement\n"}
-        if tool_name == "write_file"
-        else {"path": "guarded.txt"}
-    )
+    if tool_name == "write_file":
+        arguments = {"path": "guarded.txt", "content": "agent replacement\n"}
+    elif tool_name == "apply_patch":
+        arguments = {
+            "path": "guarded.txt",
+            "edits": [
+                {
+                    "old_text": "state shown in approval",
+                    "new_text": "agent replacement",
+                }
+            ],
+        }
+    else:
+        arguments = {"path": "guarded.txt"}
 
     with pytest.raises(ToolExecutionError, match="target changed after its diff was approved"):
         registry.execute(tool_name, arguments)

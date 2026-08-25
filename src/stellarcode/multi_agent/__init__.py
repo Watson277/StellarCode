@@ -1,4 +1,12 @@
+"""Coordinator, role, and messaging primitives for Team execution mode."""
+
 from stellarcode.multi_agent.message import AgentMessage, MessageType
+from stellarcode.multi_agent.message_bus import (
+    BusMessage,
+    ClaimedMessage,
+    FileMessageBus,
+    MessageBusError,
+)
 from stellarcode.multi_agent.orchestrator import (
     AgentOrchestrator,
     MultiAgentError,
@@ -11,7 +19,11 @@ __all__ = [
     "AgentMessage",
     "AgentOrchestrator",
     "AgentRole",
+    "BusMessage",
+    "ClaimedMessage",
+    "FileMessageBus",
     "MessageType",
+    "MessageBusError",
     "MultiAgentError",
     "StepExecutionResult",
     "SubAgent",

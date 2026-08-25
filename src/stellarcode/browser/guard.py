@@ -1,3 +1,5 @@
+"""Browser capability guard separating isolated automation from shared user sessions."""
+
 from __future__ import annotations
 
 import re

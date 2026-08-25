@@ -1,3 +1,9 @@
+"""Durable journals and task checkpoints used to recover from Sidecar failure.
+
+Journal records are append-only and fsynced.  Checkpoints capture the current task
+intent; neither should be confused with the conversation transcript shown in the UI.
+"""
+
 from __future__ import annotations
 
 import json

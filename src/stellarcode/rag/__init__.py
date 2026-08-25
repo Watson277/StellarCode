@@ -1,3 +1,5 @@
+"""Local code indexing, embeddings, retrieval, and prompt-context formatting."""
+
 from stellarcode.rag.analyzer import CodeAnalyzer
 from stellarcode.rag.chunker import CodeChunker
 from stellarcode.rag.embedding import EmbeddingClient, EmbeddingError

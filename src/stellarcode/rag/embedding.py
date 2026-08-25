@@ -1,3 +1,5 @@
+"""Embedding provider adapter with deterministic offline fallback for local RAG."""
+
 from __future__ import annotations
 
 import hashlib

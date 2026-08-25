@@ -1,3 +1,5 @@
+"""Provider-neutral chat result, usage, streaming, and task-scope primitives."""
+
 from __future__ import annotations
 
 import inspect

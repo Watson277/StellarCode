@@ -1,3 +1,5 @@
+"""Model-pricing lookup and deterministic cost estimation for token telemetry."""
+
 from __future__ import annotations
 
 import os

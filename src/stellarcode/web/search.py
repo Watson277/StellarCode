@@ -1,3 +1,5 @@
+"""Search-provider selection and graceful fallback for public-web retrieval."""
+
 from __future__ import annotations
 
 import os

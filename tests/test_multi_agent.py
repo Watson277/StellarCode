@@ -4,10 +4,12 @@ import threading
 from collections.abc import Callable
 from typing import Any
 
+from stellarcode.memory import MemoryManager
 from stellarcode.multi_agent import (
     AgentMessage,
     AgentOrchestrator,
     AgentRole,
+    FileMessageBus,
     MessageType,
     SubAgent,
 )
@@ -65,6 +67,27 @@ def test_only_worker_receives_tool_schemas(tmp_path):
     assert client.calls[0][1] is None
     assert client.calls[1][1]
     assert client.calls[2][1] is None
+
+
+def test_team_sub_agent_receives_memory_as_user_context_not_system(tmp_path):
+    client = DispatchClient(lambda _messages, _tools: "done")
+    manager = MemoryManager(storage_dir=tmp_path / "memory")
+    manager.save_fact("Python runtime uses version 3.12")
+    worker = SubAgent(
+        "worker",
+        AgentRole.WORKER,
+        client,
+        build_default_registry(tmp_path),
+        memory_manager=manager,
+    )
+
+    worker.execute(AgentMessage.task("orchestrator", "inspect Python runtime"))
+
+    messages, _tools = client.calls[0]
+    assert "version 3.12" not in messages[0]["content"]
+    assert '"kind":"retrieved_memory"' in messages[-2]["content"]
+    assert messages[-1]["role"] == "user"
+    assert all("_stellarcode_context" not in message for message in messages)
 
 
 def test_worker_executes_same_round_tool_calls_in_parallel():
@@ -246,6 +269,105 @@ def test_dependency_result_is_injected_into_next_worker_context(tmp_path):
 
     assert "Completed dependency [task_1]: first task" in worker_inputs[1]
     assert "Result: dependency output" in worker_inputs[1]
+
+
+def test_team_execution_routes_worker_and_reviewer_replies_through_mailboxes(tmp_path):
+    def handler(messages: list[dict[str, Any]], _tools: list[dict[str, Any]] | None) -> str:
+        if "worker in a multi-agent" in messages[0]["content"]:
+            return "worker completed the assigned step"
+        return '{"approved": true, "summary": "reviewed", "issues": []}'
+
+    plan = ExecutionPlan(id="team_plan", goal="route messages")
+    plan.add_task(Task("task_1", "complete one step", TaskType.ANALYSIS))
+    orchestrator = AgentOrchestrator(
+        DispatchClient(handler),
+        build_default_registry(tmp_path),
+        worker_count=1,
+        message_bus_dir=tmp_path / "team-bus",
+    )
+
+    result = orchestrator.execute_plan(plan)
+
+    assert "Multi-Agent status: COMPLETED" in result
+    assert orchestrator.last_message_bus_path is not None
+    bus = FileMessageBus(orchestrator.last_message_bus_path)
+    worker_kinds = [message.kind for message in bus.mailbox_messages("worker-1")]
+    reviewer_kinds = [message.kind for message in bus.mailbox_messages("reviewer")]
+    lead_kinds = [message.kind for message in bus.mailbox_messages("lead")]
+    assert worker_kinds == ["task"]
+    assert reviewer_kinds == ["review_request"]
+    assert lead_kinds == ["task_result", "review_request_result"]
+    assert bus.pending_count("lead") == 0
+
+
+def test_team_emits_structured_sub_agent_dialogue_events(tmp_path):
+    events: list[tuple[str, dict[str, Any]]] = []
+
+    def handler(messages: list[dict[str, Any]], _tools: list[dict[str, Any]] | None) -> str:
+        system = messages[0]["content"]
+        if "planner in a multi-agent" in system:
+            return """
+{
+  "summary": "one step",
+  "steps": [
+    {"id": "task_1", "description": "inspect the project", "type": "ANALYSIS", "dependencies": []}
+  ]
+}
+"""
+        if "worker in a multi-agent" in system:
+            return "inspection complete"
+        return '{"approved": true, "summary": "reviewed", "issues": []}'
+
+    orchestrator = AgentOrchestrator(
+        DispatchClient(handler),
+        build_default_registry(tmp_path),
+        worker_count=1,
+        event_callback=lambda event_type, data: events.append((event_type, data)),
+    )
+
+    result = orchestrator.run("inspect the project")
+
+    assert "Multi-Agent status: COMPLETED" in result
+    event_types = [event_type for event_type, _data in events]
+    assert event_types[0] == "team.run.started"
+    assert "team.agent.message" in event_types
+    assert "team.agent.status" in event_types
+    assert event_types[-1] == "team.run.completed"
+    worker_messages = [
+        data for event_type, data in events
+        if event_type == "team.agent.message" and data["agent_name"] == "worker-1"
+    ]
+    assert [item["direction"] for item in worker_messages] == ["inbound", "outbound"]
+    assert worker_messages[-1]["content"] == "inspection complete"
+
+
+def test_team_sub_agent_emits_streamed_dialogue_deltas(tmp_path):
+    class StreamingWorkerClient:
+        def chat(self, _messages, tools=None, temperature=0.2, on_delta=None):
+            assert tools is not None
+            assert on_delta is not None
+            on_delta("streamed ")
+            on_delta("worker result")
+            return {"role": "assistant", "content": "streamed worker result"}
+
+    events: list[tuple[str, dict[str, Any]]] = []
+    worker = SubAgent(
+        "worker-1",
+        AgentRole.WORKER,
+        StreamingWorkerClient(),
+        build_default_registry(tmp_path),
+        event_callback=lambda event_type, data: events.append((event_type, data)),
+    )
+
+    result = worker.execute(
+        AgentMessage.task("lead", "stream a result"),
+        team_task_id="task_1",
+    )
+
+    assert result.content == "streamed worker result"
+    deltas = [data for event_type, data in events if event_type == "team.agent.delta"]
+    assert "".join(str(data["text"]) for data in deltas) == "streamed worker result"
+    assert all(data["team_task_id"] == "task_1" for data in deltas)
 
 
 def test_review_parser_is_conservative(tmp_path):

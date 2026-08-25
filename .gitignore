@@ -37,6 +37,7 @@ htmlcov/
 .stellarcode/mcp.json
 .stellarcode/audit/
 .stellarcode/traces/
+.stellarcode/team-message-bus/
 .stellarcode-memory/
 .stellarcode-rag/
 

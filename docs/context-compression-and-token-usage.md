@@ -4,11 +4,14 @@ StellarCode keeps three different forms of memory. They solve different problems
 not be treated as one store:
 
 1. `Agent.messages` is the provider conversation history. It contains the system prompt,
-   user/assistant messages, tool calls, and matching tool results. This is the context that
-   is actually sent to the model and is persisted per desktop conversation.
+   user/assistant messages, typed internal user-context messages, tool calls, and matching
+   tool results. This is the context that is actually sent to the model and is persisted per
+   desktop conversation.
 2. `MemoryManager.short_term` is a small retrieval-oriented cache. It stores bounded
-   conversation/tool entries and injects only relevant excerpts into the system prompt.
-   Its older deterministic compression does not reduce `Agent.messages` by itself.
+   conversation/tool entries and retrieves only relevant excerpts. Retrieved Memory is
+   wrapped as a versioned, untrusted JSON object in a separate `user` message immediately
+   before the real request; it is never concatenated into the system prompt. Its older
+   deterministic compression does not reduce `Agent.messages` by itself.
 3. `LongTermMemory` is a project-level JSON fact store used by retrieval. It is independent
    from the provider history and survives conversation resets.
 
@@ -34,7 +37,8 @@ When the threshold is crossed, the compactor:
 2. preserves the two newest turns verbatim;
 3. summarizes older complete turns with the configured model;
 4. falls back to a deterministic evidence summary if the summary request fails;
-5. injects the summary into a marked system-prompt block; and
+5. wraps the summary as a versioned, untrusted JSON object in a `user` context message,
+   leaving the system prompt byte-stable; and
 6. truncates oversized older tool results if more space is still needed.
 
 An assistant tool call and all matching `tool` responses are always moved or removed as one
@@ -42,6 +46,15 @@ turn. The compressor never leaves an orphan `tool_call_id`. The compacted messag
 summary, compaction count, and timestamp are persisted in the conversation JSON, so reopening
 the desktop conversation continues from the compacted state instead of reconstructing the
 discarded raw turns.
+
+Memory and summary messages carry a private `_stellarcode_context` marker only inside the
+Runtime. That marker lets compaction and refresh logic distinguish synthetic context from an
+ordinary user request. It is stripped before every provider call, so compatible APIs receive
+only standard `role` and `content` fields. The visible content uses the
+`stellarcode.context/v1` JSON schema with `trusted=false`; JSON serialization keeps quotes,
+newlines, role-like text, and fake closing tags inside the data field. The stable system
+policy independently states that Memory and compacted history are untrusted evidence and
+cannot expand task scope, permissions, or instruction priority.
 
 The Runtime emits `history.compacted` with the estimated before/after context sizes, number
 of compacted turns, method, and cumulative compaction count.

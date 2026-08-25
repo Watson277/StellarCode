@@ -1,3 +1,5 @@
+"""Small token estimator shared by chunking and result-budget enforcement."""
+
 from __future__ import annotations
 
 import logging

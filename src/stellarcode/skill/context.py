@@ -1,3 +1,5 @@
+"""Bounded per-task buffer for model-requested Skill guidance."""
+
 from __future__ import annotations
 
 import threading
@@ -27,10 +29,7 @@ class SkillContextBuffer:
                 return ""
             entries = list(self._entries.items())
             self._entries.clear()
-        sections = [
-            f"## 已加载 Skill：{name}\n{body.strip()}\n"
-            for name, body in entries
-        ]
+        sections = [f"## 已加载 Skill：{name}\n{body.strip()}\n" for name, body in entries]
         return "\n".join(sections) + "\n---\n"
 
     def is_empty(self) -> bool:
@@ -44,4 +43,3 @@ class SkillContextBuffer:
     def clear(self) -> None:
         with self._lock:
             self._entries.clear()
-

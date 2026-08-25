@@ -1,12 +1,41 @@
-import { ClipboardEvent, FormEvent, type CSSProperties, useEffect, useMemo, useRef, useState } from "react";
+/**
+ * Desktop composition root.
+ *
+ * This component renders the shell and translates Runtime JSONL events into presentation
+ * state. Durable execution truth remains in the Python Runtime; this file must not infer
+ * task completion merely from a missing UI callback.
+ */
+import {
+  ClipboardEvent,
+  FormEvent,
+  type CSSProperties,
+  type KeyboardEvent as ReactKeyboardEvent,
+  type PointerEvent as ReactPointerEvent,
+  lazy,
+  Suspense,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  useSyncExternalStore,
+} from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { confirm as confirmDialog, open } from "@tauri-apps/plugin-dialog";
 import { revealItemInDir } from "@tauri-apps/plugin-opener";
-import ReactMarkdown from "react-markdown";
-import remarkGfm from "remark-gfm";
 import "./App.css";
+import {
+  SupervisionCenter,
+  type SupervisionApproval as SupervisionApprovalView,
+  type SupervisionTask as SupervisionTaskView,
+} from "./features/supervision/SupervisionCenter";
+import { MarkdownContent } from "./features/markdown/MarkdownContent";
+import {
+  reconcileChangedWorkspaceFile,
+  type WorkspaceFileReference,
+} from "./features/markdown/codeAnswer";
+import type { WorkspaceFilePreview } from "./features/filePreview/FilePreviewPanel";
 import {
   DEFAULT_APP_SETTINGS,
   SettingsPage,
@@ -15,6 +44,32 @@ import {
   type SettingsSnapshot,
 } from "./SettingsPage";
 import { translate, translateDiagnosticRuntimeText, translateRuntimeText, type Language, type TranslationValues, type Translator } from "./i18n";
+import {
+  INITIAL_FRONTEND_RUNTIME_STATE,
+  selectActiveTaskCancelling,
+  selectActiveTaskId,
+  selectConversationReplaying,
+  selectStaleProjectTaskRoutes,
+  reconcileReplayedTask,
+  transitionFrontendRuntime,
+  type FrontendRuntimeAction,
+} from "./runtime/frontendRuntimeMachine";
+import {
+  RuntimeClient,
+  RuntimeClientError,
+  RuntimeRequestError,
+} from "./runtime/runtimeClient";
+import { selectActiveTasks, selectTaskForSession, SupervisionStore } from "./runtime/supervisionStore";
+import { sessionDraftStore } from "./runtime/sessionDraftStore";
+import { useSmartTranscript } from "./hooks/useSmartTranscript";
+import { useWorkspaceLayout } from "./hooks/useWorkspaceLayout";
+import { WORKSPACE_LAYOUT_LIMITS, type WorkspaceColumn } from "./runtime/workspaceLayout";
+import { orderTerminalTaskSummaries } from "./runtime/transcriptOrder";
+import {
+  mergeRuntimeReplayLanes,
+  partitionRuntimeReplay,
+  type ActiveTaskRegistration,
+} from "./runtime/eventProjector";
 import {
   RUNTIME_PROTOCOL_VERSION,
   type AccessMode,
@@ -25,8 +80,8 @@ import {
   type RuntimeEvent,
   type RuntimeAttachment,
   type RuntimeMessage,
-  type RuntimeRequest,
   type RuntimeRequestDataMap,
+  type RuntimeResponseDataMap,
   type RuntimeRequestType,
   type RuntimeResponse,
   type RuntimeRecoveryTask,
@@ -39,18 +94,23 @@ import {
   type SkillSnapshot,
   type SkillDirectoryResult,
   type SkillInstallScope,
-  type BrowserProbeSnapshot,
   type BrowserSnapshot,
   type DiagnosticsSnapshot,
-  type WorkspaceProblem,
   type FileChangePreview,
   type TaskChangeSet,
   type TaskDiffResult,
   type UsageSnapshot,
 } from "./protocol/runtimeEvents";
 
-type BottomPanel = "terminal" | "problems" | "trace";
-type ConnectionState = "starting" | "restarting" | "online" | "offline" | "error";
+const ReviewChangesWorkbench = lazy(async () => {
+  const module = await import("./features/review/ReviewChangesWorkbench");
+  return { default: module.ReviewChangesWorkbench };
+});
+const FilePreviewPanel = lazy(async () => {
+  const module = await import("./features/filePreview/FilePreviewPanel");
+  return { default: module.FilePreviewPanel };
+});
+
 type ToolStatus = "waiting_approval" | "running" | "completed" | "failed";
 type TextEntryKind = "user" | "assistant" | "thinking" | "error";
 type TextTranscriptEntry = {
@@ -68,6 +128,7 @@ type ToolTranscriptEntry = {
   id: string;
   kind: "tool";
   toolCallId: string;
+  taskId?: string;
   name: string;
   detail: string;
   status: ToolStatus;
@@ -96,6 +157,8 @@ type PlanStepView = PlanTaskDescriptor & {
   status: PlanStepStatus;
   resultPreview?: string;
   error?: string;
+  streamText?: string;
+  streaming?: boolean;
 };
 type PlanTranscriptEntry = {
   id: string;
@@ -105,6 +168,8 @@ type PlanTranscriptEntry = {
   summary?: string;
   executionOrder: string[];
   steps: PlanStepView[];
+  planning?: boolean;
+  planningText?: string;
   timestamp?: string;
 };
 type TaskRunPhase = "running" | "completed" | "failed" | "cancelled";
@@ -125,14 +190,57 @@ type TaskStatusTranscriptEntry = {
   rollbackState?: "idle" | "running" | "completed" | "failed";
   rollbackError?: string;
 };
-type TranscriptEntry = TextTranscriptEntry | ToolTranscriptEntry | ApprovalTranscriptEntry | PlanTranscriptEntry | TaskStatusTranscriptEntry;
+type TeamAgentStatus = "queued" | "working" | "completed" | "failed";
+type TeamDialogueItem = {
+  id: string;
+  kind: "message" | "tool";
+  timestamp?: string;
+  direction?: "inbound" | "outbound";
+  messageKind?: string;
+  content?: string;
+  toolName?: string;
+  toolStatus?: ToolStatus;
+  elapsed?: number;
+  streaming?: boolean;
+};
+type TeamAgentDialogue = {
+  id: string;
+  name: string;
+  role: string;
+  teamTaskId: string;
+  status: TeamAgentStatus;
+  items: TeamDialogueItem[];
+};
+type TeamTranscriptEntry = {
+  id: string;
+  kind: "team";
+  taskId: string;
+  runId: string;
+  workerCount: number;
+  phase: "running" | "completed" | "failed";
+  message?: string;
+  agents: TeamAgentDialogue[];
+  timestamp?: string;
+};
+type TranscriptEntry = TextTranscriptEntry | ToolTranscriptEntry | ApprovalTranscriptEntry | PlanTranscriptEntry | TaskStatusTranscriptEntry | TeamTranscriptEntry;
 type ActivityEntry = Extract<TranscriptEntry, { kind: "thinking" | "tool" | "approval" }>;
-type MessageEntry = Exclude<TranscriptEntry, ActivityEntry | PlanTranscriptEntry | TaskStatusTranscriptEntry>;
+type SidebarActivityEntry = ActivityEntry | PlanTranscriptEntry | TeamTranscriptEntry;
+type MessageEntry = Exclude<TranscriptEntry, ActivityEntry | PlanTranscriptEntry | TaskStatusTranscriptEntry | TeamTranscriptEntry>;
 type TranscriptGroup =
   | { id: string; kind: "activity"; entries: ActivityEntry[] }
   | { id: string; kind: "plan"; entry: PlanTranscriptEntry }
   | { id: string; kind: "task-status"; entry: TaskStatusTranscriptEntry }
+  | { id: string; kind: "team"; entry: TeamTranscriptEntry }
   | { id: string; kind: "message"; entry: MessageEntry };
+
+type FilePreviewTab = {
+  id: string;
+  relativePath: string;
+  fileName: string;
+  preview: WorkspaceFilePreview | null;
+  loading: boolean;
+  error: string;
+};
 
 type ComposerReference = {
   id: string;
@@ -172,6 +280,42 @@ interface RuntimeStartResult {
   pid: number;
 }
 
+type PendingWorkspaceActivation = {
+  targetProjectId: string;
+  targetWorkspace: string;
+  previous: {
+    projectId: string;
+    workspace: string;
+    conversationId: string;
+  } | null;
+};
+
+type WorkspaceActivationIntent = {
+  project: ProjectRecord;
+  forceRestart: boolean;
+  conversationToOpen: string;
+};
+
+type PendingTaskSubmission = {
+  sessionId: string;
+  projectId: string;
+  promptPreview: string;
+  startedAt: string;
+  draft: {
+    prompt: string;
+    attachments: RuntimeAttachment[];
+  };
+};
+
+type ProjectRecoveryTask = RuntimeRecoveryTask & {
+  project_id: string;
+};
+
+type RuntimeProjectRestoreTarget = {
+  projectId: string;
+  workspace: string;
+};
+
 type UsageView = UsageSnapshot & {
   task_input_tokens: number;
   task_output_tokens: number;
@@ -190,13 +334,19 @@ type ManagementRequestType = Extract<
   | `skill.${string}`
   | `browser.${string}`
   | `diagnostics.${string}`
+  | `prompt.${string}`
   | "task.diff"
   | "task.rollback"
 >;
-type PendingManagementRequest = {
-  resolve: (result: unknown) => void;
-  reject: (error: Error) => void;
-};
+
+const UNCERTAIN_SUBMISSION_ERROR_CODES = new Set([
+  "request_timeout",
+  "runtime_transport_error",
+  "client_disposed",
+  "request_aborted",
+  "request_superseded",
+  "project_switched",
+]);
 
 const EMPTY_USAGE: UsageView = {
   input_tokens: 0,
@@ -276,6 +426,8 @@ const EMPTY_SKILL_SNAPSHOT: SkillSnapshot = {
   skills: [],
   total_count: 0,
   enabled_count: 0,
+  bundled_count: 0,
+  updates_available: 0,
   warnings: [],
   state_path: "",
   user_dir: "",
@@ -307,6 +459,13 @@ const RESTORABLE_EXECUTION_EVENT_TYPES: RuntimeEvent["type"][] = [
   "session.reset",
   "task.started",
   "assistant.thinking",
+  "team.run.started",
+  "team.run.completed",
+  "team.run.failed",
+  "team.agent.status",
+  "team.agent.message",
+  "team.agent.tool.started",
+  "team.agent.tool.completed",
   "history.compaction.started",
   "history.compaction.finished",
   "plan.created",
@@ -333,40 +492,34 @@ function requestId(prefix: string) {
   return `${prefix}-${crypto.randomUUID()}`;
 }
 
-async function sendRequest<T extends RuntimeRequestType>(
-  method: T,
-  params: RuntimeRequestDataMap[T],
-  id = requestId(method.replace(/\./g, "-")),
-) {
-  const message = {
-    kind: "request",
-    protocol_version: RUNTIME_PROTOCOL_VERSION,
-    request_id: id,
-    method,
-    params,
-  } as RuntimeRequest;
-  await invoke("runtime_send", { message });
-  return id;
-}
-
+/** Coordinates project/session UI, Runtime RPC, replay barriers, and transient overlays. */
 function App() {
+  const runtimeClient = useMemo(() => new RuntimeClient(
+    (message) => invoke("runtime_send", { message }),
+    { defaultTimeoutMs: 60_000 },
+  ), []);
+  const supervisionStore = useMemo(() => new SupervisionStore(), []);
+  const workspaceLayout = useWorkspaceLayout();
+  const supervisionState = useSyncExternalStore(
+    supervisionStore.subscribe,
+    supervisionStore.getSnapshot,
+    supervisionStore.getSnapshot,
+  );
   const [mode, setMode] = useState<AgentMode>("react");
-  const [bottomPanel, setBottomPanel] = useState<BottomPanel>("terminal");
-  const [connection, setConnection] = useState<ConnectionState>("starting");
+  const [runtimeControl, setRuntimeControl] = useState(INITIAL_FRONTEND_RUNTIME_STATE);
+  const runtimeControlRef = useRef(INITIAL_FRONTEND_RUNTIME_STATE);
   const [sessionId, setSessionId] = useState("");
   const [workspace, setWorkspace] = useState("");
   const [model, setModel] = useState("not initialized");
   const [prompt, setPrompt] = useState("");
   const [referenceMatch, setReferenceMatch] = useState<ComposerReferenceMatch | null>(null);
   const [referenceSelection, setReferenceSelection] = useState(0);
-  const [busy, setBusy] = useState(false);
-  const [runningTasks, setRunningTasks] = useState<Record<string, string>>({});
-  const [replayingConversation, setReplayingConversation] = useState(false);
-  const [cancelling, setCancelling] = useState(false);
   const [entries, setEntries] = useState<TranscriptEntry[]>([]);
   const [approvalQueue, setApprovalQueue] = useState<ApprovalEvent[]>([]);
-  const [resolvingApprovalId, setResolvingApprovalId] = useState("");
-  const [logs, setLogs] = useState<string[]>([]);
+  const [approvalDecisions, setApprovalDecisions] = useState<Record<string, "approve" | "reject" | "skip">>({});
+  const [supervisionOpen, setSupervisionOpen] = useState(false);
+  const [supervisionError, setSupervisionError] = useState("");
+  const [taskActionPending, setTaskActionPending] = useState<Record<string, "open" | "stop" | "trace">>({});
   const [eventCount, setEventCount] = useState(0);
   const [projects, setProjects] = useState<ProjectRecord[]>([]);
   const [activeProjectId, setActiveProjectId] = useState("");
@@ -396,11 +549,41 @@ function App() {
   const [timerNow, setTimerNow] = useState(() => Date.now());
   const [rollbackBusyTaskId, setRollbackBusyTaskId] = useState("");
   const [taskDiff, setTaskDiff] = useState<TaskDiffResult | null>(null);
+  const [taskDiffSelectedPath, setTaskDiffSelectedPath] = useState("");
   const [taskDiffLoading, setTaskDiffLoading] = useState("");
+  const [filePreviewTabs, setFilePreviewTabs] = useState<FilePreviewTab[]>([]);
+  const [activeFilePreviewId, setActiveFilePreviewId] = useState("");
+  const [rightSidebarView, setRightSidebarView] = useState<"context" | "activity" | "changes" | "file">("context");
   const appSettingsRef = useRef<AppSettings>(DEFAULT_APP_SETTINGS);
   const languageRef = useRef<Language>(DEFAULT_APP_SETTINGS.general.language);
+  const promptRef = useRef("");
   const composerTextareaRef = useRef<HTMLTextAreaElement | null>(null);
   const composerHighlightRef = useRef<HTMLDivElement | null>(null);
+  const filePreviewRequestsRef = useRef(new Map<string, string>());
+  const projectActionBusyRef = useRef(false);
+  const queuedWorkspaceActivation = useRef<WorkspaceActivationIntent | null>(null);
+
+  function dispatchRuntime(action: FrontendRuntimeAction) {
+    const next = transitionFrontendRuntime(runtimeControlRef.current, action);
+    runtimeControlRef.current = next;
+    setRuntimeControl(next);
+  }
+
+  const connection = runtimeControl.connection;
+  const projectedRunningTasks = useMemo(() => Object.fromEntries(
+    selectActiveTasks(supervisionState).map((task) => [task.sessionId, task.id]),
+  ), [supervisionState]);
+  const runningTasks = { ...projectedRunningTasks, ...runtimeControl.tasksBySession };
+  const activeTaskId = selectActiveTaskId(runtimeControl)
+    || projectedRunningTasks[runtimeControl.activeSessionId]
+    || "";
+  const busy = Boolean(
+    activeTaskId
+    || runtimeControl.activeSessionId
+      && runtimeControl.submittingSessions[runtimeControl.activeSessionId],
+  );
+  const cancelling = selectActiveTaskCancelling(runtimeControl);
+  const replayingConversation = selectConversationReplaying(runtimeControl);
 
   function tx(message: string, values?: TranslationValues) {
     return translate(languageRef.current, message, values);
@@ -456,23 +639,18 @@ function App() {
   const sessionOpenRequest = useRef("");
   const sessionRenameRequest = useRef("");
   const sessionDeleteRequest = useRef("");
+  const sessionDeleteTargetId = useRef("");
   const pendingConversationOpen = useRef<{ projectId: string; conversationId: string } | null>(null);
+  const pendingWorkspaceActivation = useRef<PendingWorkspaceActivation | null>(null);
   const accessModeRequest = useRef("");
   const traceModeRequest = useRef("");
-  const taskSubmitRequest = useRef("");
-  const taskSubmitSession = useRef("");
-  const taskCancelRequest = useRef("");
+  const taskSubmitSessions = useRef(new Map<string, PendingTaskSubmission>());
   const taskRecoveryRequest = useRef("");
   const eventReplayRequest = useRef("");
-  const approvalResolveRequests = useRef(new Map<string, string>());
   const approvalToolCalls = useRef(new Map<string, string>());
   const approvalQueueRef = useRef<ApprovalEvent[]>([]);
-  const pendingManagementRequests = useRef(new Map<string, PendingManagementRequest>());
   const attachmentsRef = useRef<RuntimeAttachment[]>([]);
   const canAttachRef = useRef(false);
-  const activeTaskId = useRef("");
-  const runningTasksBySession = useRef(new Map<string, string>());
-  const taskSessions = useRef(new Map<string, string>());
   const sessionProjectIds = useRef(new Map<string, string>());
   const activeConversationIdRef = useRef("");
   const workspaceRef = useRef("");
@@ -484,11 +662,23 @@ function App() {
   const runtimeStarted = useRef(false);
   const restartTimer = useRef<number | null>(null);
   const restartAttempts = useRef(0);
-  const pendingRecovery = useRef<RuntimeRecoveryTask | null>(null);
-  const recoveryQueue = useRef<RuntimeRecoveryTask[]>([]);
+  const pendingRecovery = useRef<ProjectRecoveryTask | null>(null);
+  const recoveryQueue = useRef<ProjectRecoveryTask[]>([]);
+  const loadedProjectWorkspaces = useRef(new Map<string, string>());
+  const restartProjectQueue = useRef<RuntimeProjectRestoreTarget[]>([]);
+  const runtimeRestoreInProgress = useRef<number | null>(null);
+  const runtimeRestoreEpoch = useRef(0);
+  const projectsRef = useRef<ProjectRecord[]>([]);
   const lastEventSequence = useRef(new Map<string, number>());
   const seenEventIds = useRef(new Set<string>());
   const replayBarrier = useRef<ReplayBarrier | null>(null);
+  const liveRuntimeEventHandler = useRef<(event: RuntimeEvent) => void>(() => undefined);
+  const legacyRuntimeResponseHandler = useRef<(response: RuntimeResponse) => void>(() => undefined);
+  // Last authoritative workspace.open active-task snapshot per project.  The
+  // journal can be truncated or lag behind live events, so replay is always
+  // reconciled against this control-plane truth before exposing global state.
+  const authoritativeActiveTasks = useRef(new Map<string, ActiveTaskRegistration[]>());
+  projectsRef.current = projects;
 
   const activeProject = useMemo(
     () => projects.find((project) => project.id === activeProjectId) ?? null,
@@ -498,13 +688,163 @@ function App() {
     () => conversations.find((conversation) => conversation.id === activeConversationId) ?? null,
     [activeConversationId, conversations],
   );
+  const supervisionViews = useMemo(() => {
+    const language = appSettings.general.language;
+    const resolveContext = (session: string, projectedProjectId: string) => {
+      const meta = supervisionState.sessions[session]?.meta;
+      const projectId = projectedProjectId
+        || meta?.projectId
+        || sessionProjectIds.current.get(session)
+        || "";
+      const project = projects.find((candidate) => candidate.id === projectId);
+      const projectConversations = projectId === activeProjectId
+        ? conversations
+        : conversationCache[projectId] ?? [];
+      const conversation = projectConversations.find((candidate) => candidate.id === session);
+      return {
+        projectId,
+        projectName: project?.name ?? (projectId || translate(language, "Unknown project")),
+        conversationTitle: conversation?.title ?? meta?.title ?? translate(language, "Unknown conversation"),
+        cwd: meta?.workspace ?? project?.path ?? "",
+        tracePath: conversation?.trace_path ?? "",
+      };
+    };
+
+    const sortedTasks = Object.values(supervisionState.tasks)
+      .sort((left, right) => Date.parse(right.updatedAt) - Date.parse(left.updatedAt));
+    const activeTaskIds = new Set(selectActiveTasks(supervisionState).map((task) => task.id));
+    // Never let terminal history evict a long-running background task from the
+    // global Center. Active work is unbounded; only completed history is capped.
+    const tasksForCenter = [
+      ...sortedTasks.filter((task) => activeTaskIds.has(task.id)),
+      ...sortedTasks.filter((task) => !activeTaskIds.has(task.id)).slice(0, 100),
+    ];
+    const tasks = tasksForCenter
+      .map((task): SupervisionTaskView => {
+        const context = resolveContext(task.sessionId, task.projectId);
+        const taskUsage = task.usage;
+        return {
+          id: task.id,
+          projectId: context.projectId,
+          projectName: context.projectName,
+          sessionId: task.sessionId,
+          conversationTitle: context.conversationTitle,
+          status: task.status,
+          activity: localizeSupervisionActivity(language, task.activity),
+          startedAt: task.startedAt,
+          elapsedMs: task.elapsedMs,
+          mode: task.mode,
+          usage: taskUsage ? {
+            inputTokens: taskUsage.task_input_tokens,
+            outputTokens: taskUsage.task_output_tokens,
+            cachedInputTokens: taskUsage.task_cached_input_tokens,
+            reasoningTokens: taskUsage.task_reasoning_tokens,
+            estimatedCost: taskUsage.task_estimated_cost,
+            currency: taskUsage.currency,
+            costEstimated: taskUsage.cost_estimated,
+          } : undefined,
+          failureMessage: task.errorMessage
+            ? translate(language, translateRuntimeText(language, task.errorMessage))
+            : undefined,
+          traceAvailable: Boolean(context.tracePath),
+          stoppable: task.submissionUncertain !== true,
+          actionPending: taskActionPending[task.id] ?? null,
+        };
+      });
+    const projectedApprovals = Object.values(supervisionState.approvals)
+      .filter((item) => item.status === "pending" || item.status === "resolving")
+      .sort((left, right) => Date.parse(left.requestedAt) - Date.parse(right.requestedAt));
+    const approvals = projectedApprovals.map((item, index): SupervisionApprovalView => {
+      const context = resolveContext(item.sessionId, item.projectId);
+      const pendingDecision = approvalDecisions[item.id];
+      return {
+        id: item.id,
+        taskId: item.taskId,
+        projectId: context.projectId,
+        projectName: context.projectName,
+        sessionId: item.sessionId,
+        conversationTitle: context.conversationTitle,
+        cwd: context.cwd,
+        toolName: item.toolName,
+        arguments: item.arguments,
+        changePreview: item.changePreview,
+        riskLevel: item.dangerLevel,
+        riskDescription: translate(language, translateRuntimeText(language, item.riskDescription)),
+        queuePosition: index + 1,
+        queueTotal: projectedApprovals.length,
+        requestedAt: item.requestedAt,
+        resolving: pendingDecision === "approve" || pendingDecision === "reject"
+          ? pendingDecision
+          : null,
+      };
+    });
+    return { tasks, approvals };
+  }, [
+    activeProjectId,
+    appSettings.general.language,
+    approvalDecisions,
+    conversationCache,
+    conversations,
+    projects,
+    supervisionState,
+    taskActionPending,
+  ]);
   const transcriptGroups = useMemo(() => groupTranscriptEntries(entries), [entries]);
-  const activeTaskFinalizing = entries.some((entry) => (
+  const sidebarActivityEntries = useMemo(() => entries.filter(
+    (entry): entry is SidebarActivityEntry => isSidebarActivityEntry(entry),
+  ), [entries]);
+  const activeFilePreviewTab = useMemo(
+    () => filePreviewTabs.find((tab) => tab.id === activeFilePreviewId) ?? null,
+    [activeFilePreviewId, filePreviewTabs],
+  );
+  const activeFilePreviewTabIndex = activeFilePreviewTab
+    ? filePreviewTabs.findIndex((tab) => tab.id === activeFilePreviewTab.id)
+    : -1;
+  const taskStatusById = useMemo(() => new Map(entries
+    .filter((entry): entry is TaskStatusTranscriptEntry => entry.kind === "task-status")
+    .map((entry) => [entry.taskId, entry])), [entries]);
+  const reviewedTaskEntry = taskDiff
+    ? entries.find((entry): entry is TaskStatusTranscriptEntry => entry.kind === "task-status" && entry.taskId === taskDiff.task_id) ?? null
+    : null;
+  useEffect(() => {
+    if (!taskDiff) {
+      setTaskDiffSelectedPath("");
+      setRightSidebarView((current) => current === "changes" ? "context" : current);
+    }
+  }, [taskDiff]);
+  useEffect(() => {
+    filePreviewRequestsRef.current.clear();
+    setFilePreviewTabs([]);
+    setActiveFilePreviewId("");
+    setRightSidebarView((current) => current === "file" ? "context" : current);
+  }, [activeProjectId]);
+  const {
+    containerRef: transcriptRef,
+    isFollowingBottom,
+    unreadOutputCount,
+    onScroll: handleTranscriptScroll,
+    jumpToBottom,
+  } = useSmartTranscript<HTMLDivElement>({ contentVersion: entries });
+
+  useEffect(() => {
+    // A newly selected conversation starts at its latest event. Subsequent
+    // output only follows while the reader remains near the bottom.
+    const frame = window.requestAnimationFrame(() => jumpToBottom("auto"));
+    return () => window.cancelAnimationFrame(frame);
+  }, [activeConversationId, jumpToBottom]);
+  const activeProjectedTask = selectTaskForSession(supervisionState, sessionId);
+  const activeTaskFinalizing = activeProjectedTask?.status === "finalizing" || entries.some((entry) => (
     entry.kind === "task-status"
-    && entry.taskId === activeTaskId.current
+    && entry.taskId === activeTaskId
     && entry.protection?.status === "finalize_pending"
   ));
-  const approval = approvalQueue[0] ?? null;
+  // Inline approvals belong only to the visible conversation. Background
+  // approvals stay actionable in the global Approval Center with their full
+  // project/session context, avoiding cross-project misattribution here.
+  const approval = approvalQueue.find((item) => item.session_id === activeConversationId) ?? null;
+  const resolvingApprovalId = approval && approvalDecisions[approval.data.approval_id]
+    ? approval.data.approval_id
+    : "";
   const ragIndexing = ragSnapshot.status === "indexing";
   const diagnosticsRunning = diagnosticsSnapshot.status === "running";
   const anyTaskRunning = Object.keys(runningTasks).length > 0;
@@ -515,30 +855,33 @@ function App() {
   canAttachRef.current = Boolean(sessionId && !runtimeMutationBusy);
   approvalQueueRef.current = approvalQueue;
 
-  function publishRunningTasks() {
-    setRunningTasks(Object.fromEntries(runningTasksBySession.current));
-  }
-
   function registerRunningTask(taskId: string, taskSessionId: string) {
     if (!taskId || !taskSessionId) return;
+    const projected = supervisionStore.getSnapshot().tasks[taskId];
+    if (projected && (
+      projected.status === "completed"
+      || projected.status === "failed"
+      || projected.status === "cancelled"
+    )) return;
     if (!sessionProjectIds.current.has(taskSessionId) && projectIdRef.current) {
       sessionProjectIds.current.set(taskSessionId, projectIdRef.current);
     }
-    runningTasksBySession.current.set(taskSessionId, taskId);
-    taskSessions.current.set(taskId, taskSessionId);
-    publishRunningTasks();
-    if (taskSessionId === activeConversationIdRef.current) {
-      activeTaskId.current = taskId;
-      setBusy(true);
+    const taskProjectId = sessionProjectIds.current.get(taskSessionId) ?? projectIdRef.current;
+    if (taskProjectId) {
+      const registrations = authoritativeActiveTasks.current.get(taskProjectId) ?? [];
+      if (!registrations.some((item) => item.taskId === taskId)) {
+        authoritativeActiveTasks.current.set(taskProjectId, [
+          ...registrations,
+          { taskId, sessionId: taskSessionId, projectId: taskProjectId },
+        ]);
+      }
     }
+    dispatchRuntime({ type: "task.registered", taskId, sessionId: taskSessionId });
   }
 
   function releaseRunningTask(taskId: string | undefined, taskSessionId: string) {
-    const resolvedSessionId = taskSessionId || (taskId ? taskSessions.current.get(taskId) ?? "" : "");
-    if (resolvedSessionId && (!taskId || runningTasksBySession.current.get(resolvedSessionId) === taskId)) {
-      runningTasksBySession.current.delete(resolvedSessionId);
-    }
-    if (taskId) taskSessions.current.delete(taskId);
+    const state = runtimeControlRef.current;
+    const resolvedSessionId = taskSessionId || (taskId ? state.sessionsByTask[taskId] ?? "" : "");
     if (taskId) {
       recoveryQueue.current = recoveryQueue.current.filter(
         (item) => item.task_id !== taskId,
@@ -546,12 +889,17 @@ function App() {
       if (pendingRecovery.current?.task_id === taskId) pendingRecovery.current = null;
     }
     if (taskId) clearApprovalsForTask(taskId);
-    publishRunningTasks();
-    if (resolvedSessionId === activeConversationIdRef.current) {
-      activeTaskId.current = "";
-      setBusy(false);
-      setCancelling(false);
+    if (taskId) {
+      const taskProjectId = sessionProjectIds.current.get(resolvedSessionId);
+      if (taskProjectId) {
+        authoritativeActiveTasks.current.set(
+          taskProjectId,
+          (authoritativeActiveTasks.current.get(taskProjectId) ?? [])
+            .filter((item) => item.taskId !== taskId),
+        );
+      }
     }
+    dispatchRuntime({ type: "task.released", taskId, sessionId: resolvedSessionId });
   }
 
   function clearApprovalsForTask(taskId: string) {
@@ -561,20 +909,118 @@ function App() {
       .map((item) => item.data.approval_id));
     if (removedIds.size === 0) return;
     for (const approvalId of removedIds) approvalToolCalls.current.delete(approvalId);
-    for (const [requestId, approvalId] of approvalResolveRequests.current) {
-      if (removedIds.has(approvalId)) approvalResolveRequests.current.delete(requestId);
-    }
-    setResolvingApprovalId((currentId) => removedIds.has(currentId) ? "" : currentId);
+    setApprovalDecisions((current) => Object.fromEntries(
+      Object.entries(current).filter(([approvalId]) => !removedIds.has(approvalId)),
+    ));
     const next = current.filter((item) => !removedIds.has(item.data.approval_id));
     approvalQueueRef.current = next;
     setApprovalQueue(next);
   }
 
+  function detachReplayBarrier(barrier: ReplayBarrier | null) {
+    if (!barrier) return [];
+    if (replayBarrier.current === barrier) replayBarrier.current = null;
+    const buffered = deduplicateRuntimeEvents(barrier.buffered)
+      .sort((left, right) => left.sequence - right.sequence);
+    barrier.buffered = [];
+    return buffered;
+  }
+
+  function flushReplayBarrier(barrier: ReplayBarrier | null) {
+    const buffered = detachReplayBarrier(barrier);
+    // Re-enter the normal live path only after detaching the barrier; otherwise
+    // these events would immediately buffer themselves again.
+    for (const event of buffered) liveRuntimeEventHandler.current(event);
+    return buffered;
+  }
+
+  function runtimeRequestScope<T extends RuntimeRequestType>(
+    method: T,
+    params: RuntimeRequestDataMap[T],
+  ) {
+    const values = params as Record<string, unknown>;
+    const requestSessionId = String(values.session_id ?? "");
+    const requestTaskId = String(values.task_id ?? "");
+    const requestProjectId = String(values.project_id ?? "") || (requestSessionId
+      ? sessionProjectIds.current.get(requestSessionId) ?? projectIdRef.current
+      : projectIdRef.current);
+    if (method === "workspace.open") return "workspace:open";
+    if (method === "workspace.close") return "workspace:close";
+    if (method === "runtime.ping" || method === "runtime.shutdown") return `runtime:${method}`;
+    if (method.startsWith("task.")) {
+      return `task:${requestTaskId || requestSessionId}:${method}`;
+    }
+    if (method === "approval.resolve") {
+      return `approval:${String(values.approval_id ?? requestTaskId)}:${method}`;
+    }
+    if (requestSessionId) {
+      return `project:${requestProjectId}:session:${requestSessionId}:${method}`;
+    }
+    return `project:${requestProjectId}:${method}`;
+  }
+
+  function runtimeRequestTimeout(method: RuntimeRequestType) {
+    if (method === "workspace.open" || method === "task.recover") return 120_000;
+    if (method === "event.replay") return 60_000;
+    if (method === "task.submit") return 45_000;
+    return 30_000;
+  }
+
+  /**
+   * Compatibility projection for the remaining monolithic response reducer.
+   * RuntimeClient exclusively owns correlation, timeout and scope cancellation;
+   * the reducer receives an already-settled synthetic envelope exactly once.
+   */
+  async function sendRequest<T extends RuntimeRequestType>(
+    method: T,
+    params: RuntimeRequestDataMap[T],
+    id = requestId(method.replace(/\./g, "-")),
+  ): Promise<RuntimeResponse> {
+    let response: RuntimeResponse;
+    try {
+      const values = params as Record<string, unknown>;
+      const requestSessionId = String(values.session_id ?? "");
+      const requestProjectId = String(values.project_id ?? "") || (requestSessionId
+        ? sessionProjectIds.current.get(requestSessionId) ?? projectIdRef.current
+        : projectIdRef.current);
+      const routedParams = (
+        method === "runtime.ping" || method === "runtime.shutdown"
+          ? params
+          : { ...params, project_id: requestProjectId }
+      ) as RuntimeRequestDataMap[T];
+      const result = await runtimeClient.request(method, routedParams, {
+        requestId: id,
+        scope: runtimeRequestScope(method, routedParams),
+        supersede: method !== "task.submit" && method !== "task.recover",
+        timeoutMs: runtimeRequestTimeout(method),
+      });
+      response = {
+        kind: "response",
+        protocol_version: RUNTIME_PROTOCOL_VERSION,
+        request_id: id,
+        ok: true,
+        result: result as unknown as Record<string, unknown>,
+      };
+    } catch (error) {
+      response = error instanceof RuntimeRequestError
+        ? error.response
+        : {
+          kind: "response",
+          protocol_version: RUNTIME_PROTOCOL_VERSION,
+          request_id: id,
+          ok: false,
+          error: {
+            code: error instanceof RuntimeClientError ? error.code : "runtime_transport_error",
+            message: error instanceof Error ? error.message : String(error),
+          },
+        };
+    }
+    legacyRuntimeResponseHandler.current(response);
+    return response;
+  }
+
   function syncActiveConversationTask(conversationId: string) {
-    const taskId = runningTasksBySession.current.get(conversationId) ?? "";
-    activeTaskId.current = taskId;
-    setBusy(Boolean(taskId));
-    setCancelling(false);
+    dispatchRuntime({ type: "conversation.activated", sessionId: conversationId });
   }
 
   useEffect(() => {
@@ -587,6 +1033,172 @@ function App() {
   useEffect(() => {
     let disposed = false;
     const unlisteners: Array<() => void> = [];
+
+    function captureRuntimeRestoreTargets() {
+      const projectIds = new Set(
+        selectActiveTasks(supervisionStore.getSnapshot())
+          .map((task) => task.projectId || supervisionStore.getSnapshot().sessions[task.sessionId]?.meta.projectId || "")
+          .filter(Boolean),
+      );
+      if (projectIdRef.current) projectIds.add(projectIdRef.current);
+      const targets: RuntimeProjectRestoreTarget[] = [];
+      for (const projectId of projectIds) {
+        const workspace = loadedProjectWorkspaces.current.get(projectId)
+          || projectsRef.current.find((project) => project.id === projectId)?.path
+          || (projectId === projectIdRef.current ? workspaceRef.current : "");
+        if (workspace) targets.push({ projectId, workspace });
+      }
+      return targets;
+    }
+
+    function reconcileProjectRuntimeState(
+      projectId: string,
+      result: RuntimeResponseDataMap["workspace.open"],
+    ) {
+      const resolvedProjectId = String(result.project_id || projectId);
+      const resolvedWorkspace = String(result.workspace || loadedProjectWorkspaces.current.get(resolvedProjectId) || "");
+      if (resolvedWorkspace) loadedProjectWorkspaces.current.set(resolvedProjectId, resolvedWorkspace);
+      const recoveries = (
+        result.recoveries as RuntimeRecoveryTask[] | undefined
+      ) ?? (result.recovery ? [result.recovery] : []);
+      const projectRecoveries: ProjectRecoveryTask[] = recoveries.map((recovery) => ({
+        ...recovery,
+        project_id: resolvedProjectId,
+      }));
+      const activeTasks = result.active_tasks ?? [];
+      const registrationsById = new Map<string, ActiveTaskRegistration>();
+      for (const task of activeTasks) {
+        const taskId = String(task.task_id || "");
+        const taskSessionId = String(task.session_id || "");
+        if (!taskId || !taskSessionId) continue;
+        registrationsById.set(taskId, {
+          taskId,
+          sessionId: taskSessionId,
+          projectId: resolvedProjectId,
+          phase: task.phase,
+        });
+      }
+      for (const recovery of projectRecoveries) {
+        registrationsById.set(recovery.task_id, {
+          taskId: recovery.task_id,
+          sessionId: recovery.session_id,
+          projectId: resolvedProjectId,
+          phase: recovery.status === "finalize_pending" ? "finalizing" : "recovering",
+        });
+      }
+      const projectedTasks = supervisionStore.getSnapshot().tasks;
+      const registrations = [...registrationsById.values()].filter((task) => {
+        sessionProjectIds.current.set(task.sessionId, resolvedProjectId);
+        const projected = projectedTasks[task.taskId];
+        return !projected || !(
+          projected.status === "completed"
+          || projected.status === "failed"
+          || projected.status === "cancelled"
+        );
+      });
+      const authoritativeTaskIds = new Set(registrations.map((task) => task.taskId));
+      for (const stale of selectStaleProjectTaskRoutes(
+        runtimeControlRef.current,
+        sessionProjectIds.current,
+        resolvedProjectId,
+        authoritativeTaskIds,
+      )) {
+        releaseRunningTask(stale.taskId, stale.sessionId);
+      }
+      authoritativeActiveTasks.current.set(resolvedProjectId, registrations);
+      supervisionStore.reconcileProjectActiveTasks(resolvedProjectId, registrations);
+      for (const task of registrations) registerRunningTask(task.taskId, task.sessionId);
+      recoveryQueue.current = [
+        ...recoveryQueue.current.filter((item) => item.project_id !== resolvedProjectId),
+        ...projectRecoveries,
+      ];
+      if (
+        pendingRecovery.current?.project_id === resolvedProjectId
+        && !registrations.some((item) => item.taskId === pendingRecovery.current?.task_id)
+      ) {
+        pendingRecovery.current = null;
+      }
+      return projectRecoveries;
+    }
+
+    async function restoreProjectsAfterRuntimeReady() {
+      const epoch = runtimeRestoreEpoch.current;
+      if (runtimeRestoreInProgress.current === epoch || disposed) return;
+      runtimeRestoreInProgress.current = epoch;
+      const currentTarget = {
+        projectId: projectIdRef.current,
+        workspace: workspaceRef.current,
+      };
+      const queuedTargets = restartProjectQueue.current;
+      const byProject = new Map<string, RuntimeProjectRestoreTarget>();
+      for (const target of queuedTargets) byProject.set(target.projectId, target);
+      if (currentTarget.projectId && currentTarget.workspace) {
+        byProject.set(currentTarget.projectId, currentTarget);
+      }
+      const current = byProject.get(currentTarget.projectId);
+      const background = [...byProject.values()].filter(
+        (target) => target.projectId !== currentTarget.projectId,
+      );
+      let currentOpened = false;
+      try {
+        if (current && !workspaceOpenRequest.current) {
+          const id = requestId("workspace-open");
+          workspaceOpenRequest.current = id;
+          const response = await sendRequest(
+            "workspace.open",
+            { project_id: current.projectId, workspace: current.workspace },
+            id,
+          );
+          currentOpened = response.ok;
+        }
+        for (const target of background) {
+          if (disposed || epoch !== runtimeRestoreEpoch.current) return;
+          try {
+            const result = await runtimeClient.request(
+              "workspace.open",
+              { project_id: target.projectId, workspace: target.workspace },
+              {
+                scope: `runtime-restore:${epoch}:${target.projectId}`,
+                supersede: false,
+                timeoutMs: 120_000,
+              },
+            );
+            reconcileProjectRuntimeState(target.projectId, result);
+            requestPendingTaskRecovery();
+          } catch (error) {
+            authoritativeActiveTasks.current.set(target.projectId, []);
+            supervisionStore.reconcileProjectActiveTasks(target.projectId, []);
+            recoveryQueue.current = recoveryQueue.current.filter(
+              (item) => item.project_id !== target.projectId,
+            );
+            console.warn(`Unable to restore background project ${target.projectId}: ${String(error)}`);
+          }
+        }
+        // workspace.open maintains a legacy active-project alias for older
+        // embedded integrations. Re-pin it to the visible project after all
+        // explicit background restores so fallback-only code cannot drift.
+        if (currentOpened && current && background.length > 0) {
+          const result = await runtimeClient.request(
+            "workspace.open",
+            { project_id: current.projectId, workspace: current.workspace },
+            {
+              scope: `runtime-restore:${epoch}:active-project`,
+              supersede: false,
+              timeoutMs: 120_000,
+            },
+          );
+          reconcileProjectRuntimeState(current.projectId, result);
+        }
+      } catch (error) {
+        console.warn(`Runtime project restoration did not fully complete: ${String(error)}`);
+      } finally {
+        if (epoch === runtimeRestoreEpoch.current) restartProjectQueue.current = [];
+        if (runtimeRestoreInProgress.current === epoch) {
+          runtimeRestoreInProgress.current = null;
+        }
+        requestPendingTaskRecovery();
+      }
+    }
 
     function scheduleRuntimeRestart() {
       if (disposed || restartTimer.current !== null || !workspaceRef.current) return;
@@ -605,21 +1217,19 @@ function App() {
             return;
           }
           activeRuntimePid.current = started.pid;
+          retiredRuntimePids.current.delete(started.pid);
           runtimeStarted.current = true;
           setRuntimePython(started.python);
-          setLogs((current) => [
-            ...current.slice(-199),
-            tx("Runtime restarted after {count} attempt(s).", { count: attempt }),
-          ]);
+          console.info(tx("Runtime restarted after {count} attempt(s).", { count: attempt }));
         } catch (error) {
-          setLogs((current) => [
-            ...current.slice(-199),
+          console.warn(
             `${tx("Runtime restart attempt {count} failed.", { count: attempt })} ${String(error)}`,
-          ]);
+          );
           if (attempt >= 6) {
-            setConnection("error");
-            activeTaskId.current = "";
-            setBusy(false);
+            dispatchRuntime({ type: "connection.changed", connection: "error" });
+            dispatchRuntime({ type: "tasks.cleared" });
+            authoritativeActiveTasks.current.clear();
+            supervisionStore.markRuntimeDisconnected(true);
             setEntries((current) => finishTaskStatus(
               current,
               undefined,
@@ -638,33 +1248,34 @@ function App() {
         if (!disposed) handleRuntimeMessage(payload);
       });
       const unlistenLog = await listen<string>("runtime-log", ({ payload }) => {
-        if (!disposed) setLogs((current) => [...current.slice(-199), payload]);
+        if (!disposed) console.info(payload);
       });
       const unlistenError = await listen<string>("runtime-transport-error", ({ payload }) => {
-        if (!disposed) {
-          setLogs((current) => [...current.slice(-199), `Runtime transport: ${payload}`]);
-        }
+        if (!disposed) console.error(`Runtime transport: ${payload}`);
       });
       const unlistenExit = await listen<number>("runtime-exited", ({ payload }) => {
         if (!disposed && payload === activeRuntimePid.current) {
+          const interruptedTaskId = selectActiveTaskId(runtimeControlRef.current);
+          restartProjectQueue.current = captureRuntimeRestoreTargets();
+          runtimeRestoreEpoch.current += 1;
+          flushReplayBarrier(replayBarrier.current);
           retireRuntimePid(payload);
           activeRuntimePid.current = null;
           runtimeStarted.current = false;
-          taskSubmitRequest.current = "";
-          taskCancelRequest.current = "";
           taskRecoveryRequest.current = "";
           recoveryQueue.current = [];
           eventReplayRequest.current = "";
-          setReplayingConversation(false);
+          dispatchRuntime({ type: "replay.finished" });
           workspaceOpenRequest.current = "";
           sessionListRequest.current = "";
           sessionCreateRequest.current = "";
           sessionOpenRequest.current = "";
+          sessionRenameRequest.current = "";
+          sessionDeleteRequest.current = "";
+          sessionDeleteTargetId.current = "";
           accessModeRequest.current = "";
           traceModeRequest.current = "";
-          runningTasksBySession.current.clear();
-          taskSessions.current.clear();
-          publishRunningTasks();
+          dispatchRuntime({ type: "tasks.cleared" });
           lastEventSequence.current.delete("runtime");
           const interruptedSession = activeConversationIdRef.current;
           if (interruptedSession) {
@@ -681,24 +1292,21 @@ function App() {
               conversationId: interruptedSession,
             };
           }
-          if (activeTaskId.current) {
-            setEntries((current) => updateTaskStatus(current, activeTaskId.current, {
+          if (interruptedTaskId) {
+            setEntries((current) => updateTaskStatus(current, interruptedTaskId, {
               summary: "Runtime was interrupted. Restarting and recovering the task.",
               summaryValues: undefined,
               compacting: false,
             }));
-          } else {
-            setBusy(false);
           }
-          setCancelling(false);
           setRollbackBusyTaskId("");
           setTaskDiff(null);
           setTaskDiffLoading("");
           setApprovalQueue([]);
-          setResolvingApprovalId("");
-          approvalResolveRequests.current.clear();
+          setApprovalDecisions({});
           approvalToolCalls.current.clear();
-          rejectPendingManagementRequests(tx("Python Runtime exited before the management request completed."));
+          supervisionStore.markRuntimeDisconnected(false);
+          rejectAllRuntimeRequests(tx("Python Runtime exited before the request completed."));
           setMcpSnapshot((current) => markMcpServersStarting(current));
           setRagSnapshot((current) => current.status === "indexing"
             ? {
@@ -717,7 +1325,7 @@ function App() {
                 error: tx("Python Runtime exited during diagnostics. Run the checks again after recovery."),
               }
             : { ...current, stale: true });
-          setConnection("restarting");
+          dispatchRuntime({ type: "connection.changed", connection: "restarting" });
           scheduleRuntimeRestart();
         }
       });
@@ -747,11 +1355,11 @@ function App() {
           ));
           await activateProject(mostRecentlyOpened, false);
         } else {
-          setConnection("offline");
+          dispatchRuntime({ type: "connection.changed", connection: "offline" });
         }
       } catch (error) {
         if (!disposed) {
-          setConnection("error");
+          dispatchRuntime({ type: "connection.changed", connection: "error" });
           reportError(error);
         }
       }
@@ -772,7 +1380,11 @@ function App() {
       taskRecoveryRequest.current = id;
       void sendRequest(
         "task.recover",
-        { session_id: recovery.session_id, task_id: recovery.task_id },
+        {
+          project_id: recovery.project_id,
+          session_id: recovery.session_id,
+          task_id: recovery.task_id,
+        },
         id,
       );
     }
@@ -792,28 +1404,52 @@ function App() {
       ).catch((error) => {
         if (eventReplayRequest.current !== id) return;
         eventReplayRequest.current = "";
-        if (replayBarrier.current === barrier) replayBarrier.current = null;
-        setReplayingConversation(false);
+        flushReplayBarrier(barrier);
+        dispatchRuntime({ type: "replay.finished", sessionId: barrier.sessionId });
         reportError(error);
         requestPendingTaskRecovery();
       });
     }
 
     function handleRuntimeMessage(message: RuntimeMessage, replaying = false) {
+      // One reducer accepts both live Sidecar events and durable replay.  Replay
+      // rebuilds presentation state only; live events also update the running
+      // task registry used to keep background conversations independently busy.
       const messagePid = message.runtime_pid;
-      if (
-        messagePid !== undefined
-        && (
-          retiredRuntimePids.current.has(messagePid)
-          || activeRuntimePid.current !== null
-          && messagePid !== activeRuntimePid.current
-        )
-      ) return;
+      if (messagePid !== undefined) {
+        // runtime.ready can beat the runtime_start invoke response. Adopt that
+        // process eagerly so a Windows-reused PID cannot lose its only ready
+        // signal while it is still present in the retired tombstone set.
+        if (
+          activeRuntimePid.current === null
+          && message.kind === "event"
+          && message.type === "runtime.ready"
+        ) {
+          activeRuntimePid.current = messagePid;
+          retiredRuntimePids.current.delete(messagePid);
+          runtimeStarted.current = true;
+        }
+        // The active process always wins over the retired tombstone set. Windows
+        // can reuse a PID, so checking retiredRuntimePids first would permanently
+        // discard every event from a newly launched Sidecar with the same PID.
+        if (activeRuntimePid.current !== null) {
+          if (messagePid !== activeRuntimePid.current) return;
+        } else if (retiredRuntimePids.current.has(messagePid)) {
+          return;
+        }
+      }
       if (message.kind === "response") {
+        // RuntimeClient exclusively owns request correlation. Successful or
+        // failed calls are projected into handleResponse by sendRequest once
+        // their Promise settles, so late envelopes cannot gain a second owner.
+        if (runtimeClient.accept(message)) return;
         handleResponse(message);
         return;
       }
       if (message.kind !== "event") return;
+      // Buffer live events while their older journal prefix is replayed.  Without
+      // this barrier, a new tool card can be rendered before its task-started
+      // event and be reordered when the historical entries arrive.
       const barrier = replayBarrier.current;
       if (!replaying && barrier && message.session_id === barrier.sessionId) {
         barrier.buffered.push(message);
@@ -827,6 +1463,7 @@ function App() {
         seenEventIds.current = new Set(Array.from(seenEventIds.current).slice(-5_000));
       }
       lastEventSequence.current.set(message.session_id, message.sequence);
+      if (!replaying) supervisionStore.ingest(message);
       if (!replaying) setEventCount((count) => count + 1);
       const isTaskTerminal = message.type === "task.completed"
         || message.type === "task.failed"
@@ -857,33 +1494,25 @@ function App() {
           setApprovalQueue((current) => current.filter(
             (item) => item.data.approval_id !== message.data.approval_id,
           ));
-          setResolvingApprovalId((current) => (
-            current === message.data.approval_id ? "" : current
-          ));
+          setApprovalDecisions((current) => {
+            const next = { ...current };
+            delete next[message.data.approval_id];
+            return next;
+          });
         }
         return;
       }
       if (message.type === "runtime.ready") {
         restartAttempts.current = 0;
-        setConnection("online");
-        if (!workspaceOpenRequest.current) {
-          const id = requestId("workspace-open");
-          workspaceOpenRequest.current = id;
-          void sendRequest(
-            "workspace.open",
-            { project_id: projectIdRef.current, workspace: workspaceRef.current },
-            id,
-          );
-        }
+        void restoreProjectsAfterRuntimeReady();
       } else if (message.type === "task.started") {
         const taskId = message.task_id ?? message.event_id;
         const restoredStartedAt = message.data.started_at
           ? Date.parse(message.data.started_at)
           : Date.parse(message.timestamp);
         if (!replaying) {
-          activeTaskId.current = taskId;
-          setBusy(true);
           setTimerNow(Date.now());
+          openRuntimeActivity();
         }
         if (message.data.recovered) {
           setEntries((current) => interruptOpenToolEntries(current, tx));
@@ -1034,6 +1663,121 @@ function App() {
             summaryValues: undefined,
           }));
         }
+      } else if (message.type === "plan.planning.started") {
+        const taskId = message.task_id ?? message.event_id;
+        setEntries((current) => upsertPlanEntry(current, {
+          id: `plan-${taskId}`,
+          kind: "plan",
+          taskId,
+          goal: message.data.goal,
+          executionOrder: [],
+          steps: [],
+          planning: true,
+          planningText: "",
+          timestamp: message.timestamp,
+        }));
+      } else if (message.type === "plan.planning.delta") {
+        setEntries((current) => appendPlanPlanningDelta(
+          current,
+          message.task_id,
+          message.data.text,
+        ));
+      } else if (message.type === "team.run.started") {
+        const taskId = message.task_id ?? `team-${message.data.run_id}`;
+        setEntries((current) => upsertTeamEntry(current, {
+          id: `team-${taskId}`,
+          kind: "team",
+          taskId,
+          runId: message.data.run_id,
+          workerCount: message.data.worker_count,
+          phase: "running",
+          agents: [],
+          timestamp: message.timestamp,
+        }));
+      } else if (message.type === "team.run.completed" || message.type === "team.run.failed") {
+        const taskId = message.task_id ?? `team-${message.data.run_id}`;
+        setEntries((current) => finishTeamRun(
+          current,
+          taskId,
+          message.data.run_id,
+          message.type === "team.run.completed" ? "completed" : "failed",
+          message.data.message,
+          message.timestamp,
+        ));
+      } else if (message.type === "team.agent.status") {
+        const taskId = message.task_id ?? `team-${message.data.run_id}`;
+        setEntries((current) => updateTeamAgent(current, taskId, message.data.run_id, {
+          id: teamAgentKey(message.data.agent_name, message.data.team_task_id),
+          name: message.data.agent_name,
+          role: message.data.agent_role,
+          teamTaskId: message.data.team_task_id,
+          status: message.data.status,
+        }));
+      } else if (message.type === "team.agent.message") {
+        const taskId = message.task_id ?? `team-${message.data.run_id}`;
+        setEntries((current) => updateTeamAgent(current, taskId, message.data.run_id, {
+          id: teamAgentKey(message.data.agent_name, message.data.team_task_id),
+          name: message.data.agent_name,
+          role: message.data.agent_role,
+          teamTaskId: message.data.team_task_id,
+          status: "working",
+        }, {
+          id: message.event_id,
+          kind: "message",
+          direction: message.data.direction,
+          messageKind: message.data.message_kind,
+          content: message.data.content,
+          timestamp: message.timestamp,
+        }));
+      } else if (message.type === "team.agent.delta") {
+        const taskId = message.task_id ?? `team-${message.data.team_task_id}`;
+        setEntries((current) => applyTeamAgentDelta(
+          current,
+          taskId,
+          {
+            id: teamAgentKey(message.data.agent_name, message.data.team_task_id),
+            name: message.data.agent_name,
+            role: message.data.agent_role,
+            teamTaskId: message.data.team_task_id,
+            status: "working",
+          },
+          message.data.text,
+          message.data.reset === true,
+          message.timestamp,
+        ));
+      } else if (message.type === "team.agent.tool.started") {
+        const taskId = message.task_id ?? `team-${message.data.team_task_id}`;
+        setEntries((current) => updateTeamAgent(current, taskId, "", {
+          id: teamAgentKey(message.data.agent_name, message.data.team_task_id),
+          name: message.data.agent_name,
+          role: message.data.agent_role,
+          teamTaskId: message.data.team_task_id,
+          status: "working",
+        }, {
+          id: `team-tool-${message.data.tool_call_id}`,
+          kind: "tool",
+          toolName: message.data.name,
+          toolStatus: "running",
+          content: JSON.stringify(message.data.arguments),
+          timestamp: message.timestamp,
+        }));
+      } else if (message.type === "team.agent.tool.completed") {
+        const taskId = message.task_id ?? `team-${message.data.team_task_id}`;
+        setEntries((current) => updateTeamAgent(current, taskId, "", {
+          id: teamAgentKey(message.data.agent_name, message.data.team_task_id),
+          name: message.data.agent_name,
+          role: message.data.agent_role,
+          teamTaskId: message.data.team_task_id,
+          status: message.data.success ? "working" : "failed",
+        }, {
+          id: `team-tool-${message.data.tool_call_id}`,
+          kind: "tool",
+          toolName: message.data.name,
+          toolStatus: message.data.success ? "completed" : "failed",
+          content: message.data.result_preview,
+          elapsed: message.data.elapsed_ms,
+          timestamp: message.timestamp,
+        }));
       } else if (message.type === "plan.created") {
         const taskId = message.task_id ?? message.event_id;
         setEntries((current) => updateTaskStatus(current, message.task_id, {
@@ -1059,14 +1803,23 @@ function App() {
           current,
           message.task_id,
           message.data.step_id,
-          { status: "running", resultPreview: undefined, error: undefined },
+          { status: "running", resultPreview: undefined, error: undefined, streamText: "", streaming: true },
+        ));
+      } else if (message.type === "plan.step.delta") {
+        setEntries((current) => updatePlanStep(
+          current,
+          message.task_id,
+          message.data.step_id,
+          message.data.reset
+            ? { streamText: "", streaming: false }
+            : { streamText: appendPlanStepDelta(current, message.task_id, message.data.step_id, message.data.text), streaming: true },
         ));
       } else if (message.type === "plan.step.completed") {
         setEntries((current) => updatePlanStep(
           current,
           message.task_id,
           message.data.step_id,
-          { status: "completed", resultPreview: message.data.result_preview, error: undefined },
+          { status: "completed", resultPreview: message.data.result_preview, error: undefined, streamText: undefined, streaming: false },
         ));
       } else if (message.type === "plan.step.failed") {
         setEntries((current) => updatePlanStep(
@@ -1091,6 +1844,7 @@ function App() {
           id: message.event_id,
           kind: "tool",
           toolCallId: message.data.tool_call_id,
+          taskId: message.task_id,
           name: message.data.name,
           detail: JSON.stringify(message.data.arguments),
           status: "running",
@@ -1108,6 +1862,7 @@ function App() {
           id: message.event_id,
           kind: "tool",
           toolCallId: message.data.tool_call_id,
+          taskId: message.task_id,
           name: message.data.name,
           detail: message.type === "tool.completed" ? message.data.result_preview : message.data.error,
           elapsed: message.data.elapsed_ms,
@@ -1177,17 +1932,14 @@ function App() {
         });
         if (!replaying) {
           approvalToolCalls.current.delete(message.data.approval_id);
-          for (const [requestId, approvalId] of approvalResolveRequests.current) {
-            if (approvalId === message.data.approval_id) {
-              approvalResolveRequests.current.delete(requestId);
-            }
-          }
           setApprovalQueue((current) => current.filter(
             (item) => item.data.approval_id !== message.data.approval_id,
           ));
-          setResolvingApprovalId((current) => (
-            current === message.data.approval_id ? "" : current
-          ));
+          setApprovalDecisions((current) => {
+            const next = { ...current };
+            delete next[message.data.approval_id];
+            return next;
+          });
         }
       } else if (message.type === "assistant.delta") {
         if (replaying) return;
@@ -1209,11 +1961,7 @@ function App() {
           message.timestamp,
         ));
       } else if (message.type === "task.completed") {
-        if (!replaying) {
-          if (pendingRecovery.current?.task_id === message.task_id) pendingRecovery.current = null;
-          activeTaskId.current = "";
-          setBusy(false);
-        }
+        if (!replaying && pendingRecovery.current?.task_id === message.task_id) pendingRecovery.current = null;
         setEntries((current) => updateTaskStatus(finishTaskStatus(
           current,
           message.task_id,
@@ -1223,15 +1971,14 @@ function App() {
           Date.parse(message.timestamp),
         ), message.task_id, { changes: message.data.changes, rollbackState: "idle" }));
         if (!replaying) {
-          setCancelling(false);
+          dispatchRuntime({ type: "task.cancel.finished", taskId: message.task_id });
           if (message.task_id) clearApprovalsForTask(message.task_id);
           void requestConversationList();
         }
       } else if (message.type === "task.failed") {
-        if (!replaying) {
-          if (pendingRecovery.current?.task_id === message.task_id) pendingRecovery.current = null;
-          activeTaskId.current = "";
-          setBusy(false);
+        if (!replaying && pendingRecovery.current?.task_id === message.task_id) pendingRecovery.current = null;
+        if (message.data.error_code === "worktree_merge_conflict") {
+          setEntries((current) => removeUnappliedAssistantAnswer(current, message.task_id));
         }
         setEntries((current) => updateTaskStatus(finishTaskStatus(
           current,
@@ -1242,17 +1989,13 @@ function App() {
           Date.parse(message.timestamp),
         ), message.task_id, { changes: message.data.changes, rollbackState: "idle" }));
         if (!replaying) {
-          setCancelling(false);
+          dispatchRuntime({ type: "task.cancel.finished", taskId: message.task_id });
           if (message.task_id) clearApprovalsForTask(message.task_id);
         }
         setEntries((current) => finishPlanTask(current, message.task_id, "failed"));
         if (!replaying) reportError(message.data.message, message.event_id);
       } else if (message.type === "task.cancelled") {
-        if (!replaying) {
-          if (pendingRecovery.current?.task_id === message.task_id) pendingRecovery.current = null;
-          activeTaskId.current = "";
-          setBusy(false);
-        }
+        if (!replaying && pendingRecovery.current?.task_id === message.task_id) pendingRecovery.current = null;
         setEntries((current) => updateTaskStatus(finishTaskStatus(
           current,
           message.task_id,
@@ -1262,7 +2005,7 @@ function App() {
           Date.parse(message.timestamp),
         ), message.task_id, { changes: message.data.changes, rollbackState: "idle" }));
         if (!replaying) {
-          setCancelling(false);
+          dispatchRuntime({ type: "task.cancel.finished", taskId: message.task_id });
           if (message.task_id) clearApprovalsForTask(message.task_id);
         }
         setEntries((current) => replaying
@@ -1333,43 +2076,46 @@ function App() {
     }
 
     function handleResponse(message: RuntimeResponse) {
-      const pendingManagement = pendingManagementRequests.current.get(message.request_id);
-      if (pendingManagement) {
-        pendingManagementRequests.current.delete(message.request_id);
-        if (message.ok) {
-          pendingManagement.resolve(message.result ?? {});
-        } else {
-          pendingManagement.reject(new Error(
-            `${message.error?.code ?? "runtime_error"}: ${message.error?.message ?? tx("Unknown management error")}`,
-          ));
-        }
-        return;
-      }
       if (!message.ok) {
         const failedWorkspaceOpen = message.request_id === workspaceOpenRequest.current;
+        const failedSessionList = message.request_id === sessionListRequest.current;
         const failedSessionCreate = message.request_id === sessionCreateRequest.current;
         const failedSessionOpen = message.request_id === sessionOpenRequest.current;
+        const failedSessionRename = message.request_id === sessionRenameRequest.current;
+        const failedSessionDelete = message.request_id === sessionDeleteRequest.current;
         const failedReplay = message.request_id === eventReplayRequest.current;
-        const approvalId = approvalResolveRequests.current.get(message.request_id);
-        if (approvalId) {
-          approvalResolveRequests.current.delete(message.request_id);
-          setResolvingApprovalId((current) => current === approvalId ? "" : current);
-        }
+        const failedSubmission = taskSubmitSessions.current.get(message.request_id);
+        const failedSubmitSessionId = failedSubmission?.sessionId ?? "";
+        const responseCode = message.error?.code ?? "runtime_error";
+        const submissionResultUncertain = Boolean(
+          failedSubmitSessionId && UNCERTAIN_SUBMISSION_ERROR_CODES.has(responseCode),
+        );
         if (message.request_id === accessModeRequest.current) {
           accessModeRequest.current = "";
         }
         if (message.request_id === traceModeRequest.current) {
           traceModeRequest.current = "";
         }
-        if (message.request_id === taskSubmitRequest.current) {
-          taskSubmitRequest.current = "";
-          taskSubmitSession.current = "";
-          activeTaskId.current = "";
-          setBusy(false);
-        }
-        if (message.request_id === taskCancelRequest.current) {
-          taskCancelRequest.current = "";
-          setCancelling(false);
+        if (failedSubmitSessionId) {
+          taskSubmitSessions.current.delete(message.request_id);
+          dispatchRuntime({
+            type: "task.submit.finished",
+            sessionId: failedSubmitSessionId,
+            requestId: message.request_id,
+          });
+          supervisionStore.recordSubmissionFailure({
+            requestId: message.request_id,
+            sessionId: failedSubmitSessionId,
+            projectId: failedSubmission?.projectId,
+            promptPreview: failedSubmission?.promptPreview,
+            errorCode: responseCode,
+            errorMessage: message.error?.message ?? tx("Unknown error"),
+            startedAt: failedSubmission?.startedAt,
+            uncertain: submissionResultUncertain,
+          });
+          if (!submissionResultUncertain && failedSubmission?.draft) {
+            restoreFailedSubmissionDraft(failedSubmitSessionId, failedSubmission.draft);
+          }
         }
         if (message.request_id === taskRecoveryRequest.current) {
           taskRecoveryRequest.current = "";
@@ -1379,29 +2125,62 @@ function App() {
               (item) => item.task_id !== failedRecovery.task_id,
             );
             releaseRunningTask(failedRecovery.task_id, failedRecovery.session_id);
+            supervisionStore.reconcileProjectActiveTasks(
+              failedRecovery.project_id,
+              authoritativeActiveTasks.current.get(failedRecovery.project_id) ?? [],
+            );
           }
           pendingRecovery.current = null;
           requestPendingTaskRecovery();
         }
         if (failedReplay) {
+          const failedBarrier = replayBarrier.current;
+          const failedReplaySession = failedBarrier?.sessionId;
           eventReplayRequest.current = "";
-          replayBarrier.current = null;
-          setReplayingConversation(false);
+          flushReplayBarrier(failedBarrier);
+          dispatchRuntime({ type: "replay.finished", sessionId: failedReplaySession });
           requestPendingTaskRecovery();
         }
+        if (failedSessionList) sessionListRequest.current = "";
         if (failedSessionCreate) sessionCreateRequest.current = "";
+        if (failedSessionRename) sessionRenameRequest.current = "";
+        if (failedSessionDelete) {
+          sessionDeleteRequest.current = "";
+          sessionDeleteTargetId.current = "";
+        }
         if (failedSessionOpen) {
+          const failedBarrier = replayBarrier.current;
+          const failedSessionId = failedBarrier?.sessionId;
           sessionOpenRequest.current = "";
-          replayBarrier.current = null;
-          setReplayingConversation(false);
+          flushReplayBarrier(failedBarrier);
+          dispatchRuntime({ type: "replay.finished", sessionId: failedSessionId });
         }
         if (failedWorkspaceOpen) {
           workspaceOpenRequest.current = "";
-          setConnection("error");
+          flushReplayBarrier(replayBarrier.current);
+          dispatchRuntime({ type: "connection.changed", connection: "error" });
+          const failedActivation = pendingWorkspaceActivation.current;
+          pendingWorkspaceActivation.current = null;
+          if (
+            failedActivation?.previous
+            && failedActivation.targetProjectId === projectIdRef.current
+          ) {
+            void restorePreviousWorkspace(failedActivation).catch(reportError);
+          }
         }
-        reportError(
-          `${message.error?.code ?? "runtime_error"}: ${message.error?.message ?? tx("Unknown error")}`,
+        const backgroundSubmitFailure = Boolean(
+          failedSubmitSessionId
+          && failedSubmitSessionId !== activeConversationIdRef.current,
         );
+        if (
+          !backgroundSubmitFailure
+          && responseCode !== "request_superseded"
+          && responseCode !== "project_switched"
+        ) {
+          reportError(
+            `${responseCode}: ${message.error?.message ?? tx("Unknown error")}`,
+          );
+        }
         return;
       }
       if (message.request_id === eventReplayRequest.current) {
@@ -1416,24 +2195,42 @@ function App() {
           );
           return;
         }
-        replayBarrier.current = null;
-        const buffered = barrier?.buffered ?? [];
-        const ordered = deduplicateRuntimeEvents([
-          ...(barrier?.replayed ?? replayed),
-          ...buffered,
-        ])
-          .filter((event) => RESTORABLE_EXECUTION_EVENT_TYPES.includes(event.type))
-          .sort((left, right) => (
-            left.session_id === right.session_id
-              ? left.sequence - right.sequence
-              : left.timestamp.localeCompare(right.timestamp)
-        ));
+        const detachedBuffered = detachReplayBarrier(barrier);
+        // Rebuild only from the durable replay prefix. Buffered envelopes are
+        // live traffic and may contain assistant.delta, usage, access or trace
+        // events that are intentionally absent from the restorable event list.
+        const { replayEvents: ordered, liveEvents: buffered } = partitionRuntimeReplay(
+          barrier?.replayed ?? replayed,
+          detachedBuffered,
+          RESTORABLE_EXECUTION_EVENT_TYPES,
+        );
         const lastResetIndex = findLastRuntimeEventIndex(ordered, "session.reset");
         const restorable = lastResetIndex >= 0 ? ordered.slice(lastResetIndex + 1) : ordered;
-        for (const event of restorable) handleRuntimeMessage(event, true);
-        const recovery = pendingRecovery.current;
-        const previousActiveTaskId = activeTaskId.current;
-        const replayedTerminalTaskIds = new Set(restorable
+        if (barrier?.sessionId) {
+          const currentMeta = supervisionStore.getSnapshot().sessions[barrier.sessionId]?.meta;
+          supervisionStore.replay(barrier.sessionId, restorable, currentMeta ?? {
+            sessionId: barrier.sessionId,
+            projectId: sessionProjectIds.current.get(barrier.sessionId),
+            workspace: workspaceRef.current,
+          }, buffered);
+        }
+        const previousActiveTaskId = selectActiveTaskId(runtimeControlRef.current);
+        for (const lane of mergeRuntimeReplayLanes(restorable, buffered)) {
+          handleRuntimeMessage(lane.event, lane.source === "replay");
+        }
+        if (barrier?.sessionId) {
+          const replayProjectId = sessionProjectIds.current.get(barrier.sessionId)
+            ?? supervisionStore.getSnapshot().sessions[barrier.sessionId]?.meta.projectId
+            ?? "";
+          const authoritative = authoritativeActiveTasks.current.get(replayProjectId);
+          if (replayProjectId && authoritative) {
+            supervisionStore.reconcileProjectActiveTasks(replayProjectId, authoritative);
+          }
+        }
+        const recovery = barrier?.sessionId
+          ? recoveryQueue.current.find((item) => item.session_id === barrier.sessionId) ?? null
+          : null;
+        const replayedTerminalTaskIds = new Set([...restorable, ...buffered]
           .filter((event) => (
             event.type === "task.completed"
             || event.type === "task.failed"
@@ -1441,31 +2238,31 @@ function App() {
           ))
           .map((event) => event.task_id)
           .filter((taskId): taskId is string => Boolean(taskId)));
-        const activeTaskReachedTerminal = Boolean(
-          previousActiveTaskId && replayedTerminalTaskIds.has(previousActiveTaskId),
-        );
         const recoveringTaskId = recovery && recovery.session_id === barrier?.sessionId
           ? recovery.task_id
           : undefined;
+        const liveTaskId = barrier?.sessionId
+          ? runtimeControlRef.current.tasksBySession[barrier.sessionId] ?? ""
+          : "";
+        const replayTask = reconcileReplayedTask(
+          previousActiveTaskId,
+          recoveringTaskId,
+          liveTaskId,
+          replayedTerminalTaskIds,
+        );
         setEntries((current) => sortTranscriptEntries(
           settleInterruptedReplayEntries(
             current,
-            activeTaskReachedTerminal ? undefined : recoveringTaskId,
+            replayTask.retainedTaskId || undefined,
             tx,
           ),
         ));
-        if (
-          activeTaskReachedTerminal
-          || previousActiveTaskId && !recovery
-        ) {
-          if (previousActiveTaskId) {
-            releaseRunningTask(previousActiveTaskId, barrier?.sessionId ?? "");
-          }
-          pendingRecovery.current = null;
+        if (replayTask.releaseTaskId) {
+          releaseRunningTask(replayTask.releaseTaskId, barrier?.sessionId ?? "");
         } else if (recovery) {
           registerRunningTask(recovery.task_id, recovery.session_id);
         }
-        setReplayingConversation(false);
+        dispatchRuntime({ type: "replay.finished", sessionId: barrier?.sessionId });
         requestPendingTaskRecovery();
         return;
       }
@@ -1477,51 +2274,53 @@ function App() {
         recoveryQueue.current = recoveryQueue.current.filter(
           (item) => item.task_id !== taskId,
         );
-        pendingRecovery.current = recoveryQueue.current.find(
-          (item) => item.session_id === activeConversationIdRef.current,
-        ) ?? recoveryQueue.current[0] ?? null;
+        pendingRecovery.current = null;
         requestPendingTaskRecovery();
         return;
       }
-      if (message.request_id === taskSubmitRequest.current) {
-        taskSubmitRequest.current = "";
-        const submittedSessionId = taskSubmitSession.current;
-        taskSubmitSession.current = "";
+      const submittedSessionId = taskSubmitSessions.current.get(message.request_id)?.sessionId ?? "";
+      if (submittedSessionId) {
+        taskSubmitSessions.current.delete(message.request_id);
+        dispatchRuntime({
+          type: "task.submit.finished",
+          sessionId: submittedSessionId,
+          requestId: message.request_id,
+        });
         registerRunningTask(String(message.result?.task_id ?? ""), submittedSessionId);
-        return;
-      }
-      if (message.request_id === taskCancelRequest.current) {
-        taskCancelRequest.current = "";
-        if (message.result?.accepted !== true) {
-          setCancelling(false);
-        }
         return;
       }
       if (message.request_id === workspaceOpenRequest.current) {
         workspaceOpenRequest.current = "";
         const result = message.result ?? {};
+        const completedActivation = pendingWorkspaceActivation.current;
+        if (
+          completedActivation
+          && completedActivation.targetProjectId === projectIdRef.current
+        ) {
+          pendingWorkspaceActivation.current = null;
+          void invoke("project_touch", { projectId: completedActivation.targetProjectId })
+            .then(() => refreshProjects())
+            .catch((error) => console.warn(`Unable to update recent projects: ${String(error)}`));
+        }
+        // A successful workspace.open is also a liveness proof when switching
+        // projects inside an already-running multi-project Sidecar.
+        dispatchRuntime({ type: "connection.changed", connection: "online" });
         setWorkspace(String(result.workspace ?? workspaceRef.current));
         setModel(`${String(result.provider ?? "provider")} / ${String(result.model ?? "model")}`);
         setAccessMode((result.access_mode as AccessMode | undefined) ?? "restricted");
-        const activeTasks = (result.active_tasks as Array<{ task_id?: string; session_id?: string }> | undefined) ?? [];
-        for (const task of activeTasks) {
-          registerRunningTask(String(task.task_id ?? ""), String(task.session_id ?? ""));
-        }
-        const recoveries = (
-          result.recoveries as RuntimeRecoveryTask[] | undefined
-        ) ?? ((result.recovery as RuntimeRecoveryTask | null | undefined)
-          ? [result.recovery as RuntimeRecoveryTask]
-          : []);
-        recoveryQueue.current = recoveries;
+        const openedProjectId = String(result.project_id ?? projectIdRef.current);
+        const recoveries = reconcileProjectRuntimeState(
+          openedProjectId,
+          result as unknown as RuntimeResponseDataMap["workspace.open"],
+        );
         const recovery = recoveries[0] ?? null;
         // Keep finalize_pending as the authoritative active-task state. It must
         // not be sent through task.recover (the Sidecar retries POST snapshot
         // only), but replay reconciliation still needs its task id so a buffered
         // terminal event can clear busy deterministically.
-        pendingRecovery.current = recovery;
         if (recovery) {
           pendingConversationOpen.current = {
-            projectId: projectIdRef.current,
+            projectId: openedProjectId,
             conversationId: recovery.session_id,
           };
           registerRunningTask(recovery.task_id, recovery.session_id);
@@ -1538,14 +2337,14 @@ function App() {
         }
         void requestConversationList();
         void refreshMcpSnapshot().catch((error) => {
-          setLogs((current) => [...current.slice(-199), `${tx("MCP refresh failed:")} ${String(error)}`]);
+          console.warn(`${tx("MCP refresh failed:")} ${String(error)}`);
         });
         void refreshRagSnapshot().catch((error) => {
-          setLogs((current) => [...current.slice(-199), `${tx("RAG refresh failed:")} ${String(error)}`]);
+          console.warn(`${tx("RAG refresh failed:")} ${String(error)}`);
         });
         void refreshManagementSnapshots();
         void refreshDiagnosticsSnapshot().catch((error) => {
-          setLogs((current) => [...current.slice(-199), `${tx("Diagnostics refresh failed:")} ${String(error)}`]);
+          console.warn(`${tx("Diagnostics refresh failed:")} ${String(error)}`);
         });
         return;
       }
@@ -1557,6 +2356,12 @@ function App() {
         if (listedProjectId) {
           for (const conversation of listed) {
             sessionProjectIds.current.set(conversation.id, listedProjectId);
+            supervisionStore.registerSession({
+              sessionId: conversation.id,
+              projectId: listedProjectId,
+              title: conversation.title,
+              workspace: workspaceRef.current,
+            });
           }
           setConversationCache((current) => ({ ...current, [listedProjectId]: listed }));
         }
@@ -1577,6 +2382,15 @@ function App() {
         const result = message.result ?? {};
         sessionCreateRequest.current = "";
         const identifier = String(result.session_id ?? "");
+        if (identifier) {
+          sessionProjectIds.current.set(identifier, projectIdRef.current);
+          supervisionStore.registerSession({
+            sessionId: identifier,
+            projectId: projectIdRef.current,
+            title: String(result.title ?? tx("New conversation")),
+            workspace: String(result.workspace ?? workspaceRef.current),
+          });
+        }
         setSessionId(identifier);
         setActiveConversationId(identifier);
         activeConversationIdRef.current = identifier;
@@ -1596,6 +2410,15 @@ function App() {
         sessionOpenRequest.current = "";
         const result = message.result ?? {};
         const identifier = String(result.id ?? "");
+        if (identifier) {
+          sessionProjectIds.current.set(identifier, projectIdRef.current);
+          supervisionStore.registerSession({
+            sessionId: identifier,
+            projectId: projectIdRef.current,
+            title: String(result.title ?? identifier),
+            workspace: String(result.workspace ?? workspaceRef.current),
+          });
+        }
         setSessionId(identifier);
         setActiveConversationId(identifier);
         activeConversationIdRef.current = identifier;
@@ -1614,7 +2437,7 @@ function App() {
           }
           requestEventReplay(barrier, barrier.afterSequence);
         } else {
-          setReplayingConversation(false);
+          dispatchRuntime({ type: "replay.finished", sessionId: identifier });
           requestPendingTaskRecovery();
         }
         return;
@@ -1626,19 +2449,27 @@ function App() {
       }
       if (message.request_id === sessionDeleteRequest.current) {
         sessionDeleteRequest.current = "";
-        setSessionId("");
-        setActiveConversationId("");
-        activeConversationIdRef.current = "";
-        setEntries([]);
-        setRollbackBusyTaskId("");
-        setTaskDiff(null);
-        setTaskDiffLoading("");
-        replaceAttachments([]);
-        setTraceEnabled(false);
-        setTracePath("");
-        setUsage({ ...EMPTY_USAGE, context_window: appSettingsRef.current.agent.context_window });
-        setHistoryState({ ...EMPTY_HISTORY, context_window: appSettingsRef.current.agent.context_window });
-        void requestConversationList(true);
+        const deletedSessionId = sessionDeleteTargetId.current;
+        sessionDeleteTargetId.current = "";
+        if (deletedSessionId) sessionDraftStore.delete(deletedSessionId);
+        const deletedActiveConversation = deletedSessionId === activeConversationIdRef.current;
+        if (deletedActiveConversation) {
+          setSessionId("");
+          setActiveConversationId("");
+          activeConversationIdRef.current = "";
+          syncActiveConversationTask("");
+          setEntries([]);
+          setRollbackBusyTaskId("");
+          setTaskDiff(null);
+          setTaskDiffLoading("");
+          replacePrompt("", false);
+          replaceAttachments([], false);
+          setTraceEnabled(false);
+          setTracePath("");
+          setUsage({ ...EMPTY_USAGE, context_window: appSettingsRef.current.agent.context_window });
+          setHistoryState({ ...EMPTY_HISTORY, context_window: appSettingsRef.current.agent.context_window });
+        }
+        void requestConversationList(deletedActiveConversation);
         return;
       }
       if (message.request_id === accessModeRequest.current) {
@@ -1654,6 +2485,9 @@ function App() {
     }
 
     function applySnapshot(result: Record<string, unknown>) {
+      // A snapshot is deliberately compact (user/assistant/plan). Execution
+      // cards, approvals and task state are reconstructed from event replay.
+      setAccessMode((result.access_mode as AccessMode | undefined) ?? "restricted");
       const transcript = (result.transcript as ConversationTranscriptEntry[] | undefined) ?? [];
       setEntries(transcript.flatMap((item): TranscriptEntry[] => {
         if (item.role === "plan" && item.plan) {
@@ -1681,11 +2515,12 @@ function App() {
           id: item.id,
           kind: item.role,
           text: item.content,
+          taskId: item.task_id,
           attachments: item.attachments,
           timestamp: item.timestamp,
         }];
       }));
-      replaceAttachments([]);
+      restoreComposerDraft(activeConversationIdRef.current);
       setRollbackBusyTaskId("");
       setTaskDiff(null);
       setTaskDiffLoading("");
@@ -1709,10 +2544,15 @@ function App() {
       });
     }
 
+    liveRuntimeEventHandler.current = (event) => handleRuntimeMessage(event);
+    legacyRuntimeResponseHandler.current = (response) => handleResponse(response);
     void start();
     return () => {
       disposed = true;
-      rejectPendingManagementRequests(tx("Desktop Runtime connection closed."));
+      liveRuntimeEventHandler.current = () => undefined;
+      legacyRuntimeResponseHandler.current = () => undefined;
+      rejectAllRuntimeRequests(tx("Desktop Runtime connection closed."));
+      runtimeClient.dispose(tx("Desktop Runtime connection closed."));
       if (restartTimer.current !== null) {
         window.clearTimeout(restartTimer.current);
         restartTimer.current = null;
@@ -1723,6 +2563,10 @@ function App() {
   }, []);
 
   function reportError(error: unknown, id: string = crypto.randomUUID()) {
+    if (
+      error instanceof RuntimeClientError
+      && (error.code === "project_switched" || error.code === "project_removed")
+    ) return;
     setEntries((current) => [
       ...current,
       {
@@ -1732,6 +2576,11 @@ function App() {
         timestamp: new Date().toISOString(),
       },
     ]);
+  }
+
+  function reportSupervisionError(error: unknown) {
+    setSupervisionError(error instanceof Error ? error.message : String(error));
+    setSupervisionOpen(true);
   }
 
   function retireRuntimePid(pid: number | null) {
@@ -1744,11 +2593,15 @@ function App() {
     }
   }
 
-  function rejectPendingManagementRequests(message: string) {
-    for (const pending of pendingManagementRequests.current.values()) {
-      pending.reject(new Error(message));
-    }
-    pendingManagementRequests.current.clear();
+  function rejectAllRuntimeRequests(message: string) {
+    runtimeClient.rejectAll(new Error(message));
+  }
+
+  function rejectProjectRequests(projectId: string, message: string, code = "project_switched") {
+    if (!projectId) return;
+    const reason = new RuntimeClientError(message, code);
+    runtimeClient.rejectScopePrefix(`management:${projectId}:`, reason);
+    runtimeClient.rejectScopePrefix(`project:${projectId}:`, reason);
   }
 
   function applySettings(snapshot: SettingsSnapshot) {
@@ -1769,11 +2622,13 @@ function App() {
 
   function handleSettingsSaved(snapshot: SettingsSnapshot) {
     const runtimeChanged = JSON.stringify([
+      appSettings.general.worktree_directory,
       appSettings.models,
       appSettings.agent,
       appSettings.rag,
       appSettings.diagnostics,
     ]) !== JSON.stringify([
+      snapshot.settings.general.worktree_directory,
       snapshot.settings.models,
       snapshot.settings.agent,
       snapshot.settings.rag,
@@ -1796,28 +2651,28 @@ function App() {
     }
   }
 
-  function requestManagement<T, M extends ManagementRequestType>(
+  function requestManagement<M extends ManagementRequestType>(
     method: M,
     params: RuntimeRequestDataMap[M],
-  ): Promise<T> {
-    if (!runtimeStarted.current || !projectIdRef.current) {
+  ): Promise<RuntimeResponseDataMap[M]> {
+    if (
+      !runtimeStarted.current
+      || !projectIdRef.current
+      || runtimeControlRef.current.connection !== "online"
+    ) {
       return Promise.reject(new Error(t("Open a project and wait for Python Runtime first.")));
     }
-    const id = requestId(method.replace(/\./g, "-"));
-    return new Promise<T>((resolve, reject) => {
-      pendingManagementRequests.current.set(id, {
-        resolve: (result) => resolve(result as T),
-        reject,
-      });
-      void sendRequest(method, params, id).catch((error) => {
-        pendingManagementRequests.current.delete(id);
-        reject(error instanceof Error ? error : new Error(String(error)));
-      });
+    return runtimeClient.request(method, {
+      ...params,
+      project_id: projectIdRef.current,
+    } as RuntimeRequestDataMap[M], {
+      scope: `management:${projectIdRef.current}:${method}`,
+      timeoutMs: 60_000,
     });
   }
 
   async function refreshMcpSnapshot() {
-    const next = await requestManagement<McpSnapshot, "mcp.list">("mcp.list", {});
+    const next = await requestManagement("mcp.list", {});
     setMcpSnapshot(next);
     return next;
   }
@@ -1828,7 +2683,7 @@ function App() {
     overwrite: boolean,
     confirmed: boolean,
   ) {
-    const next = await requestManagement<McpSnapshot, "mcp.install">("mcp.install", {
+    const next = await requestManagement("mcp.install", {
       name,
       config,
       overwrite,
@@ -1839,7 +2694,7 @@ function App() {
   }
 
   async function setMcpServerEnabled(name: string, enabled: boolean) {
-    const next = await requestManagement<McpSnapshot, "mcp.set_enabled">("mcp.set_enabled", {
+    const next = await requestManagement("mcp.set_enabled", {
       name,
       enabled,
     });
@@ -1848,89 +2703,136 @@ function App() {
   }
 
   async function restartMcpServer(name: string) {
-    const next = await requestManagement<McpSnapshot, "mcp.restart">("mcp.restart", { name });
+    const next = await requestManagement("mcp.restart", { name });
     setMcpSnapshot(next);
     return next;
   }
 
   async function removeMcpServer(name: string) {
-    const next = await requestManagement<McpSnapshot, "mcp.remove">("mcp.remove", { name });
+    const next = await requestManagement("mcp.remove", { name });
     setMcpSnapshot(next);
     return next;
   }
 
   async function readMcpServerLogs(name: string) {
-    return requestManagement<{ name: string; logs: string }, "mcp.logs">("mcp.logs", { name });
+    return requestManagement("mcp.logs", { name });
   }
 
   async function refreshRagSnapshot() {
-    const next = await requestManagement<RagSnapshot, "rag.snapshot">("rag.snapshot", {});
+    const next = await requestManagement("rag.snapshot", {});
     setRagSnapshot(next);
     return next;
   }
 
   async function addRagSources(paths: string[]) {
-    const next = await requestManagement<RagSnapshot, "rag.add_sources">("rag.add_sources", { paths });
+    const next = await requestManagement("rag.add_sources", { paths });
     setRagSnapshot(next);
     return next;
   }
 
   async function removeRagSource(path: string) {
-    const next = await requestManagement<RagSnapshot, "rag.remove_source">("rag.remove_source", { path });
+    const next = await requestManagement("rag.remove_source", { path });
     setRagSnapshot(next);
     return next;
   }
 
   async function rebuildRagIndex() {
-    const next = await requestManagement<RagSnapshot, "rag.index">("rag.index", {});
+    const next = await requestManagement("rag.index", {});
     setRagSnapshot(next);
     return next;
   }
 
   async function clearRagIndex(confirmed: boolean) {
-    const next = await requestManagement<RagSnapshot, "rag.clear">("rag.clear", { confirmed });
+    const next = await requestManagement("rag.clear", { confirmed });
     setRagSnapshot(next);
     return next;
   }
 
   async function refreshMemorySnapshot(query = "") {
-    const next = await requestManagement<MemorySnapshot, "memory.list">("memory.list", { query, limit: 500 });
+    const next = await requestManagement("memory.list", { query, limit: 500 });
     setMemorySnapshot(next);
     return next;
   }
 
+  async function refreshPromptSnapshot(includeMemory = false) {
+    if (!sessionId) throw new Error(t("Create or open a conversation first."));
+    return requestManagement("prompt.snapshot", {
+      session_id: sessionId,
+      include_memory: includeMemory,
+    });
+  }
+
   async function saveMemory(content: string) {
-    const next = await requestManagement<MemorySnapshot, "memory.save">("memory.save", { content });
+    const next = await requestManagement("memory.save", { content });
     setMemorySnapshot(next);
     return next;
   }
 
   async function deleteMemory(id: string) {
-    const next = await requestManagement<MemorySnapshot, "memory.delete">("memory.delete", { id });
+    const next = await requestManagement("memory.delete", { id });
     setMemorySnapshot(next);
     return next;
   }
 
   async function clearMemory(confirmed: boolean) {
-    const next = await requestManagement<MemorySnapshot, "memory.clear">("memory.clear", { confirmed });
+    const next = await requestManagement("memory.clear", { confirmed });
     setMemorySnapshot(next);
     return next;
   }
 
   async function refreshSkillSnapshot() {
-    const next = await requestManagement<SkillSnapshot, "skill.list">("skill.list", {});
+    const next = await requestManagement("skill.list", {});
     setSkillSnapshot(next);
     return next;
   }
 
+  async function loadSkillDiff(name: string) {
+    return requestManagement("skill.diff", {
+      name,
+      max_chars: 120_000,
+    });
+  }
+
   async function setSkillEnabled(name: string, enabled: boolean) {
-    const next = await requestManagement<SkillSnapshot, "skill.set_enabled">("skill.set_enabled", { name, enabled });
+    const next = await requestManagement("skill.set_enabled", { name, enabled });
     setSkillSnapshot(next);
     return next;
   }
 
   async function reloadSkills() {
-    const next = await requestManagement<SkillSnapshot, "skill.reload">("skill.reload", {});
+    const next = await requestManagement("skill.reload", {});
+    setSkillSnapshot(next);
+    return next;
+  }
+
+  async function updateBundledSkill(name: string, currentHash: string, builtinHash: string) {
+    const next = await requestManagement("skill.update", {
+      name,
+      current_hash: currentHash,
+      builtin_hash: builtinHash,
+      confirmed: true,
+    });
+    setSkillSnapshot(next);
+    return next;
+  }
+
+  async function keepCustomSkill(name: string, currentHash: string, builtinHash: string) {
+    const next = await requestManagement("skill.keep_custom", {
+      name,
+      current_hash: currentHash,
+      builtin_hash: builtinHash,
+    });
+    setSkillSnapshot(next);
+    return next;
+  }
+
+  async function restoreBundledSkill(name: string, currentHash: string, builtinHash: string) {
+    const next = await requestManagement("skill.restore_default", {
+      name,
+      current_hash: currentHash,
+      builtin_hash: builtinHash,
+      confirmed: true,
+    });
     setSkillSnapshot(next);
     return next;
   }
@@ -1943,31 +2845,31 @@ function App() {
   }
 
   async function refreshBrowserSnapshot() {
-    const next = await requestManagement<BrowserSnapshot, "browser.snapshot">("browser.snapshot", {});
+    const next = await requestManagement("browser.snapshot", {});
     setBrowserSnapshot(next);
     return next;
   }
 
   async function probeBrowser(port: number) {
-    const probe = await requestManagement<BrowserProbeSnapshot, "browser.probe">("browser.probe", { port });
+    const probe = await requestManagement("browser.probe", { port });
     setBrowserSnapshot((current) => ({ ...current, legacy_probe: probe }));
     return probe;
   }
 
   async function connectBrowser(port?: number) {
-    const result = await requestManagement<{ message: string; snapshot: BrowserSnapshot }, "browser.connect">("browser.connect", { port, confirmed: true });
+    const result = await requestManagement("browser.connect", { port, confirmed: true });
     setBrowserSnapshot({ ...result.snapshot, message: result.message });
     return { ...result.snapshot, message: result.message };
   }
 
   async function disconnectBrowser() {
-    const result = await requestManagement<{ message: string; snapshot: BrowserSnapshot }, "browser.disconnect">("browser.disconnect", { confirmed: true });
+    const result = await requestManagement("browser.disconnect", { confirmed: true });
     setBrowserSnapshot({ ...result.snapshot, message: result.message });
     return { ...result.snapshot, message: result.message };
   }
 
   async function readBrowserTabs() {
-    const result = await requestManagement<{ output: string }, "browser.tabs">("browser.tabs", {});
+    const result = await requestManagement("browser.tabs", {});
     setBrowserSnapshot((current) => ({ ...current, tabs_output: result.output }));
     return result;
   }
@@ -1979,13 +2881,13 @@ function App() {
       ["Browser", refreshBrowserSnapshot],
     ] as const) {
       void operation().catch((error) => {
-        setLogs((current) => [...current.slice(-199), `${tx("{name} refresh failed:", { name: label })} ${String(error)}`]);
+        console.warn(`${tx("{name} refresh failed:", { name: label })} ${String(error)}`);
       });
     }
   }
 
   async function refreshDiagnosticsSnapshot() {
-    const next = await requestManagement<DiagnosticsSnapshot, "diagnostics.snapshot">("diagnostics.snapshot", {});
+    const next = await requestManagement("diagnostics.snapshot", {});
     setDiagnosticsSnapshot(next);
     return next;
   }
@@ -1995,33 +2897,131 @@ function App() {
       t("Build checks may execute local project build scripts. Continue?"),
       { title: t("Run build checks"), kind: "warning" },
     )) return diagnosticsSnapshot;
-    const next = await requestManagement<DiagnosticsSnapshot, "diagnostics.run">("diagnostics.run", {
+    const next = await requestManagement("diagnostics.run", {
       profile,
       confirmed: profile === "build",
     });
     setDiagnosticsSnapshot(next);
-    setBottomPanel("problems");
     return next;
   }
 
   async function cancelDiagnostics() {
     const runId = diagnosticsSnapshot.run_id;
     if (!runId) return diagnosticsSnapshot;
-    const next = await requestManagement<DiagnosticsSnapshot, "diagnostics.cancel">("diagnostics.cancel", { run_id: runId });
+    const next = await requestManagement("diagnostics.cancel", { run_id: runId });
     setDiagnosticsSnapshot(next);
     return next;
   }
 
-  async function viewTaskDiff(entry: TaskStatusTranscriptEntry) {
+  /** Opens the shared inspector without changing the durable transcript. */
+  function openRuntimeActivity() {
+    setRightSidebarView("activity");
+    workspaceLayout.showColumn("right", 560);
+  }
+
+  async function previewWorkspaceFile(reference: WorkspaceFileReference, taskId?: string) {
+    if (!activeProjectId) return;
+    const taskEntry = taskId ? taskStatusById.get(taskId) : undefined;
+    const resolvedReference = reconcileChangedWorkspaceFile(
+      reference,
+      taskEntry?.changes?.changed_files ?? [],
+    );
+    const tabId = filePreviewTabId(resolvedReference.relativePath);
+    const request = requestId("file-preview");
+    filePreviewRequestsRef.current.set(tabId, request);
+    setFilePreviewTabs((current) => {
+      const existing = current.find((tab) => tab.id === tabId);
+      if (!existing) return [...current, {
+        id: tabId,
+        relativePath: resolvedReference.relativePath,
+        fileName: fileNameFromPath(resolvedReference.relativePath) || t("File"),
+        preview: null,
+        loading: true,
+        error: "",
+      }];
+      return current.map((tab) => tab.id === tabId ? {
+        ...tab,
+        preview: tab.preview ? { ...tab.preview, line: resolvedReference.line, column: resolvedReference.column } : null,
+        loading: true,
+        error: "",
+      } : tab);
+    });
+    setActiveFilePreviewId(tabId);
+    setRightSidebarView("file");
+    workspaceLayout.showColumn("right", 680);
+    try {
+      const result = await invoke<WorkspaceFilePreview>("workspace_file_preview", {
+        projectId: activeProjectId,
+        relativePath: resolvedReference.relativePath,
+      });
+      if (filePreviewRequestsRef.current.get(tabId) !== request) return;
+      setFilePreviewTabs((current) => current.map((tab) => tab.id === tabId ? {
+        ...tab,
+        fileName: result.file_name,
+        preview: { ...result, line: resolvedReference.line, column: resolvedReference.column },
+        loading: false,
+        error: "",
+      } : tab));
+    } catch (error) {
+      if (filePreviewRequestsRef.current.get(tabId) !== request) return;
+      const taskDiffFallback = taskEntry?.changes?.diff_available
+        && taskEntry.changes.changed_files.some(
+          (file) => file.path === resolvedReference.relativePath,
+        );
+      setFilePreviewTabs((current) => current.map((tab) => tab.id === tabId ? {
+        ...tab,
+        preview: null,
+        loading: false,
+        error: taskDiffFallback
+          ? t("The file is unavailable in the current workspace. Showing its recorded changes instead.")
+          : t("Open file failed: {error}", { error: String(error) }),
+      } : tab));
+      if (taskDiffFallback) await viewTaskDiff(taskEntry, resolvedReference.relativePath);
+    } finally {
+      if (filePreviewRequestsRef.current.get(tabId) === request) {
+        filePreviewRequestsRef.current.delete(tabId);
+      }
+    }
+  }
+
+  function closeFilePreview(tabId: string) {
+    filePreviewRequestsRef.current.delete(tabId);
+    const closingIndex = filePreviewTabs.findIndex((tab) => tab.id === tabId);
+    const remaining = filePreviewTabs.filter((tab) => tab.id !== tabId);
+    setFilePreviewTabs(remaining);
+    if (activeFilePreviewId !== tabId) return;
+    const nextTab = remaining[Math.min(Math.max(0, closingIndex), remaining.length - 1)] ?? null;
+    setActiveFilePreviewId(nextTab?.id ?? "");
+    if (rightSidebarView === "file") setRightSidebarView(nextTab ? "file" : "context");
+  }
+
+  async function viewTaskDiff(entry: TaskStatusTranscriptEntry, filePath?: string) {
     if (!sessionId || !entry.changes?.diff_available || taskDiffLoading) return;
+    if (taskDiff?.task_id === entry.taskId) {
+      const selectedPath = filePath && taskDiff.changed_files.some((file) => file.path === filePath)
+        ? filePath
+        : taskDiffSelectedPath || taskDiff.changed_files[0]?.path || "";
+      setTaskDiffSelectedPath(selectedPath);
+      setRightSidebarView("changes");
+      workspaceLayout.showColumn("right", 640);
+      return;
+    }
+    setTaskDiffSelectedPath(filePath || entry.changes.changed_files[0]?.path || "");
     setTaskDiffLoading(entry.taskId);
     try {
-      const result = await requestManagement<TaskDiffResult, "task.diff">("task.diff", {
+      const result = await requestManagement("task.diff", {
         session_id: sessionId,
         task_id: entry.taskId,
-        max_chars: 120_000,
+        max_chars: 200_000,
       });
       setTaskDiff(result);
+      setTaskDiffSelectedPath(
+        filePath && result.changed_files.some((file) => file.path === filePath)
+          ? filePath
+          : result.changed_files[0]?.path || "",
+      );
+      setRightSidebarView("changes");
+      workspaceLayout.showColumn("right", 640);
     } catch (error) {
       reportError(error);
     } finally {
@@ -2038,33 +3038,35 @@ function App() {
       || rollbackBusyTaskId
       || busy
       || activeProjectTaskRunning
-    ) return;
+    ) return false;
     const confirmed = await confirmDialog(
       t("Restore the {count} file(s) changed by this task? Later edits to those files will cause a safe conflict instead of being overwritten.", {
         count: changes.changed_files.length,
       }),
       { title: t("Undo task changes"), kind: "warning" },
     );
-    if (!confirmed) return;
+    if (!confirmed) return false;
     setRollbackBusyTaskId(entry.taskId);
     setEntries((current) => updateTaskStatus(current, entry.taskId, {
       rollbackState: "running",
       rollbackError: undefined,
     }));
     try {
-      await requestManagement<TaskChangeSet, "task.rollback">("task.rollback", {
+      await requestManagement("task.rollback", {
         session_id: sessionId,
         task_id: entry.taskId,
         snapshot_id: changes.snapshot_id,
         confirmed: true,
       });
       void requestConversationList(false);
+      return true;
     } catch (error) {
       setEntries((current) => updateTaskStatus(current, entry.taskId, {
         rollbackState: "failed",
         rollbackError: String(error),
       }));
       reportError(error);
+      return false;
     } finally {
       setRollbackBusyTaskId("");
     }
@@ -2094,9 +3096,12 @@ function App() {
       || projectActionBusy
       || conversationId === activeConversationId
     ) return;
+    // Bind a fresh replay barrier to this exact session before opening it. The
+    // response handler rejects stale request ids, preventing two rapid clicks
+    // from mixing events of different conversations.
     const id = requestId("session-open");
     sessionOpenRequest.current = id;
-    setReplayingConversation(true);
+    dispatchRuntime({ type: "replay.started", sessionId: conversationId });
     replayBarrier.current = {
       sessionId: conversationId,
       afterSequence: 0,
@@ -2107,8 +3112,8 @@ function App() {
       await sendRequest("session.open", { session_id: conversationId }, id);
     } catch (error) {
       sessionOpenRequest.current = "";
-      replayBarrier.current = null;
-      setReplayingConversation(false);
+      flushReplayBarrier(replayBarrier.current);
+      dispatchRuntime({ type: "replay.finished", sessionId: conversationId });
       reportError(error);
     }
   }
@@ -2135,16 +3140,18 @@ function App() {
     )) return;
     const id = requestId("session-delete");
     sessionDeleteRequest.current = id;
+    sessionDeleteTargetId.current = conversation.id;
     try {
       await sendRequest("session.delete", { session_id: conversation.id }, id);
     } catch (error) {
       sessionDeleteRequest.current = "";
+      sessionDeleteTargetId.current = "";
       reportError(error);
     }
   }
 
   async function changeAccessMode(nextMode: AccessMode) {
-    if (runtimeMutationBusy || activeProjectTaskRunning || !sessionId || nextMode === accessMode || accessModeRequest.current) return;
+    if (runtimeMutationBusy || !sessionId || nextMode === accessMode || accessModeRequest.current) return;
     if (nextMode === "full-access") {
       const confirmed = await confirmDialog(
         `${t("Enable Full access?")}\n\n${t("StellarCode will execute file writes, deletes, commands, MCP tools, and full-disk scans without approval. It may access files outside the active project, subject only to Windows permissions. This setting resets to Normal when the app or project is restarted.")}`,
@@ -2155,7 +3162,7 @@ function App() {
     const id = requestId("access-mode");
     accessModeRequest.current = id;
     try {
-      await sendRequest("runtime.set_access_mode", { mode: nextMode }, id);
+      await sendRequest("runtime.set_access_mode", { session_id: sessionId, mode: nextMode }, id);
     } catch (error) {
       accessModeRequest.current = "";
       reportError(error);
@@ -2184,8 +3191,77 @@ function App() {
     return storedProjects;
   }
 
+  /**
+   * Re-establishes the last confirmed workspace after an optimistic project
+   * switch fails. The Sidecar commits its active workspace only after a
+   * successful workspace.open response, so the UI must follow the same rule.
+   */
+  async function restorePreviousWorkspace(activation: PendingWorkspaceActivation) {
+    const previous = activation.previous;
+    if (!previous) return;
+    rejectProjectRequests(
+      activation.targetProjectId,
+      tx("A management request was interrupted by a project or Runtime switch."),
+    );
+    pendingConversationOpen.current = previous.conversationId
+      ? { projectId: previous.projectId, conversationId: previous.conversationId }
+      : null;
+    setActiveProjectId(previous.projectId);
+    setExpandedProjectIds((current) => new Set(current).add(previous.projectId));
+    setWorkspace(previous.workspace);
+    workspaceRef.current = previous.workspace;
+    projectIdRef.current = previous.projectId;
+    setSessionId("");
+    setAccessMode("restricted");
+    setTraceEnabled(false);
+    setTracePath("");
+    setMcpSnapshot(EMPTY_MCP_SNAPSHOT);
+    setRagSnapshot(EMPTY_RAG_SNAPSHOT);
+    setMemorySnapshot(EMPTY_MEMORY_SNAPSHOT);
+    setSkillSnapshot(EMPTY_SKILL_SNAPSHOT);
+    setBrowserSnapshot(EMPTY_BROWSER_SNAPSHOT);
+    setDiagnosticsSnapshot({ ...EMPTY_DIAGNOSTICS_SNAPSHOT, workspace: previous.workspace });
+    setConversations([]);
+    setActiveConversationId("");
+    activeConversationIdRef.current = "";
+    dispatchRuntime({ type: "conversation.activated", sessionId: "" });
+    dispatchRuntime({ type: "replay.finished" });
+    dispatchRuntime({ type: "connection.changed", connection: "starting" });
+    sessionListRequest.current = "";
+    sessionCreateRequest.current = "";
+    sessionOpenRequest.current = "";
+    sessionRenameRequest.current = "";
+    sessionDeleteRequest.current = "";
+    sessionDeleteTargetId.current = "";
+    accessModeRequest.current = "";
+    traceModeRequest.current = "";
+    setEntries([]);
+    replacePrompt("", false);
+    replaceAttachments([], false);
+    setEventCount(0);
+
+    const rollbackRequestId = requestId("workspace-restore");
+    workspaceOpenRequest.current = rollbackRequestId;
+    await sendRequest(
+      "workspace.open",
+      { project_id: previous.projectId, workspace: previous.workspace },
+      rollbackRequestId,
+    );
+  }
+
   async function activateProject(project: ProjectRecord, forceRestart = false, conversationToOpen = "") {
-    if (projectActionBusy || workspaceOpenRequest.current) return;
+    // Never silently drop a second project click. React state and the legacy
+    // workspace request id can both lag by one turn, so a ref owns the actual
+    // critical section and the newest intent runs as soon as it is released.
+    if (projectActionBusyRef.current) {
+      queuedWorkspaceActivation.current = { project, forceRestart, conversationToOpen };
+      return;
+    }
+    projectActionBusyRef.current = true;
+    const previousProjectId = projectIdRef.current;
+    const previousWorkspace = workspaceRef.current;
+    const previousConversationId = activeConversationIdRef.current;
+    const runtimeAlreadyRunning = runtimeStarted.current;
     setProjectActionBusy(true);
     if (restartTimer.current !== null) {
       window.clearTimeout(restartTimer.current);
@@ -2193,14 +3269,24 @@ function App() {
     }
     restartAttempts.current = 0;
     pendingRecovery.current = null;
-    replayBarrier.current = null;
+    flushReplayBarrier(replayBarrier.current);
     eventReplayRequest.current = "";
-    setReplayingConversation(false);
     taskRecoveryRequest.current = "";
     if (forceRestart) {
       lastEventSequence.current.clear();
       seenEventIds.current.clear();
     }
+    pendingWorkspaceActivation.current = {
+      targetProjectId: project.id,
+      targetWorkspace: project.path,
+      previous: previousProjectId && previousProjectId !== project.id
+        ? {
+          projectId: previousProjectId,
+          workspace: previousWorkspace,
+          conversationId: previousConversationId,
+        }
+        : null,
+    };
     setActiveProjectId(project.id);
     setExpandedProjectIds((current) => new Set(current).add(project.id));
     pendingConversationOpen.current = conversationToOpen
@@ -2222,59 +3308,82 @@ function App() {
     setConversations([]);
     setActiveConversationId("");
     activeConversationIdRef.current = "";
-    activeTaskId.current = "";
-    setBusy(false);
-    setCancelling(false);
+    dispatchRuntime({ type: "conversation.activated", sessionId: "" });
+    dispatchRuntime({ type: "replay.finished" });
+    dispatchRuntime({
+      type: "workspace.activation.started",
+      runtimeAlreadyRunning,
+      forceRestart,
+    });
     workspaceOpenRequest.current = "";
     sessionListRequest.current = "";
     sessionCreateRequest.current = "";
     sessionOpenRequest.current = "";
+    sessionRenameRequest.current = "";
+    sessionDeleteRequest.current = "";
+    sessionDeleteTargetId.current = "";
     accessModeRequest.current = "";
     traceModeRequest.current = "";
     setEntries([]);
-    replaceAttachments([]);
+    replacePrompt("", false);
+    replaceAttachments([], false);
     setEventCount(0);
-    setConnection("starting");
     try {
-      rejectPendingManagementRequests(tx("A management request was interrupted by a project or Runtime switch."));
+      rejectProjectRequests(
+        previousProjectId,
+        tx("A management request was interrupted by a project or Runtime switch."),
+      );
       if (forceRestart && runtimeStarted.current) {
+        rejectAllRuntimeRequests(tx("Python Runtime exited before the request completed."));
         retireRuntimePid(activeRuntimePid.current);
         activeRuntimePid.current = null;
         await invoke("runtime_stop");
         runtimeStarted.current = false;
-        runningTasksBySession.current.clear();
-        taskSessions.current.clear();
-        publishRunningTasks();
+        dispatchRuntime({ type: "tasks.cleared" });
         setApprovalQueue([]);
-        setResolvingApprovalId("");
-        approvalResolveRequests.current.clear();
+        setApprovalDecisions({});
         approvalToolCalls.current.clear();
       }
       if (runtimeStarted.current) {
         const id = requestId("workspace-open");
         workspaceOpenRequest.current = id;
-        await sendRequest(
+        const openResponse = await sendRequest(
           "workspace.open",
           { project_id: project.id, workspace: project.path },
           id,
         );
+        if (!openResponse.ok) return;
       } else {
         const started = await invoke<RuntimeStartResult>("runtime_start", {
           workspace: project.path,
         });
         activeRuntimePid.current = started.pid;
+        retiredRuntimePids.current.delete(started.pid);
         setRuntimePython(started.python);
         setRuntimeSettingsDirty(false);
         runtimeStarted.current = true;
       }
-      await invoke("project_touch", { projectId: project.id });
-      await refreshProjects();
     } catch (error) {
+      const failedActivation = pendingWorkspaceActivation.current;
+      pendingWorkspaceActivation.current = null;
       pendingConversationOpen.current = null;
-      setConnection("error");
+      dispatchRuntime({ type: "connection.changed", connection: "error" });
       reportError(error);
+      if (failedActivation?.previous && runtimeStarted.current) {
+        void restorePreviousWorkspace(failedActivation).catch(reportError);
+      }
     } finally {
+      projectActionBusyRef.current = false;
       setProjectActionBusy(false);
+      const queued = queuedWorkspaceActivation.current;
+      queuedWorkspaceActivation.current = null;
+      if (queued) {
+        window.queueMicrotask(() => void activateProject(
+          queued.project,
+          queued.forceRestart,
+          queued.conversationToOpen,
+        ));
+      }
     }
   }
 
@@ -2320,6 +3429,14 @@ function App() {
     try {
       await invoke("project_remove", { projectId: activeProject.id });
       const removedProjectId = activeProject.id;
+      authoritativeActiveTasks.current.delete(removedProjectId);
+      loadedProjectWorkspaces.current.delete(removedProjectId);
+      restartProjectQueue.current = restartProjectQueue.current.filter(
+        (target) => target.projectId !== removedProjectId,
+      );
+      recoveryQueue.current = recoveryQueue.current.filter(
+        (recovery) => recovery.project_id !== removedProjectId,
+      );
       setExpandedProjectIds((current) => {
         const updated = new Set(current);
         updated.delete(removedProjectId);
@@ -2330,7 +3447,11 @@ function App() {
         delete updated[removedProjectId];
         return updated;
       });
-      rejectPendingManagementRequests(t("A management request was interrupted because the project was removed."));
+      rejectProjectRequests(
+        removedProjectId,
+        t("A management request was interrupted because the project was removed."),
+        "project_removed",
+      );
       retireRuntimePid(activeRuntimePid.current);
       activeRuntimePid.current = null;
       if (runtimeStarted.current) await invoke("runtime_stop");
@@ -2354,7 +3475,8 @@ function App() {
         setDiagnosticsSnapshot(EMPTY_DIAGNOSTICS_SNAPSHOT);
         setConversations([]);
         setActiveConversationId("");
-        setConnection("offline");
+        activeConversationIdRef.current = "";
+        dispatchRuntime({ type: "workspace.reset", connection: "offline" });
       }
     } catch (error) {
       reportError(error);
@@ -2430,7 +3552,7 @@ function App() {
     if (!referenceMatch) return;
     const nextPrompt = `${prompt.slice(0, referenceMatch.start)}${reference.token} ${prompt.slice(referenceMatch.end)}`;
     const nextCaret = referenceMatch.start + reference.token.length + 1;
-    setPrompt(nextPrompt);
+    replacePrompt(nextPrompt);
     setReferenceMatch(null);
     setReferenceSelection(0);
     window.requestAnimationFrame(() => {
@@ -2461,13 +3583,22 @@ function App() {
         timestamp: new Date().toISOString(),
       },
     ]);
-    setPrompt("");
+    sessionDraftStore.clear(sessionId);
+    replacePrompt("", false);
     setReferenceMatch(null);
-    replaceAttachments([]);
-    setBusy(true);
+    replaceAttachments([], false);
     const id = requestId("task-submit");
-    taskSubmitRequest.current = id;
-    taskSubmitSession.current = sessionId;
+    dispatchRuntime({ type: "task.submit.started", sessionId, requestId: id });
+    taskSubmitSessions.current.set(id, {
+      sessionId,
+      projectId: sessionProjectIds.current.get(sessionId) ?? projectIdRef.current,
+      promptPreview: displayText.slice(0, 500),
+      startedAt: new Date().toISOString(),
+      draft: {
+        prompt: value,
+        attachments: submittedAttachments.map((attachment) => ({ ...attachment })),
+      },
+    });
     try {
       await sendRequest(
         "task.submit",
@@ -2475,27 +3606,29 @@ function App() {
         id,
       );
     } catch (error) {
-      taskSubmitRequest.current = "";
-      taskSubmitSession.current = "";
-      activeTaskId.current = "";
-      setBusy(false);
+      if (taskSubmitSessions.current.get(id)?.sessionId === sessionId) {
+        taskSubmitSessions.current.delete(id);
+      }
+      dispatchRuntime({ type: "task.submit.finished", sessionId, requestId: id });
       reportError(error);
     }
   }
 
   async function chooseAttachments() {
     if (runtimeMutationBusy || !sessionId) return;
+    const targetSessionId = sessionId;
     const selected = await open({
       directory: false,
       multiple: true,
       title: t("Attach files to this message"),
     });
     if (!selected) return;
-    await addAttachmentPaths(typeof selected === "string" ? [selected] : selected);
+    await addAttachmentPaths(typeof selected === "string" ? [selected] : selected, targetSessionId);
   }
 
   async function pasteImages(event: ClipboardEvent<HTMLTextAreaElement>) {
     if (runtimeMutationBusy || !sessionId) return;
+    const targetSessionId = sessionId;
     const files = Array.from(event.clipboardData.items)
       .filter((item) => item.kind === "file" && item.type.startsWith("image/"))
       .map((item) => item.getAsFile())
@@ -2504,32 +3637,57 @@ function App() {
     event.preventDefault();
     try {
       const pasted = await Promise.all(files.map((file) => clipboardImageAttachment(file, t)));
-      const merged = [...attachmentsRef.current, ...pasted];
+      const current = composerDraftForSession(targetSessionId).attachments;
+      const merged = [...current, ...pasted];
       if (merged.length > 10) {
-        reportError(t("A message can contain at most 10 attachments."));
+        reportAttachmentError(targetSessionId, t("A message can contain at most 10 attachments."));
       }
-      replaceAttachments(merged.slice(0, 10));
+      replaceSessionAttachments(targetSessionId, merged.slice(0, 10));
     } catch (error) {
-      reportError(error);
+      reportAttachmentError(targetSessionId, error);
     }
   }
 
-  async function addAttachmentPaths(paths: string[]) {
-    if (!paths.length) return;
+  async function addAttachmentPaths(paths: string[], targetSessionId = activeConversationIdRef.current) {
+    if (!paths.length || !targetSessionId) return;
     try {
       const inspected = await invoke<RuntimeAttachment[]>("attachment_inspect", { paths });
-      const current = attachmentsRef.current;
+      const current = composerDraftForSession(targetSessionId).attachments;
       const known = new Set(current.map((item) => item.local_path?.toLowerCase()));
       const additions = inspected.filter(
         (item) => !known.has(item.local_path?.toLowerCase()),
       );
       const merged = [...current, ...additions];
       if (merged.length > 10) {
-        reportError(t("A message can contain at most 10 attachments."));
+        reportAttachmentError(targetSessionId, t("A message can contain at most 10 attachments."));
       }
-      replaceAttachments(merged.slice(0, 10));
+      replaceSessionAttachments(targetSessionId, merged.slice(0, 10));
     } catch (error) {
+      reportAttachmentError(targetSessionId, error);
+    }
+  }
+
+  function composerDraftForSession(targetSessionId: string) {
+    if (targetSessionId === activeConversationIdRef.current) {
+      return { prompt: promptRef.current, attachments: attachmentsRef.current };
+    }
+    return sessionDraftStore.get(targetSessionId) ?? { prompt: "", attachments: [] };
+  }
+
+  function replaceSessionAttachments(targetSessionId: string, nextAttachments: RuntimeAttachment[]) {
+    const draft = composerDraftForSession(targetSessionId);
+    sessionDraftStore.save(targetSessionId, { prompt: draft.prompt, attachments: nextAttachments });
+    if (targetSessionId === activeConversationIdRef.current) {
+      attachmentsRef.current = nextAttachments;
+      setAttachments(nextAttachments);
+    }
+  }
+
+  function reportAttachmentError(targetSessionId: string, error: unknown) {
+    if (targetSessionId === activeConversationIdRef.current) {
       reportError(error);
+    } else {
+      console.warn(`Attachment processing failed for background session ${targetSessionId}: ${String(error)}`);
     }
   }
 
@@ -2538,30 +3696,103 @@ function App() {
     replaceAttachments((current) => current.filter((item) => item.id !== id));
   }
 
+  function replacePrompt(value: string, saveDraft = true) {
+    promptRef.current = value;
+    setPrompt(value);
+    if (saveDraft) saveComposerDraft();
+  }
+
   function replaceAttachments(
     value: RuntimeAttachment[] | ((current: RuntimeAttachment[]) => RuntimeAttachment[]),
+    saveDraft = true,
   ) {
     const next = typeof value === "function" ? value(attachmentsRef.current) : value;
     attachmentsRef.current = next;
     setAttachments(next);
+    if (saveDraft) saveComposerDraft();
+  }
+
+  function saveComposerDraft(targetSessionId = activeConversationIdRef.current) {
+    if (!targetSessionId) return;
+    const draft = {
+      prompt: promptRef.current,
+      attachments: attachmentsRef.current,
+    };
+    if (draft.prompt.trim() || draft.attachments.length > 0) {
+      sessionDraftStore.save(targetSessionId, draft);
+    } else {
+      sessionDraftStore.clear(targetSessionId);
+    }
+  }
+
+  function restoreComposerDraft(targetSessionId: string) {
+    const draft = targetSessionId ? sessionDraftStore.get(targetSessionId) : undefined;
+    promptRef.current = draft?.prompt ?? "";
+    attachmentsRef.current = draft?.attachments ?? [];
+    setPrompt(promptRef.current);
+    setAttachments(attachmentsRef.current);
+    setReferenceMatch(null);
+    setReferenceSelection(0);
+  }
+
+  function restoreFailedSubmissionDraft(
+    targetSessionId: string,
+    submittedDraft: { prompt: string; attachments: RuntimeAttachment[] },
+  ) {
+    const existing = sessionDraftStore.get(targetSessionId);
+    if (existing && (existing.prompt.trim() || existing.attachments.length > 0)) return;
+    sessionDraftStore.save(targetSessionId, submittedDraft);
+    if (activeConversationIdRef.current === targetSessionId) {
+      restoreComposerDraft(targetSessionId);
+    }
   }
 
   async function cancelTask() {
-    const taskId = activeTaskId.current;
-    if (!busy || !taskId || cancelling || taskCancelRequest.current) return;
-    const id = requestId("task-cancel");
-    taskCancelRequest.current = id;
-    setCancelling(true);
+    const taskId = selectActiveTaskId(runtimeControlRef.current)
+      || selectTaskForSession(supervisionStore.getSnapshot(), sessionId)?.id
+      || "";
+    if (!busy || !taskId || cancelling) return;
+    await cancelSupervisedTask(taskId, sessionId);
+  }
+
+  async function cancelSupervisedTask(
+    taskId: string,
+    taskSessionId: string,
+    errorTarget: "transcript" | "supervision" = "transcript",
+  ) {
+    if (!taskId || !taskSessionId || runtimeControlRef.current.cancellingTasks[taskId]) return;
+    if (errorTarget === "supervision") setSupervisionError("");
+    dispatchRuntime({ type: "task.cancel.started", taskId });
+    setTaskActionPending((current) => ({ ...current, [taskId]: "stop" }));
     try {
-      await sendRequest(
+      const result = await runtimeClient.request(
         "task.cancel",
-        { session_id: sessionId, task_id: taskId },
-        id,
+        {
+          session_id: taskSessionId,
+          task_id: taskId,
+          project_id: sessionProjectIds.current.get(taskSessionId) ?? projectIdRef.current,
+        },
+        { scope: `task:${taskId}:cancel`, supersede: false, timeoutMs: 30_000 },
       );
+      if (result.accepted) {
+        supervisionStore.markTaskStopping(taskId);
+        clearApprovalsForTask(taskId);
+      } else {
+        dispatchRuntime({ type: "task.cancel.finished", taskId });
+        const message = t("The task is no longer running.");
+        if (errorTarget === "supervision") reportSupervisionError(message);
+        else reportError(message);
+      }
     } catch (error) {
-      taskCancelRequest.current = "";
-      setCancelling(false);
-      reportError(error);
+      dispatchRuntime({ type: "task.cancel.finished", taskId });
+      if (errorTarget === "supervision") reportSupervisionError(error);
+      else reportError(error);
+    } finally {
+      setTaskActionPending((current) => {
+        const next = { ...current };
+        delete next[taskId];
+        return next;
+      });
     }
   }
 
@@ -2575,21 +3806,86 @@ function App() {
 
   async function resolveApproval(decision: "approve" | "reject" | "skip") {
     if (!approval || resolvingApprovalId) return;
-    const approvalId = approval.data.approval_id;
-    const id = requestId("approval-resolve");
-    setResolvingApprovalId(approvalId);
-    approvalResolveRequests.current.set(id, approvalId);
+    await resolveSupervisedApproval({
+      id: approval.data.approval_id,
+      sessionId: approval.session_id,
+      taskId: approval.task_id ?? "",
+    }, decision);
+  }
+
+  async function resolveSupervisedApproval(
+    target: { id: string; sessionId: string; taskId: string },
+    decision: "approve" | "reject" | "skip",
+    errorTarget: "transcript" | "supervision" = "transcript",
+  ) {
+    const projected = supervisionStore.getSnapshot().approvals[target.id];
+    if (projected && projected.status !== "pending") return;
+    if (errorTarget === "supervision") setSupervisionError("");
+    supervisionStore.markApprovalResolving(target.id, true);
+    setApprovalDecisions((current) => ({ ...current, [target.id]: decision }));
     try {
-      await sendRequest("approval.resolve", {
-        session_id: approval.session_id,
-        task_id: approval.task_id ?? "",
-        approval_id: approvalId,
+      await runtimeClient.request("approval.resolve", {
+        session_id: target.sessionId,
+        task_id: target.taskId,
+        approval_id: target.id,
         decision,
-      }, id);
+        project_id: sessionProjectIds.current.get(target.sessionId) ?? projectIdRef.current,
+      }, {
+        scope: `approval:${target.id}`,
+        supersede: false,
+        timeoutMs: 30_000,
+      });
     } catch (error) {
-      approvalResolveRequests.current.delete(id);
-      setResolvingApprovalId((current) => current === approvalId ? "" : current);
-      reportError(error);
+      supervisionStore.markApprovalResolving(target.id, false);
+      if (errorTarget === "supervision") reportSupervisionError(error);
+      else reportError(error);
+    } finally {
+      setApprovalDecisions((current) => {
+        const next = { ...current };
+        delete next[target.id];
+        return next;
+      });
+    }
+  }
+
+  async function openSupervisedSession(target: { projectId: string; sessionId: string }) {
+    const projectId = target.projectId || sessionProjectIds.current.get(target.sessionId) || "";
+    const project = projects.find((candidate) => candidate.id === projectId);
+    if (!project) {
+      reportSupervisionError(t("The project for this task is no longer available."));
+      return;
+    }
+    setSupervisionOpen(false);
+    if (project.id === activeProjectId) {
+      if (target.sessionId !== activeConversationIdRef.current) {
+        await requestOpenConversation(target.sessionId);
+      }
+      return;
+    }
+    await activateProject(project, false, target.sessionId);
+  }
+
+  async function openSupervisedTrace(task: SupervisionTaskView) {
+    const projectConversations = task.projectId === activeProjectId
+      ? conversations
+      : conversationCache[task.projectId] ?? [];
+    const conversation = projectConversations.find((candidate) => candidate.id === task.sessionId);
+    const path = conversation?.trace_path ?? "";
+    if (!path) {
+      reportSupervisionError(t("No trace log is available for this conversation."));
+      return;
+    }
+    setTaskActionPending((current) => ({ ...current, [task.id]: "trace" }));
+    try {
+      await revealItemInDir(path);
+    } catch (error) {
+      reportSupervisionError(error);
+    } finally {
+      setTaskActionPending((current) => {
+        const next = { ...current };
+        delete next[task.id];
+        return next;
+      });
     }
   }
 
@@ -2598,9 +3894,23 @@ function App() {
     await activateProject(activeProject, true);
   }
 
+  function renderAgentMarkdown(content: string, taskId?: string) {
+    const taskEntry = taskId ? taskStatusById.get(taskId) : undefined;
+    const canReviewChanges = Boolean(taskEntry?.changes?.diff_available);
+    return <MarkdownContent
+      content={content}
+      workspace={workspace}
+      projectId={activeProjectId}
+      t={t}
+      reviewChangesBusy={Boolean(taskId && taskDiffLoading === taskId)}
+      onReviewChanges={canReviewChanges && taskEntry ? () => void viewTaskDiff(taskEntry) : undefined}
+      onOpenWorkspaceFile={(reference) => previewWorkspaceFile(reference, taskId)}
+    />;
+  }
+
   return (
     <div
-      className={`app-shell theme-${appSettings.appearance.theme} ${appSettings.general.compact_tools ? "compact-tools" : ""} ${appSettings.general.compact_plans ? "compact-plans" : ""}`}
+      className={`app-shell theme-${appSettings.appearance.theme} ${appSettings.general.compact_tools ? "compact-tools" : ""} ${appSettings.general.compact_plans ? "compact-plans" : ""} ${workspaceLayout.resizingColumn ? "layout-resizing" : ""}`}
       style={{
         "--conversation-font-size": `${appSettings.general.conversation_font_size}px`,
         "--accent": appSettings.appearance.accent_color,
@@ -2614,17 +3924,62 @@ function App() {
       <header className="topbar">
         <div className="brand-mark" aria-hidden="true">*</div>
         <strong className="brand-name">StellarCode</strong>
+        <button
+          type="button"
+          className={`layout-toggle ${workspaceLayout.layout.leftCollapsed ? "" : "active"}`}
+          onClick={() => workspaceLayout.toggleColumn("left")}
+          aria-controls="project-sidebar"
+          aria-expanded={!workspaceLayout.layout.leftCollapsed}
+          aria-label={t(workspaceLayout.layout.leftCollapsed ? "Show project sidebar" : "Hide project sidebar")}
+          title={t(workspaceLayout.layout.leftCollapsed ? "Show project sidebar" : "Hide project sidebar")}
+        ><span className="layout-toggle-icon left" aria-hidden="true"><i /></span></button>
         <span className="topbar-divider" />
         <span className="workspace-path" title={workspace}>{workspace || t("No workspace")}</span>
         <span className="branch-chip">desktop-client</span>
         <div className="topbar-spacer" />
+        <button
+          type="button"
+          className={`layout-toggle ${workspaceLayout.layout.rightCollapsed ? "" : "active"}`}
+          onClick={() => workspaceLayout.toggleColumn("right")}
+          aria-controls="context-sidebar"
+          aria-expanded={!workspaceLayout.layout.rightCollapsed}
+          aria-label={t(workspaceLayout.layout.rightCollapsed ? "Show context sidebar" : "Hide context sidebar")}
+          title={t(workspaceLayout.layout.rightCollapsed ? "Show context sidebar" : "Hide context sidebar")}
+        ><span className="layout-toggle-icon right" aria-hidden="true"><i /></span></button>
+        <SupervisionCenter
+          tasks={supervisionViews.tasks}
+          approvals={supervisionViews.approvals}
+          t={t}
+          locale={appSettings.general.language}
+          open={supervisionOpen}
+          onOpenChange={setSupervisionOpen}
+          error={supervisionError}
+          onDismissError={() => setSupervisionError("")}
+          onOpenTask={(task) => openSupervisedSession(task)}
+          onStopTask={(task) => cancelSupervisedTask(task.id, task.sessionId, "supervision")}
+          onOpenTrace={openSupervisedTrace}
+          onOpenApproval={(item) => openSupervisedSession(item)}
+          onResolveApproval={(item, decision) => resolveSupervisedApproval({
+            id: item.id,
+            sessionId: item.sessionId,
+            taskId: item.taskId,
+          }, decision, "supervision")}
+        />
         <span className={`connection-state ${connection}`}><i /> {connectionLabel}</span>
         <button className="icon-button" aria-label={t("Open management center")} onClick={() => setSettingsTarget("memory")}>{t("Manage")}</button>
         <button className="icon-button" aria-label={t("Open settings")} onClick={() => setSettingsTarget("general")}>{t("Settings")}</button>
       </header>
 
-      <div className="workspace-grid">
-        <aside className="left-sidebar">
+      <div
+        className={`workspace-grid ${workspaceLayout.layout.leftCollapsed ? "left-collapsed" : ""} ${workspaceLayout.layout.rightCollapsed ? "right-collapsed" : ""}`}
+        style={{
+          "--left-sidebar-width": `${workspaceLayout.layout.leftCollapsed ? 0 : workspaceLayout.layout.leftWidth}px`,
+          "--right-sidebar-width": `${workspaceLayout.layout.rightCollapsed ? 0 : workspaceLayout.layout.rightWidth}px`,
+          "--left-divider-width": workspaceLayout.layout.leftCollapsed ? "0px" : `${WORKSPACE_LAYOUT_LIMITS.dividerWidth}px`,
+          "--right-divider-width": workspaceLayout.layout.rightCollapsed ? "0px" : `${WORKSPACE_LAYOUT_LIMITS.dividerWidth}px`,
+        } as CSSProperties}
+      >
+        <aside id="project-sidebar" className="left-sidebar" aria-hidden={workspaceLayout.layout.leftCollapsed}>
           <div className="sidebar-actions">
             <button className="primary-button full-width" onClick={() => void openWorkspace()} disabled={projectActionBusy}>+ {t("Open workspace")}</button>
           </div>
@@ -2679,7 +4034,10 @@ function App() {
                           title={`${conversation.title}\n${t(isActiveProject ? "Double-click to rename" : "Click to switch project and open")}`}
                         >
                           <span className={`session-dot ${runningTasks[conversation.id] ? "running" : ""}`} /><span className="project-label">{conversation.title}</span>
-                          {runningTasks[conversation.id] && <span className="session-running-label">{t("Running")}</span>}
+                          <span className="session-row-status">
+                            {hasSessionDraft(conversation.id) && <span className="session-draft-label">{t("Draft")}</span>}
+                            {runningTasks[conversation.id] && <span className="session-running-label">{t("Running")}</span>}
+                          </span>
                         </button>
                         {isActiveProject && <button className="row-delete" onClick={() => void deleteConversation(conversation)} disabled={Boolean(runningTasks[conversation.id]) || projectActionBusy} aria-label={t("Delete {name}", { name: conversation.title })}>x</button>}
                       </div>
@@ -2701,59 +4059,64 @@ function App() {
           </div>
         </aside>
 
+        <WorkspaceResizeHandle
+          column="left"
+          width={workspaceLayout.layout.leftWidth}
+          maximum={workspaceLayout.maximumWidth("left")}
+          collapsed={workspaceLayout.layout.leftCollapsed}
+          active={workspaceLayout.resizingColumn === "left"}
+          t={t}
+          onPointerDown={(event) => workspaceLayout.beginResize("left", event)}
+          onKeyDown={(event) => workspaceLayout.handleSeparatorKeyDown("left", event)}
+          onDoubleClick={() => workspaceLayout.resetColumn("left")}
+        />
+
         <main className="conversation-panel">
           <div className="conversation-header">
             <div><h1>{activeConversation?.title ?? t("New conversation")}</h1><p>{activeProject?.name ?? t("No project")} - {t("protocol v{version}", { version: RUNTIME_PROTOCOL_VERSION })}</p></div>
             <ModeSwitch mode={mode} onChange={changeMode} disabled={runtimeMutationBusy || !sessionId} t={t} />
           </div>
-          <div className="transcript" aria-live="polite">
-            {entries.length === 0 && <Message role="StellarCode" timestamp={t("runtime")} accent>
+          <div className="transcript-shell">
+          <div
+            className="transcript"
+            ref={transcriptRef}
+            onScroll={handleTranscriptScroll}
+            aria-label={t("Conversation transcript")}
+            aria-busy={busy}
+            tabIndex={0}
+          >
+            {entries.length === 0 && <Message role="StellarCode" timestampFallback={t("runtime")} language={appSettings.general.language} accent>
               {sessionId ? t("Runtime connected to {name}. Submit a task to start.", { name: activeProject?.name ?? t("No project") }) : connectionLabel}
             </Message>}
-            {transcriptGroups.map((group) => group.kind === "activity" ? (
-              <article className="message assistant activity-message" key={group.id}>
-                <div className="message-body">
-                  <div className="message-meta"><strong>StellarCode</strong><time>{t("now")}</time></div>
-                  <div className="activity-stack">
-                    {group.entries.map((entry) => entry.kind === "tool" ? (
-                      <ToolCard
-                        name={entry.name}
-                        status={entry.status}
-                        detail={entry.detail}
-                        elapsed={entry.elapsed === undefined ? "" : `${entry.elapsed} ms`}
-                        changePreview={entry.changePreview}
-                        t={t}
-                        key={entry.id}
-                      />
-                    ) : entry.kind === "approval" ? (
-                      approvalQueue.some((item) => item.data.approval_id === entry.approvalId)
-                        ? null
-                        : <ApprovalHistoryCard entry={entry} t={t} language={appSettings.general.language} key={entry.id} />
-                    ) : (
-                      <div className="activity-progress" key={entry.id}>{entry.text}</div>
-                    ))}
-                  </div>
-                </div>
-              </article>
-            ) : group.kind === "task-status" ? (
+            {transcriptGroups.map((group) => group.kind === "activity" ? null : group.kind === "task-status" ? (
               <AgentRunStatus
                 entry={group.entry}
                 now={timerNow}
                 t={t}
                 diffLoading={taskDiffLoading === group.entry.taskId}
                 rollbackBusy={rollbackBusyTaskId === group.entry.taskId}
-                onViewDiff={() => void viewTaskDiff(group.entry)}
+                selectedFilePath={taskDiff?.task_id === group.entry.taskId || taskDiffLoading === group.entry.taskId ? taskDiffSelectedPath : ""}
+                onSelectFile={(path) => void viewTaskDiff(group.entry, path)}
                 onRollback={() => void rollbackTaskChanges(group.entry)}
                 key={group.id}
               />
+            ) : group.kind === "team" ? (
+              <TeamConversationCard
+                entry={group.entry}
+                t={t}
+                compact
+                onOpenDetails={openRuntimeActivity}
+                renderMarkdown={(content) => renderAgentMarkdown(content, group.entry.taskId)}
+                key={group.id}
+              />
             ) : group.kind === "plan" ? (
-              <PlanCard plan={group.entry} t={t} key={group.id} />
+              <PlanCard plan={group.entry} t={t} compact onOpenDetails={openRuntimeActivity} key={group.id} />
             ) : (
-              <Message role={group.entry.kind === "user" ? t("You") : group.entry.kind === "error" ? t("Runtime error") : "StellarCode"} timestamp={t("now")} accent={group.entry.kind !== "user"} key={group.id}>
+              <Message role={group.entry.kind === "user" ? t("You") : group.entry.kind === "error" ? t("Runtime error") : "StellarCode"} timestamp={group.entry.timestamp} timestampFallback={t("now")} language={appSettings.general.language} accent={group.entry.kind !== "user"} key={group.id}>
                 {group.entry.kind === "user"
                   ? <UserMessageContent text={group.entry.text} attachments={group.entry.attachments} t={t} />
                   : group.entry.kind === "assistant"
-                  ? <><MarkdownContent content={group.entry.text} />{group.entry.streaming && <span className="streaming-caret" aria-label={t("Streaming response")} />}</>
+                  ? <>{renderAgentMarkdown(group.entry.text, group.entry.taskId)}{group.entry.streaming && <span className="streaming-caret" aria-label={t("Streaming response")} />}</>
                   : group.entry.text}
               </Message>
             ))}
@@ -2765,10 +4128,24 @@ function App() {
                 <small>{t("Task: {task} - Approval {position}", { task: approval.task_id ?? "", position: approvalQueue.length > 1 ? t("1 of {count}", { count: approvalQueue.length }) : t("pending") })}</small>
                 <div className="approval-actions">
                   <button className="secondary-button" onClick={() => void resolveApproval("reject")} disabled={Boolean(resolvingApprovalId)}>{t("Reject")}</button>
-                  <button className="primary-button" onClick={() => void resolveApproval("approve")} disabled={Boolean(resolvingApprovalId)}>{t(resolvingApprovalId ? "Resolving..." : "Allow once")}</button>
+                  <button className={`approval-allow-button risk-${approval.data.danger_level}`} onClick={() => void resolveApproval("approve")} disabled={Boolean(resolvingApprovalId)}>{t(resolvingApprovalId ? "Resolving..." : "Allow once")}</button>
                 </div>
               </div>
             </section>}
+          </div>
+          <span className="sr-only" role="status" aria-live="polite" aria-atomic="true">
+            {approval ? t("Approval required") : activeTaskFinalizing ? t("Finalizing workspace protection") : busy ? t("Agent is running") : ""}
+          </span>
+          {(!isFollowingBottom || unreadOutputCount > 0) && <button
+            className="transcript-jump"
+            type="button"
+            onClick={() => jumpToBottom("auto")}
+          >
+            <span aria-hidden="true">↓</span>
+            {unreadOutputCount > 0
+              ? t("{count} new updates", { count: Math.min(unreadOutputCount, 99) })
+              : t("Jump to latest")}
+          </button>}
           </div>
           <form className="composer" onSubmit={submitPrompt}>
             {referenceMatch && <div className="reference-menu" role="listbox" aria-label={t("References")}>
@@ -2811,7 +4188,7 @@ function App() {
                 <HighlightedComposerPrompt value={prompt} />
               </div>
               <textarea ref={composerTextareaRef} value={prompt} onChange={(event) => {
-                setPrompt(event.currentTarget.value);
+                replacePrompt(event.currentTarget.value);
                 updateReferenceMatch(event.currentTarget.value, event.currentTarget.selectionStart);
               }} onScroll={(event) => syncComposerHighlightScroll(event.currentTarget)} onSelect={(event) => updateReferenceMatch(event.currentTarget.value, event.currentTarget.selectionStart)} onPaste={(event) => void pasteImages(event)} onKeyDown={(event) => {
               if (referenceMatch) {
@@ -2844,17 +4221,89 @@ function App() {
               <button className="text-button" type="button" onClick={() => void chooseAttachments()} disabled={runtimeMutationBusy || !sessionId}>+ {t("Attach")}{attachments.length ? ` (${attachments.length})` : ""}</button>
               <button className={`trace-toggle ${traceEnabled ? "active" : ""}`} type="button" onClick={() => void toggleTrace()} disabled={runtimeMutationBusy || !sessionId || Boolean(traceModeRequest.current)} title={tracePath || t("Record complete LLM, tool, approval, and Runtime event logs for this conversation")}>{t(traceEnabled ? "Trace On" : "Trace Off")}</button>
               <div className="access-switch" aria-label={t("Access mode")}>
-                <button className={accessMode === "restricted" ? "active" : ""} type="button" onClick={() => void changeAccessMode("restricted")} disabled={runtimeMutationBusy || activeProjectTaskRunning || !sessionId}>{t("Normal")}</button>
-                <button className={accessMode === "full-access" ? "active dangerous" : ""} type="button" onClick={() => void changeAccessMode("full-access")} disabled={runtimeMutationBusy || activeProjectTaskRunning || !sessionId}>{t("Full access")}</button>
+                <button className={accessMode === "restricted" ? "active" : ""} type="button" onClick={() => void changeAccessMode("restricted")} disabled={runtimeMutationBusy || !sessionId}>{t("Normal")}</button>
+                <button className={accessMode === "full-access" ? "active dangerous" : ""} type="button" onClick={() => void changeAccessMode("full-access")} disabled={runtimeMutationBusy || !sessionId}>{t("Full access")}</button>
               </div>
               <span className="composer-hint">{activeTaskFinalizing ? t("Finalizing workspace protection") : busy ? t("Agent is running") : ragIndexing ? t("RAG index is building") : sessionId ? t(appSettings.general.send_shortcut === "enter" ? "Enter to send - Shift+Enter for newline" : "Ctrl+Enter to send") : connectionLabel}</span>
-              <button className="secondary-button" type="button" onClick={() => void cancelTask()} disabled={!busy || !activeTaskId.current || cancelling || activeTaskFinalizing}>{t(activeTaskFinalizing ? "Finalizing..." : cancelling ? "Stopping..." : "Stop")}</button>
+              <button className="secondary-button" type="button" onClick={() => void cancelTask()} disabled={!busy || !activeTaskId || cancelling || activeTaskFinalizing}>{t(activeTaskFinalizing ? "Finalizing..." : cancelling ? "Stopping..." : "Stop")}</button>
               <button className="primary-button" type="submit" disabled={!sessionId || runtimeMutationBusy || (!prompt.trim() && attachments.length === 0)}>{t("Send")}</button>
             </div>
           </form>
         </main>
 
-        <aside className="context-sidebar">
+        <WorkspaceResizeHandle
+          column="right"
+          width={workspaceLayout.layout.rightWidth}
+          maximum={workspaceLayout.maximumWidth("right")}
+          collapsed={workspaceLayout.layout.rightCollapsed}
+          active={workspaceLayout.resizingColumn === "right"}
+          t={t}
+          onPointerDown={(event) => workspaceLayout.beginResize("right", event)}
+          onKeyDown={(event) => workspaceLayout.handleSeparatorKeyDown("right", event)}
+          onDoubleClick={() => workspaceLayout.resetColumn("right")}
+        />
+
+        <aside id="context-sidebar" className="context-sidebar" aria-hidden={workspaceLayout.layout.rightCollapsed}>
+          <div className="right-sidebar-tabs" role="tablist" aria-label={t("Right sidebar") }>
+            <button
+              type="button"
+              id="right-context-tab"
+              role="tab"
+              aria-selected={rightSidebarView === "context"}
+              aria-controls="right-context-panel"
+              className={rightSidebarView === "context" ? "active" : ""}
+              onClick={() => setRightSidebarView("context")}
+            >{t("Context")}</button>
+            <button
+              type="button"
+              id="right-activity-tab"
+              role="tab"
+              aria-selected={rightSidebarView === "activity"}
+              aria-controls="right-activity-panel"
+              className={rightSidebarView === "activity" ? "active" : ""}
+              onClick={() => setRightSidebarView("activity")}
+            >{t("Activity")}{sidebarActivityEntries.length > 0 && <span>{sidebarActivityEntries.length}</span>}</button>
+            <button
+              type="button"
+              id="right-changes-tab"
+              role="tab"
+              aria-selected={rightSidebarView === "changes"}
+              aria-controls="right-changes-panel"
+              className={rightSidebarView === "changes" ? "active" : ""}
+              onClick={() => setRightSidebarView("changes")}
+              disabled={!taskDiff}
+            >{t("Changes")}{taskDiff && <span>{taskDiff.changed_files.length}</span>}</button>
+            {filePreviewTabs.map((tab, index) => <div className="right-file-tab-group" key={tab.id}>
+              <button
+                type="button"
+                id={`right-file-tab-${index}`}
+                role="tab"
+                aria-selected={rightSidebarView === "file" && activeFilePreviewId === tab.id}
+                aria-busy={tab.loading}
+                aria-controls="right-file-panel"
+                className={`right-file-tab ${rightSidebarView === "file" && activeFilePreviewId === tab.id ? "active" : ""}`}
+                onClick={() => {
+                  setActiveFilePreviewId(tab.id);
+                  setRightSidebarView("file");
+                }}
+                title={tab.preview?.absolute_path || tab.relativePath}
+              ><strong>{tab.fileName}</strong>{tab.loading && <i aria-hidden="true" />}</button>
+              <button
+                type="button"
+                className="right-file-tab-close"
+                onClick={() => closeFilePreview(tab.id)}
+                aria-label={t("Close {name}", { name: tab.fileName })}
+                title={t("Close {name}", { name: tab.fileName })}
+              >×</button>
+            </div>)}
+          </div>
+          <div
+            id="right-context-panel"
+            className="context-sidebar-content"
+            role="tabpanel"
+            aria-labelledby="right-context-tab"
+            hidden={rightSidebarView !== "context"}
+          >
           <PanelSection title={t("Run context")}>
             <DefinitionRow label={t("Model")} value={t(model)} /><DefinitionRow label={t("Mode")} value={mode === "react" ? "ReAct" : t(mode === "plan" ? "Plan" : "Team")} />
             <DefinitionRow label={t("Access")} value={t(accessMode === "restricted" ? "normal" : "full access")} emphasis={accessMode === "full-access"} /><DefinitionRow label={t("Workspace")} value={activeProject?.name ?? t("none")} />
@@ -2899,28 +4348,72 @@ function App() {
             <DefinitionRow label={t("Version")} value={`v${RUNTIME_PROTOCOL_VERSION}`} /><DefinitionRow label={t("Events")} value={`${eventCount}`} />
             <p className="panel-note">{t("JSONL over stdio. Sidecar logs are routed to stderr.")}</p>
           </PanelSection>
+          </div>
+          <div
+            id="right-activity-panel"
+            className="activity-sidebar-content"
+            role="tabpanel"
+            aria-labelledby="right-activity-tab"
+            hidden={rightSidebarView !== "activity"}
+          >
+            <RuntimeActivityPanel
+              entries={sidebarActivityEntries}
+              language={appSettings.general.language}
+              t={t}
+              renderMarkdown={(content, taskId) => renderAgentMarkdown(content, taskId)}
+            />
+          </div>
+          <div
+            id="right-changes-panel"
+            className="changes-sidebar-content"
+            role="tabpanel"
+            aria-labelledby="right-changes-tab"
+            hidden={rightSidebarView !== "changes"}
+          >
+            {taskDiff ? <Suspense fallback={<div className="right-sidebar-empty">{t("Loading changes...")}</div>}>
+              <ReviewChangesWorkbench
+                embedded
+                result={taskDiff}
+                projectId={activeProjectId}
+                workspace={workspace}
+                rollbackBusy={rollbackBusyTaskId === taskDiff.task_id}
+                canRollback={Boolean(
+                  reviewedTaskEntry
+                  && reviewedTaskEntry.changes?.rollback_available
+                  && !busy
+                  && !activeProjectTaskRunning
+                  && !taskDiff.rolled_back
+                )}
+                t={t}
+                selectedPath={taskDiffSelectedPath}
+                showFileSidebar={false}
+                onClose={() => {
+                  setTaskDiff(null);
+                  setRightSidebarView("context");
+                }}
+                onRollback={async () => {
+                  if (!reviewedTaskEntry) return false;
+                  return rollbackTaskChanges(reviewedTaskEntry);
+                }}
+              />
+            </Suspense> : <div className="right-sidebar-empty">{t("No task changes loaded.")}</div>}
+          </div>
+          <div
+            id="right-file-panel"
+            className="file-sidebar-content"
+            role="tabpanel"
+            aria-labelledby={activeFilePreviewTabIndex >= 0 ? `right-file-tab-${activeFilePreviewTabIndex}` : undefined}
+            hidden={rightSidebarView !== "file"}
+          >
+            {activeFilePreviewTab?.preview ? <Suspense fallback={<div className="right-sidebar-empty">{t("Loading file...")}</div>}>
+              <FilePreviewPanel preview={activeFilePreviewTab.preview} t={t} />
+            </Suspense> : activeFilePreviewTab?.error
+              ? <div className="right-sidebar-empty file-preview-error"><div><strong>{t("File preview failed")}</strong><p>{activeFilePreviewTab.error}</p><button type="button" className="secondary-button" onClick={() => closeFilePreview(activeFilePreviewTab.id)}>{t("Close")}</button></div></div>
+              : <div className="right-sidebar-empty">{t("Loading file...")}</div>}
+          </div>
         </aside>
       </div>
 
-      <section className="bottom-panel">
-        <div className="bottom-tabs">{(["terminal", "problems", "trace"] as BottomPanel[]).map((panel) => (
-          <button className={bottomPanel === panel ? "active" : ""} onClick={() => setBottomPanel(panel)} key={panel}>{t(panel[0].toUpperCase() + panel.slice(1))}{panel === "problems" && <span className="count-badge">{diagnosticsSnapshot.error_count + diagnosticsSnapshot.warning_count}</span>}</button>
-        ))}<span className="bottom-tabs-spacer" /></div>
-        <div className={`bottom-content ${bottomPanel === "problems" ? "problems-content" : ""}`}>
-          {bottomPanel === "terminal" && <><span className="prompt-symbol">&gt;</span><span>{logs[logs.length - 1] || connectionLabel}</span></>}
-          {bottomPanel === "problems" && <ProblemsPanel
-            snapshot={diagnosticsSnapshot}
-            language={appSettings.general.language}
-            runtimeOnline={connection === "online"}
-            mutationBusy={busy || ragIndexing || replayingConversation || Boolean(rollbackBusyTaskId)}
-            onRun={runDiagnostics}
-            onCancel={cancelDiagnostics}
-            onOpenManagement={() => setSettingsTarget("diagnostics")}
-            t={t}
-          />}
-          {bottomPanel === "trace" && <span>{traceEnabled ? t("Recording trace: {path}", { path: tracePath || t("initializing log file") }) : t("Trace recording is off for this conversation.")}</span>}
-        </div>
-      </section>
       {settingsTarget && settingsSnapshot && <SettingsPage
         initialSection={settingsTarget}
         snapshot={settingsSnapshot}
@@ -2952,9 +4445,14 @@ function App() {
         onMemorySave={saveMemory}
         onMemoryDelete={deleteMemory}
         onMemoryClear={clearMemory}
+        onPromptRefresh={refreshPromptSnapshot}
         onSkillRefresh={refreshSkillSnapshot}
+        onSkillDiff={loadSkillDiff}
         onSkillSetEnabled={setSkillEnabled}
         onSkillReload={reloadSkills}
+        onSkillUpdate={updateBundledSkill}
+        onSkillKeepCustom={keepCustomSkill}
+        onSkillRestoreDefault={restoreBundledSkill}
         onSkillPrepareDirectory={prepareSkillDirectory}
         onBrowserRefresh={refreshBrowserSnapshot}
         onBrowserProbe={probeBrowser}
@@ -2965,94 +4463,83 @@ function App() {
         onDiagnosticsRun={runDiagnostics}
         onDiagnosticsCancel={cancelDiagnostics}
       />}
-      {taskDiff && <section className="diff-overlay" role="dialog" aria-modal="true" aria-label={t("Task diff")}>
-        <div className="diff-dialog">
-          <header><div><strong>{t("Task diff")}</strong><span>{t("{count} files · +{additions} -{deletions}", { count: taskDiff.changed_files.length, additions: taskDiff.additions, deletions: taskDiff.deletions })}</span></div><button className="secondary-button" onClick={() => setTaskDiff(null)}>{t("Close")}</button></header>
-          <pre className="task-diff-content">{taskDiff.diff || t("No textual diff is available.")}</pre>
-          {taskDiff.diff_truncated && <p>{t("The displayed diff was truncated. The Git snapshot still contains the complete task state.")}</p>}
-        </div>
-      </section>}
     </div>
   );
+}
+
+function WorkspaceResizeHandle({
+  column,
+  width,
+  maximum,
+  collapsed,
+  active,
+  t,
+  onPointerDown,
+  onKeyDown,
+  onDoubleClick,
+}: {
+  column: WorkspaceColumn;
+  width: number;
+  maximum: number;
+  collapsed: boolean;
+  active: boolean;
+  t: Translator;
+  onPointerDown: (event: ReactPointerEvent<HTMLDivElement>) => void;
+  onKeyDown: (event: ReactKeyboardEvent<HTMLDivElement>) => void;
+  onDoubleClick: () => void;
+}) {
+  const minimum = column === "left" ? WORKSPACE_LAYOUT_LIMITS.leftMin : WORKSPACE_LAYOUT_LIMITS.rightMin;
+  const label = t(column === "left" ? "Resize project sidebar" : "Resize context sidebar");
+  return <div
+    className={`workspace-resizer ${column} ${active ? "active" : ""} ${collapsed ? "collapsed" : ""}`}
+    role="separator"
+    aria-orientation="vertical"
+    aria-label={label}
+    aria-controls={column === "left" ? "project-sidebar" : "context-sidebar"}
+    aria-valuemin={minimum}
+    aria-valuemax={maximum}
+    aria-valuenow={width}
+    aria-valuetext={`${width} px`}
+    aria-hidden={collapsed}
+    tabIndex={collapsed ? -1 : 0}
+    title={`${label} · ${t("Double-click to reset width")}`}
+    onPointerDown={onPointerDown}
+    onKeyDown={onKeyDown}
+    onDoubleClick={onDoubleClick}
+  ><span className="workspace-resizer-grip" aria-hidden="true" /></div>;
 }
 
 function SidebarSection({ title, action, grow = false, onAction, children }: { title: string; action: string; grow?: boolean; onAction?: () => void; children: React.ReactNode }) {
   return <section className={`sidebar-section ${grow ? "grow" : ""}`}><div className="section-heading"><span>{title}</span><button aria-label={`${action} ${title}`} onClick={onAction} disabled={!onAction}>{action}</button></div>{children}</section>;
 }
 
-function ProblemsPanel({
-  snapshot,
-  language,
-  runtimeOnline,
-  mutationBusy,
-  onRun,
-  onCancel,
-  onOpenManagement,
-  t,
-}: {
-  snapshot: DiagnosticsSnapshot;
-  language: Language;
-  runtimeOnline: boolean;
-  mutationBusy: boolean;
-  onRun: (profile?: "safe" | "build") => Promise<DiagnosticsSnapshot>;
-  onCancel: () => Promise<DiagnosticsSnapshot>;
-  onOpenManagement: () => void;
-  t: Translator;
-}) {
-  const running = snapshot.status === "running";
-  const problems = snapshot.problems;
-  const statusText = running
-    ? translateDiagnosticRuntimeText(language, snapshot.progress || t("Running workspace diagnostics..."))
-    : snapshot.status === "not_run"
-      ? t("Diagnostics have not been run for this workspace.")
-      : snapshot.status === "failed"
-        ? snapshot.error || t("Diagnostics failed.")
-        : problems.length === 0
-          ? t("No problems were reported by the completed checks.")
-          : t("{count} problem(s) reported.", { count: problems.length });
-  return <div className="problems-panel">
-    <div className="problems-toolbar">
-      <span className={`diagnostics-run-state ${snapshot.status}`}><i />{statusText}</span>
-      {snapshot.stale && !running && <span className="problems-stale" title={t("Results may be stale.")}>{t("Results may be stale.")}</span>}
-      <span className="problems-count errors">{t("{count} errors", { count: snapshot.error_count })}</span>
-      <span className="problems-count warnings">{t("{count} warnings", { count: snapshot.warning_count })}</span>
-      <span className="bottom-tabs-spacer" />
-      <button className="secondary-button" onClick={onOpenManagement}>{t("Providers")}</button>
-      {running
-        ? <button className="secondary-button danger-button" onClick={() => void onCancel()}>{t("Cancel")}</button>
-        : <>
-            <button className="secondary-button" onClick={() => void onRun("safe")} disabled={!runtimeOnline || mutationBusy}>{t("Run checks")}</button>
-            <button className="secondary-button" onClick={() => void onRun("build")} disabled={!runtimeOnline || mutationBusy}>{t("Run build checks")}</button>
-          </>}
-    </div>
-    {problems.length > 0 && <div className="problems-list" role="list" aria-label={t("Double-click a problem to reveal its file.")}>
-      {problems.map((problem) => <ProblemRow problem={problem} t={t} key={problem.id} />)}
-    </div>}
-  </div>;
-}
-
-function ProblemRow({ problem, t }: { problem: WorkspaceProblem; t: Translator }) {
-  const location = `${problem.relative_path || problem.path}:${problem.line}:${problem.column}`;
-  const reveal = () => void revealItemInDir(problem.path);
-  return <div role="listitem">
-    <button
-      type="button"
-      className={`problem-row severity-${problem.severity}`}
-      title={t("Double-click to reveal {path}", { path: problem.path })}
-      aria-label={`${problem.severity}: ${location}: ${problem.message}. ${t("Double-click a problem to reveal its file.")}`}
-      onDoubleClick={reveal}
-      onKeyDown={(event) => {
-        if (event.key !== "Enter" && event.key !== " ") return;
-        event.preventDefault();
-        reveal();
-      }}
-    >
-      <span className="problem-severity" aria-label={t(problem.severity)}>{problem.severity === "error" ? "E" : problem.severity === "warning" ? "W" : "I"}</span>
-      <code>{location}</code>
-      <span className="problem-message">{problem.message}</span>
-      <span className="problem-source">{problem.source}{problem.code ? ` (${problem.code})` : ""}</span>
-    </button>
-  </div>;
+function localizeSupervisionActivity(language: Language, activity: string) {
+  if (language === "en" || !activity) return activity;
+  const exact = translate(language, activity);
+  if (exact !== activity) return exact;
+  const patterns: Array<{
+    pattern: RegExp;
+    key: string;
+    values: (match: RegExpMatchArray) => TranslationValues;
+  }> = [
+    { pattern: /^Waiting for approval: (.+)$/, key: "Waiting for approval: {tool}", values: (match) => ({ tool: match[1] }) },
+    { pattern: /^Running plan step (.+)$/, key: "Running plan step {step}", values: (match) => ({ step: match[1] }) },
+    { pattern: /^Plan step (.+) completed$/, key: "Plan step {step} completed", values: (match) => ({ step: match[1] }) },
+    { pattern: /^Plan step (.+) failed$/, key: "Plan step {step} failed", values: (match) => ({ step: match[1] }) },
+    { pattern: /^Plan step (.+) skipped$/, key: "Plan step {step} skipped", values: (match) => ({ step: match[1] }) },
+    { pattern: /^Team started with (\d+) workers$/, key: "Team started with {count} workers", values: (match) => ({ count: match[1] }) },
+    { pattern: /^Running (.+)$/, key: "Running {name}", values: (match) => ({ name: match[1] }) },
+    { pattern: /^(.+) completed$/, key: "{name} completed", values: (match) => ({ name: match[1] }) },
+    { pattern: /^(.+) failed$/, key: "{name} failed", values: (match) => ({ name: match[1] }) },
+    { pattern: /^Approval (.+)$/, key: "Approval {decision}", values: (match) => ({ decision: translate(language, match[1]) }) },
+  ];
+  for (const item of patterns) {
+    const match = activity.match(item.pattern);
+    if (match) return translate(language, item.key, item.values(match));
+  }
+  const agentStatus = activity.match(/^(.+): (queued|working|completed|failed)$/);
+  if (agentStatus) return `${agentStatus[1]}: ${translate(language, agentStatus[2])}`;
+  return activity;
 }
 
 function upsertMcpServer(snapshot: McpSnapshot, server: McpServerInfo): McpSnapshot {
@@ -3102,17 +4589,190 @@ function HighlightedComposerPrompt({ value }: { value: string }) {
   return <>{content}</>;
 }
 
-function Message({ role, timestamp, accent = false, children }: { role: string; timestamp: string; accent?: boolean; children: React.ReactNode }) {
-  return <article className={`message ${accent ? "assistant" : "user"}`}><div className="message-body"><div className="message-meta"><strong>{role}</strong><time>{timestamp}</time></div><div className="message-content">{children}</div></div></article>;
+function Message({ role, timestamp, timestampFallback, language, accent = false, children }: {
+  role: string;
+  timestamp?: string;
+  timestampFallback?: string;
+  language: Language;
+  accent?: boolean;
+  children: React.ReactNode;
+}) {
+  return <article className={`message ${accent ? "assistant" : "user"}`}><div className="message-body"><div className="message-meta"><strong>{role}</strong><TranscriptTime timestamp={timestamp} language={language} fallback={timestampFallback} /></div><div className="message-content">{children}</div></div></article>;
 }
 
-function AgentRunStatus({ entry, now, t, diffLoading, rollbackBusy, onViewDiff, onRollback }: {
+function TranscriptTime({ timestamp, language, fallback = "" }: { timestamp?: string; language: Language; fallback?: string }) {
+  const parsed = timestamp ? new Date(timestamp) : null;
+  if (!parsed || Number.isNaN(parsed.getTime())) return <time>{fallback}</time>;
+  const locale = language === "zh-CN" ? "zh-CN" : "en-US";
+  const now = new Date();
+  const sameDay = parsed.getFullYear() === now.getFullYear()
+    && parsed.getMonth() === now.getMonth()
+    && parsed.getDate() === now.getDate();
+  const label = new Intl.DateTimeFormat(locale, sameDay
+    ? { hour: "2-digit", minute: "2-digit" }
+    : { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" }).format(parsed);
+  const title = new Intl.DateTimeFormat(locale, { dateStyle: "medium", timeStyle: "medium" }).format(parsed);
+  return <time dateTime={timestamp} title={title}>{label}</time>;
+}
+
+function RuntimeActivityPanel({ entries, language, t, renderMarkdown }: {
+  entries: SidebarActivityEntry[];
+  language: Language;
+  t: Translator;
+  renderMarkdown: (content: string, taskId?: string) => React.ReactNode;
+}) {
+  const tools = entries.reduce((count, entry) => count + (
+    entry.kind === "tool"
+      ? 1
+      : entry.kind === "team"
+        ? entry.agents.reduce((agentCount, agent) => agentCount + agent.items.filter((item) => item.kind === "tool").length, 0)
+        : 0
+  ), 0);
+  const approvals = entries.filter((entry) => entry.kind === "approval").length;
+  if (entries.length === 0) {
+    return <div className="right-sidebar-empty activity-empty">
+      <div><strong>{t("No runtime activity yet.")}</strong><p>{t("Tool calls, resolved approvals, execution details, and team conversations appear here.")}</p></div>
+    </div>;
+  }
+  return <div className="runtime-activity-panel">
+    <header className="runtime-activity-header">
+      <div><span className="plan-eyebrow">{t("Runtime activity")}</span><strong>{t("{count} activity item(s)", { count: entries.length })}</strong></div>
+      <div><span>{t("{count} tool(s)", { count: tools })}</span><span>{t("{count} approval result(s)", { count: approvals })}</span></div>
+    </header>
+    <div className="runtime-activity-list">
+      {entries.map((entry) => entry.kind === "tool" ? <section className="runtime-activity-item kind-tool" key={entry.id}>
+        <ToolCard
+          name={entry.name}
+          status={entry.status}
+          detail={entry.detail}
+          elapsed={entry.elapsed === undefined ? "" : `${entry.elapsed} ms`}
+          changePreview={entry.changePreview}
+          t={t}
+        />
+      </section> : entry.kind === "approval" ? <section className="runtime-activity-item kind-approval" key={entry.id}>
+        <ApprovalHistoryCard entry={entry} t={t} language={language} />
+      </section> : entry.kind === "thinking" ? <section className="runtime-activity-item kind-thinking" key={entry.id}>
+        <div className="runtime-activity-item-heading"><strong>{t("Thinking")}</strong><TranscriptTime timestamp={entry.timestamp} language={language} fallback={t("now")} /></div>
+        <p>{entry.text}</p>
+      </section> : entry.kind === "plan" ? <section className="runtime-activity-item kind-plan" key={entry.id}>
+        <PlanCard plan={entry} t={t} />
+      </section> : <section className="runtime-activity-item kind-team" key={entry.id}>
+        <TeamConversationCard entry={entry} t={t} renderMarkdown={(content) => renderMarkdown(content, entry.taskId)} />
+      </section>)}
+    </div>
+  </div>;
+}
+
+function TeamConversationCard({ entry, t, renderMarkdown, compact = false, onOpenDetails }: {
+  entry: TeamTranscriptEntry;
+  t: Translator;
+  renderMarkdown: (content: string) => React.ReactNode;
+  compact?: boolean;
+  onOpenDetails?: () => void;
+}) {
+  const finished = entry.agents.filter((agent) => agent.status === "completed").length;
+  const failed = entry.agents.filter((agent) => agent.status === "failed").length;
+  const status = entry.phase === "running"
+    ? "Working"
+    : entry.phase === "completed" ? "Completed" : "Failed";
+  if (compact) {
+    const roleSummaries = ["planner", "worker", "reviewer"].flatMap((role) => {
+      const agents = entry.agents.filter((agent) => agent.role === role);
+      if (agents.length === 0) return [];
+      const roleFinished = agents.filter((agent) => agent.status === "completed").length;
+      const roleStatus = agents.some((agent) => agent.status === "failed")
+        ? "Failed"
+        : agents.some((agent) => agent.status === "working")
+          ? "Working"
+          : agents.every((agent) => agent.status === "completed") ? "Completed" : "Queued";
+      return [{ role, count: agents.length, finished: roleFinished, status: roleStatus }];
+    });
+    return <article className={`team-conversation-card team-summary-card phase-${entry.phase}`}>
+      <header className="team-summary-header">
+        <div className="team-card-summary-copy">
+          <span className="plan-eyebrow">{t("Team collaboration")}</span>
+          <strong>{t("{count} worker(s) · {finished} finished", { count: entry.workerCount, finished })}</strong>
+          <small>{entry.phase === "running" ? t("Sub-agents are working through the MessageBus.") : entry.message || t("Team run finished.")}</small>
+        </div>
+        <div className="summary-card-actions"><span className={`team-run-status ${entry.phase}`}>{t(status)}</span><button type="button" onClick={onOpenDetails}>{t("View details")}</button></div>
+      </header>
+      {roleSummaries.length > 0 && <div className="team-role-summary">{roleSummaries.map((role) => <div key={role.role}>
+        <strong>{t(teamRoleLabel(role.role))}</strong>
+        <span className={`status-${role.status.toLowerCase()}`}>{role.count > 1 ? `${role.finished}/${role.count} ${t("Completed")}` : t(role.status)}</span>
+      </div>)}</div>}
+    </article>;
+  }
+  return <article className={`team-conversation-card phase-${entry.phase}`}>
+    <details>
+      <summary>
+        <div className="team-card-summary-copy">
+          <span className="plan-eyebrow">{t("Team collaboration")}</span>
+          <strong>{t("{count} worker(s) · {finished} finished", { count: entry.workerCount, finished })}</strong>
+          <small>{entry.phase === "running" ? t("Sub-agents are working through the MessageBus.") : entry.message || t("Team run finished.")}</small>
+        </div>
+        <span className={`team-run-status ${entry.phase}`}>{t(status)}</span>
+      </summary>
+      <div className="team-dialogues">
+        {entry.agents.length === 0 ? <p className="team-dialogue-empty">{t("No sub-agent messages yet.")}</p> : entry.agents.map((agent) => (
+          <section className={`team-agent-dialogue status-${agent.status}`} key={agent.id}>
+            <details>
+              <summary aria-label={t("Toggle {name} dialogue", { name: agent.name })}>
+                <div>
+                  <span className="team-agent-role">{t(teamRoleLabel(agent.role))}</span>
+                  <strong>{agent.name}</strong>
+                  {agent.teamTaskId !== "planning" && <small>{agent.teamTaskId}</small>}
+                </div>
+                <span>{t(teamStatusLabel(agent.status))}</span>
+              </summary>
+              <div className="team-dialogue-messages">
+                {agent.items.map((item) => item.kind === "tool" ? (
+                  <ToolCard
+                    key={item.id}
+                    name={item.toolName || t("Tool")}
+                    status={item.toolStatus || "running"}
+                    detail={item.content || ""}
+                    elapsed={item.elapsed === undefined ? "" : `${item.elapsed} ms`}
+                    t={t}
+                  />
+                ) : (
+                  <div className={`team-dialogue-bubble ${item.direction === "inbound" ? "from-lead" : "from-agent"}`} key={item.id}>
+                    <small>{item.direction === "inbound" ? t("Lead → {name}", { name: agent.name }) : `${agent.name} → ${t("Lead")}`} · {t(teamMessageKindLabel(item.messageKind))}</small>
+                    <div>{item.direction === "outbound" ? renderMarkdown(item.content || "") : item.content}</div>
+                  </div>
+                ))}
+              </div>
+            </details>
+          </section>
+        ))}
+      </div>
+      {failed > 0 && <p className="team-card-warning">{t("{count} sub-agent(s) reported a failure.", { count: failed })}</p>}
+    </details>
+  </article>;
+}
+
+function teamRoleLabel(role: string) {
+  return { planner: "Planner", worker: "Worker", reviewer: "Reviewer" }[role] ?? role;
+}
+
+function teamStatusLabel(status: TeamAgentStatus) {
+  return { queued: "Queued", working: "Working", completed: "Completed", failed: "Failed" }[status];
+}
+
+function teamMessageKindLabel(kind?: string) {
+  if (kind === "review_request") return "Review request";
+  if (kind === "result") return "Reply";
+  if (kind === "error") return "Error";
+  return "Request";
+}
+
+function AgentRunStatus({ entry, now, t, diffLoading, rollbackBusy, selectedFilePath, onSelectFile, onRollback }: {
   entry: TaskStatusTranscriptEntry;
   now: number;
   t: Translator;
   diffLoading: boolean;
   rollbackBusy: boolean;
-  onViewDiff: () => void;
+  selectedFilePath: string;
+  onSelectFile: (path: string) => void;
   onRollback: () => void;
 }) {
   const elapsed = entry.phase === "running"
@@ -3131,36 +4791,26 @@ function AgentRunStatus({ entry, now, t, diffLoading, rollbackBusy, onViewDiff, 
     <div className="agent-run-copy">
       <div className="agent-run-heading"><strong>{label}</strong><time>{formatElapsed(elapsed)}</time></div>
       <p>{t(entry.summary, entry.summaryValues)}</p>
-      {entry.phase === "running" && protection?.protected && <div className="snapshot-ready">{t("Protected by an automatic task Git snapshot")}</div>}
+      {entry.phase === "running" && protection?.protected && <div className="snapshot-ready">{t(protection.worktree_isolated ? "Isolated in a protected task Git worktree" : "Protected by an automatic task Git snapshot")}</div>}
       {entry.phase === "running" && protection && !protection.protected && <div className="snapshot-warning">{t("Workspace snapshot unavailable: {error}", { error: protection.error || t("unknown error") })}</div>}
       {entry.changes?.has_changes && <div className={`task-change-set ${entry.changes.rolled_back ? "rolled-back" : ""}`}>
         <div className="task-change-heading"><strong>{entry.changes.rolled_back ? t("Task changes rolled back") : t("{count} protected file(s) changed", { count: entry.changes.changed_files.length })}</strong><span>+{entry.changes.additions} -{entry.changes.deletions}</span></div>
-        <div className="task-change-files">{entry.changes.changed_files.slice(0, 6).map((file) => <div key={file.path}><span>{changeStatusMarker(file.status)}</span><code title={file.path}>{file.path}</code><small>+{file.additions} -{file.deletions}</small></div>)}</div>
-        {entry.changes.changed_files.length > 6 && <small>{t("and {count} more file(s)", { count: entry.changes.changed_files.length - 6 })}</small>}
+        <div className="task-change-files" aria-label={t("Changed files")}>{entry.changes.changed_files.map((file) => <button
+          type="button"
+          className={selectedFilePath === file.path ? "active" : ""}
+          onClick={() => onSelectFile(file.path)}
+          disabled={diffLoading || rollbackBusy || !entry.changes?.diff_available}
+          title={t("View changes for {path}", { path: file.path })}
+          key={file.path}
+        ><span>{changeStatusMarker(file.status)}</span><code>{file.path}</code><small><i>+{file.additions}</i><b>-{file.deletions}</b></small></button>)}</div>
         {entry.changes.rollback_block_reason && <p className="snapshot-warning">{t(entry.changes.rollback_block_reason)}</p>}
         {entry.rollbackError && <p className="rollback-error">{entry.rollbackError}</p>}
         <div className="task-change-actions">
-          <button className="secondary-button" onClick={onViewDiff} disabled={diffLoading || rollbackBusy || !entry.changes.diff_available}>{t(diffLoading ? "Loading diff..." : "View diff")}</button>
           <button className="secondary-button danger-button" onClick={onRollback} disabled={rollbackBusy || !entry.changes.rollback_available}>{t(rollbackBusy || entry.rollbackState === "running" ? "Rolling back..." : entry.phase === "completed" ? "Undo task changes" : "Rollback task changes")}</button>
         </div>
       </div>}
     </div>
   </article>;
-}
-
-function MarkdownContent({ content }: { content: string }) {
-  return (
-    <div className="markdown-content">
-      <ReactMarkdown
-        remarkPlugins={[remarkGfm]}
-        components={{
-          a: ({ children, ...props }) => <a {...props} target="_blank" rel="noreferrer">{children}</a>,
-        }}
-      >
-        {content}
-      </ReactMarkdown>
-    </div>
-  );
 }
 
 function UserMessageContent({ text, attachments = [], t }: { text: string; attachments?: RuntimeAttachment[]; t: Translator }) {
@@ -3180,6 +4830,14 @@ function formatFileSize(bytes?: number) {
   if (bytes < 1024) return `${bytes} B`;
   if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
   return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+function fileNameFromPath(path: string) {
+  return path.replace(/\\/g, "/").split("/").filter(Boolean).pop() ?? "";
+}
+
+function filePreviewTabId(path: string) {
+  return `file:${path.replace(/\\/g, "/").toLocaleLowerCase()}`;
 }
 
 const PREVIEWABLE_IMAGE_TYPES = new Set([
@@ -3261,13 +4919,53 @@ function readFileAsDataUrl(file: File, t: Translator): Promise<string> {
 }
 
 function ToolCard({ name, status, detail, elapsed, changePreview, t }: { name: string; status: ToolStatus; detail: string; elapsed: string; changePreview?: FileChangePreview; t: Translator }) {
+  const [copied, setCopied] = useState(false);
   const display = {
     waiting_approval: { marker: "WAIT", label: "Waiting for approval" },
     running: { marker: "RUN", label: "Running" },
     completed: { marker: "OK", label: "Completed" },
     failed: { marker: "FAIL", label: "Failed" },
   }[status];
-  return <div className={`tool-card tool-${status}`}><div className="tool-status">{t(display.marker)}</div><div><strong>{name}</strong><code>{detail}</code>{changePreview && <ChangePreviewPanel preview={changePreview} t={t} />}</div><span className="tool-result">{t(display.label)}{elapsed && ` - ${elapsed}`}</span></div>;
+  const hasDetails = Boolean(detail.trim() || changePreview);
+  const header = <span className="tool-card-header">
+    <span className="tool-status">{t(display.marker)}</span>
+    <span className="tool-card-summary">
+      <strong>{name}</strong>
+      {detail && <code className="tool-detail-preview">{summarizeToolDetail(detail)}</code>}
+    </span>
+    <span className="tool-result">{t(display.label)}{elapsed && ` · ${elapsed}`}</span>
+    {hasDetails && <span className="tool-expand-marker" aria-hidden="true">›</span>}
+  </span>;
+
+  if (!hasDetails) return <div className={`tool-card tool-${status}`}>{header}</div>;
+
+  async function copyDetails() {
+    if (!detail) return;
+    try {
+      await navigator.clipboard.writeText(detail);
+      setCopied(true);
+      window.setTimeout(() => setCopied(false), 1_500);
+    } catch {
+      setCopied(false);
+    }
+  }
+
+  return <details className={`tool-card tool-${status}`} open={status === "failed"}>
+    <summary aria-label={t("Show tool details for {name}", { name })}>{header}</summary>
+    <div className="tool-detail-panel">
+      <div className="tool-detail-toolbar">
+        <strong>{t("Tool details")}</strong>
+        {detail && <button type="button" onClick={() => void copyDetails()}>{t(copied ? "Copied" : "Copy details")}</button>}
+      </div>
+      {detail && <pre>{detail}</pre>}
+      {changePreview && <ChangePreviewPanel preview={changePreview} t={t} expanded />}
+    </div>
+  </details>;
+}
+
+function summarizeToolDetail(detail: string) {
+  const normalized = detail.replace(/\s+/g, " ").trim();
+  return normalized.length > 220 ? `${normalized.slice(0, 217)}...` : normalized;
 }
 
 function ChangePreviewPanel({ preview, t, expanded = false }: { preview: FileChangePreview; t: Translator; expanded?: boolean }) {
@@ -3331,7 +5029,12 @@ function changeStatusMarker(status: TaskChangeSet["changed_files"][number]["stat
   }[status];
 }
 
-function PlanCard({ plan, t }: { plan: PlanTranscriptEntry; t: Translator }) {
+function PlanCard({ plan, t, compact = false, onOpenDetails }: {
+  plan: PlanTranscriptEntry;
+  t: Translator;
+  compact?: boolean;
+  onOpenDetails?: () => void;
+}) {
   const order = new Map(plan.executionOrder.map((id, index) => [id, index]));
   const steps = [...plan.steps].sort((left, right) => (
     (order.get(left.id) ?? Number.MAX_SAFE_INTEGER) - (order.get(right.id) ?? Number.MAX_SAFE_INTEGER)
@@ -3343,6 +5046,33 @@ function PlanCard({ plan, t }: { plan: PlanTranscriptEntry; t: Translator }) {
   const running = steps.some((step) => step.status === "running");
   const overall = cancelled ? "Cancelled" : failed ? "Needs attention" : settled === steps.length ? "Completed" : running ? "Running" : "Ready";
   const progress = steps.length ? Math.round((settled / steps.length) * 100) : 0;
+
+  if (compact) {
+    const visibleSteps = steps.slice(0, 5);
+    return <article className={`plan-card plan-summary-card plan-${overall.toLowerCase().replace(" ", "-")}`}>
+      <header className="plan-header">
+        <div><span className="plan-eyebrow">{t("Execution plan")}</span><strong>{plan.planning ? t("Creating execution plan...") : plan.summary || plan.goal}</strong>{(plan.planning || plan.summary) && <small>{plan.goal}</small>}</div>
+        <div className="summary-card-actions"><span className="plan-overall">{t(plan.planning ? "Working" : overall)}</span><button type="button" onClick={onOpenDetails}>{t("View details")}</button></div>
+      </header>
+      <div className="plan-progress"><span style={{ width: `${progress}%` }} /></div>
+      {!plan.planning && <>
+        <div className="plan-progress-label"><span>{t("{settled} of {total} steps finished", { settled, total: steps.length })}</span><strong>{t("{count} completed", { count: completed })}</strong></div>
+        <ol className="plan-summary-steps">
+          {visibleSteps.map((step, index) => <li className={`step-${step.status}`} key={step.id}>
+            <span className="plan-step-marker">{planStepMarker(step.status, index + 1)}</span><strong>{step.description}</strong><span>{t(step.status)}</span>
+          </li>)}
+        </ol>
+        {steps.length > visibleSteps.length && <p className="plan-summary-overflow">{t("{count} more step(s) in Activity", { count: steps.length - visibleSteps.length })}</p>}
+      </>}
+    </article>;
+  }
+
+  if (plan.planning) {
+    return <article className="plan-card plan-planning">
+      <header className="plan-header"><div><span className="plan-eyebrow">{t("Execution plan")}</span><strong>{t("Creating execution plan...")}</strong><small>{plan.goal}</small></div><span className="plan-overall">{t("Working")}</span></header>
+      <pre className="plan-planning-stream">{plan.planningText || t("Waiting for the planner stream...")}<span className="streaming-caret" aria-label={t("Streaming response")} /></pre>
+    </article>;
+  }
 
   return <article className={`plan-card plan-${overall.toLowerCase().replace(" ", "-")}`}>
     <header className="plan-header">
@@ -3357,6 +5087,7 @@ function PlanCard({ plan, t }: { plan: PlanTranscriptEntry; t: Translator }) {
         <div className="plan-step-body">
           <div className="plan-step-heading"><span className="plan-step-type">{t(step.task_type.replace("_", " "))}</span><strong>{step.description}</strong></div>
           {step.dependencies.length > 0 && <small>{t("Depends on {dependencies}", { dependencies: step.dependencies.join(", ") })}</small>}
+          {step.streaming && step.streamText && <p className="plan-step-stream">{step.streamText}<span className="streaming-caret" aria-label={t("Streaming response")} /></p>}
           {(step.resultPreview || step.error) && <p>{step.resultPreview || step.error}</p>}
         </div>
         <span className="plan-step-status">{t(step.status)}</span>
@@ -3422,6 +5153,16 @@ function completeAssistantStream(
     entryIndex === index && entry.kind === "assistant"
       ? { ...entry, text: content, streaming: false }
       : entry
+  ));
+}
+
+function removeUnappliedAssistantAnswer(
+  entries: TranscriptEntry[],
+  taskId: string | undefined,
+): TranscriptEntry[] {
+  if (!taskId) return entries;
+  return entries.filter((entry) => !(
+    entry.kind === "assistant" && entry.taskId === taskId
   ));
 }
 
@@ -3491,17 +5232,19 @@ function updateApprovalEntry(
 
 function settleInterruptedReplayEntries(
   entries: TranscriptEntry[],
-  recoveringTaskId: string | undefined,
+  retainedTaskId: string | undefined,
   t: Translator,
 ): TranscriptEntry[] {
   return entries.map((entry) => {
     if (entry.kind === "approval" && entry.status === "pending") {
+      if (retainedTaskId && entry.taskId === retainedTaskId) return entry;
       return { ...entry, status: "interrupted" };
     }
     if (
       entry.kind === "tool"
       && (entry.status === "running" || entry.status === "waiting_approval")
     ) {
+      if (retainedTaskId && entry.taskId === retainedTaskId) return entry;
       return {
         ...entry,
         status: "failed",
@@ -3511,7 +5254,7 @@ function settleInterruptedReplayEntries(
     if (
       entry.kind === "task-status"
       && entry.phase === "running"
-      && entry.taskId !== recoveringTaskId
+      && entry.taskId !== retainedTaskId
     ) {
       return {
         ...entry,
@@ -3540,6 +5283,149 @@ function updateToolStatus(
   ));
 }
 
+function teamAgentKey(name: string, teamTaskId: string) {
+  return `${name}::${teamTaskId}`;
+}
+
+function upsertTeamEntry(
+  entries: TranscriptEntry[],
+  next: TeamTranscriptEntry,
+): TranscriptEntry[] {
+  const index = entries.findIndex((entry) => entry.kind === "team" && entry.taskId === next.taskId);
+  if (index < 0) return [...entries, next];
+  return entries.map((entry, entryIndex) => entryIndex === index && entry.kind === "team"
+    ? {
+        ...entry,
+        ...next,
+        id: entry.id,
+        runId: next.runId || entry.runId,
+        workerCount: next.workerCount || entry.workerCount,
+        agents: next.agents.length ? next.agents : entry.agents,
+        timestamp: entry.timestamp ?? next.timestamp,
+      }
+    : entry);
+}
+
+function updateTeamAgent(
+  entries: TranscriptEntry[],
+  taskId: string,
+  runId: string,
+  agent: Omit<TeamAgentDialogue, "items">,
+  item?: TeamDialogueItem,
+): TranscriptEntry[] {
+  const existing = entries.find(
+    (entry): entry is TeamTranscriptEntry => entry.kind === "team" && entry.taskId === taskId,
+  );
+  const base: TeamTranscriptEntry = existing ?? {
+    id: `team-${taskId}`,
+    kind: "team",
+    taskId,
+    runId,
+    workerCount: 0,
+    phase: "running",
+    agents: [],
+    timestamp: item?.timestamp,
+  };
+  const agentIndex = base.agents.findIndex((candidate) => candidate.id === agent.id);
+  const previous = agentIndex < 0 ? undefined : base.agents[agentIndex];
+  const previousItems = previous?.items ?? [];
+  const activeStreamIndex = item?.kind === "message"
+    && item.direction === "outbound"
+    && !item.streaming
+    ? previousItems.findIndex((candidate) => (
+        candidate.kind === "message"
+        && candidate.direction === "outbound"
+        && candidate.streaming
+      ))
+    : -1;
+  const nextAgent: TeamAgentDialogue = {
+    ...previous,
+    ...agent,
+    items: !item
+      ? previousItems
+      : activeStreamIndex >= 0
+      ? previousItems.map((candidate, index) => index === activeStreamIndex
+          ? { ...item, id: candidate.id, timestamp: candidate.timestamp ?? item.timestamp, streaming: false }
+          : candidate)
+      : upsertTeamDialogueItem(previousItems, item),
+  };
+  const agents = agentIndex < 0
+    ? [...base.agents, nextAgent]
+    : base.agents.map((candidate, index) => index === agentIndex ? nextAgent : candidate);
+  return upsertTeamEntry(entries, { ...base, runId: runId || base.runId, agents });
+}
+
+function finishTeamRun(
+  entries: TranscriptEntry[],
+  taskId: string,
+  runId: string,
+  phase: TeamTranscriptEntry["phase"],
+  message: string,
+  timestamp: string,
+): TranscriptEntry[] {
+  const existing = entries.find(
+    (entry): entry is TeamTranscriptEntry => entry.kind === "team" && entry.taskId === taskId,
+  );
+  const pendingStatus: TeamAgentStatus = phase === "completed" ? "completed" : "failed";
+  const agents = (existing?.agents ?? []).map((agent) => (
+    agent.status === "working" || agent.status === "queued"
+      ? { ...agent, status: pendingStatus }
+      : agent
+  ));
+  return upsertTeamEntry(entries, {
+    id: existing?.id ?? `team-${taskId}`,
+    kind: "team",
+    taskId,
+    runId: runId || existing?.runId || "team",
+    workerCount: existing?.workerCount ?? 0,
+    phase,
+    message,
+    agents,
+    timestamp: existing?.timestamp ?? timestamp,
+  });
+}
+
+function upsertTeamDialogueItem(items: TeamDialogueItem[], next: TeamDialogueItem) {
+  const index = items.findIndex((item) => item.id === next.id);
+  if (index < 0) return [...items, next];
+  return items.map((item, itemIndex) => itemIndex === index
+    ? next.streaming && item.streaming
+      ? { ...item, ...next, content: `${item.content ?? ""}${next.content ?? ""}`, timestamp: item.timestamp ?? next.timestamp }
+      : { ...item, ...next, timestamp: item.timestamp ?? next.timestamp }
+    : item);
+}
+
+function applyTeamAgentDelta(
+  entries: TranscriptEntry[],
+  taskId: string,
+  agent: Omit<TeamAgentDialogue, "items">,
+  text: string,
+  reset: boolean,
+  timestamp: string,
+): TranscriptEntry[] {
+  const streamId = `team-stream-${agent.id}`;
+  if (reset) {
+    return entries.map((entry) => entry.kind === "team" && entry.taskId === taskId
+      ? {
+          ...entry,
+          agents: entry.agents.map((candidate) => candidate.id === agent.id
+            ? { ...candidate, items: candidate.items.filter((item) => item.id !== streamId) }
+            : candidate),
+        }
+      : entry);
+  }
+  if (!text) return entries;
+  return updateTeamAgent(entries, taskId, "", agent, {
+    id: streamId,
+    kind: "message",
+    direction: "outbound",
+    messageKind: "Reply",
+    content: text,
+    streaming: true,
+    timestamp,
+  });
+}
+
 function interruptOpenToolEntries(entries: TranscriptEntry[], t: Translator): TranscriptEntry[] {
   return entries.map((entry) => entry.kind === "tool"
     && (entry.status === "running" || entry.status === "waiting_approval")
@@ -3557,6 +5443,31 @@ function upsertPlanEntry(entries: TranscriptEntry[], next: PlanTranscriptEntry):
   return entries.map((entry, entryIndex) => entryIndex === index
     ? { ...next, id: entry.id, timestamp: entry.timestamp ?? next.timestamp }
     : entry);
+}
+
+function appendPlanPlanningDelta(
+  entries: TranscriptEntry[],
+  taskId: string | undefined,
+  text: string,
+): TranscriptEntry[] {
+  if (!taskId || !text) return entries;
+  return entries.map((entry) => entry.kind === "plan" && entry.taskId === taskId
+    ? { ...entry, planningText: `${entry.planningText ?? ""}${text}` }
+    : entry);
+}
+
+function appendPlanStepDelta(
+  entries: TranscriptEntry[],
+  taskId: string | undefined,
+  stepId: string,
+  text: string,
+) {
+  if (!text) return "";
+  const plan = entries.find(
+    (entry): entry is PlanTranscriptEntry => entry.kind === "plan" && (!taskId || entry.taskId === taskId),
+  );
+  const step = plan?.steps.find((candidate) => candidate.id === stepId);
+  return `${step?.streamText ?? ""}${text}`;
 }
 
 function updatePlanStep(
@@ -3665,7 +5576,7 @@ function sortTranscriptEntries(entries: TranscriptEntry[]): TranscriptEntry[] {
 function transcriptEntrySortPriority(entry: TranscriptEntry): number {
   if (entry.kind === "user") return 0;
   if (entry.kind === "task-status") return 1;
-  if (entry.kind === "thinking" || entry.kind === "tool" || entry.kind === "approval" || entry.kind === "plan") {
+  if (entry.kind === "thinking" || entry.kind === "tool" || entry.kind === "approval" || entry.kind === "plan" || entry.kind === "team") {
     return 2;
   }
   return 3;
@@ -3696,6 +5607,11 @@ function briefThinkingSummary(value: string, t: Translator = (message) => messag
   return bounded.length > 140 ? `${bounded.slice(0, 137)}...` : bounded;
 }
 
+function hasSessionDraft(sessionId: string) {
+  const draft = sessionDraftStore.get(sessionId);
+  return Boolean(draft && (draft.prompt.trim() || draft.attachments.length > 0));
+}
+
 function formatElapsed(milliseconds: number) {
   const totalSeconds = Math.max(0, Math.floor(milliseconds / 1000));
   const hours = Math.floor(totalSeconds / 3600);
@@ -3709,7 +5625,7 @@ function formatElapsed(milliseconds: number) {
 
 function groupTranscriptEntries(entries: TranscriptEntry[]): TranscriptGroup[] {
   const groups: TranscriptGroup[] = [];
-  for (const entry of entries) {
+  for (const entry of orderTerminalTaskSummaries(entries)) {
     if (entry.kind === "task-status") {
       groups.push({ id: entry.id, kind: "task-status", entry });
       continue;
@@ -3727,9 +5643,22 @@ function groupTranscriptEntries(entries: TranscriptEntry[]): TranscriptGroup[] {
       groups.push({ id: entry.id, kind: "plan", entry });
       continue;
     }
+    if (entry.kind === "team") {
+      groups.push({ id: entry.id, kind: "team", entry });
+      continue;
+    }
     groups.push({ id: entry.id, kind: "message", entry });
   }
   return groups;
+}
+
+/** Pending approvals stay actionable in the transcript; resolved records move to Activity. */
+function isSidebarActivityEntry(entry: TranscriptEntry): entry is SidebarActivityEntry {
+  if (entry.kind === "approval") return entry.status !== "pending";
+  return entry.kind === "thinking"
+    || entry.kind === "tool"
+    || entry.kind === "plan"
+    || entry.kind === "team";
 }
 
 function contextPercent(usage: UsageView) {

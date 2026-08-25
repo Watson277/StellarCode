@@ -1,3 +1,5 @@
+"""Plan-and-Execute coordinator that turns a validated DAG into bounded workers."""
+
 from __future__ import annotations
 
 from collections.abc import Callable
@@ -12,6 +14,7 @@ from stellarcode.memory import MemoryManager
 from stellarcode.plan.execution_plan import ExecutionPlan, PlanValidationError
 from stellarcode.plan.planner import Planner
 from stellarcode.plan.task import Task, TaskStatus
+from stellarcode.prompt import PromptAssembler, PromptMode
 from stellarcode.skill import SkillContextBuffer, SkillRegistry
 from stellarcode.tools import ToolRegistry
 
@@ -30,6 +33,8 @@ class PlanExecuteAgent:
         workspace: str | Path | None = None,
         event_callback: Callable[[str, dict[str, object]], None] | None = None,
         context_window: int = 200_000,
+        rag_auto_retrieval: bool | None = True,
+        prompt_assembler: PromptAssembler | None = None,
     ) -> None:
         if max_parallel_tasks < 1:
             raise ValueError("max_parallel_tasks must be at least 1.")
@@ -42,9 +47,15 @@ class PlanExecuteAgent:
         self.skill_registry = skill_registry
         self.skill_context_buffer = skill_context_buffer
         self.workspace = Path(workspace or ".").resolve()
-        self.planner = Planner(llm_client, self.workspace)
+        self.prompt_assembler = prompt_assembler or PromptAssembler()
+        self.planner = Planner(
+            llm_client,
+            self.workspace,
+            prompt_assembler=self.prompt_assembler,
+        )
         self.event_callback = event_callback
         self.context_window = context_window
+        self.rag_auto_retrieval = rag_auto_retrieval
 
     def run(
         self,
@@ -52,7 +63,12 @@ class PlanExecuteAgent:
         cancellation_event: threading.Event | None = None,
     ) -> str:
         self._emit_progress("[Planner] Creating an execution plan")
-        plan = self.planner.create_plan(user_input, cancellation_event)
+        self._emit_event("plan.planning.started", {"goal": user_input})
+        plan = self.planner.create_plan(
+            user_input,
+            cancellation_event,
+            on_delta=lambda text: self._emit_event("plan.planning.delta", {"text": text}),
+        )
         return self.execute_plan(plan, cancellation_event)
 
     def execute_plan(
@@ -62,8 +78,10 @@ class PlanExecuteAgent:
     ) -> str:
         raise_if_cancelled(cancellation_event)
         try:
+            # Linear order is DFS-compatible presentation/prompt order; batches
+            # are a separate Kahn-style scheduling view for safe parallel work.
+            plan.compute_execution_order()
             batches = plan.execution_batches()
-            plan.execution_order = [task.id for batch in batches for task in batch]
         except PlanValidationError as exc:
             plan.mark_failed()
             return f"Plan validation failed: {exc}"
@@ -122,9 +140,7 @@ class PlanExecuteAgent:
                         {"step_id": task.id, "error": error},
                     )
                     pending_before = {
-                        item.id
-                        for item in plan.tasks.values()
-                        if item.status == TaskStatus.PENDING
+                        item.id for item in plan.tasks.values() if item.status == TaskStatus.PENDING
                     }
                     plan.skip_blocked_tasks(task.id)
                     for skipped_id in pending_before:
@@ -159,8 +175,13 @@ class PlanExecuteAgent:
             workspace=self.workspace,
             event_callback=self.event_callback,
             context_window=self.context_window,
+            rag_auto_retrieval=self.rag_auto_retrieval,
             llm_operation_name="plan-step",
-            stream_output=False,
+            stream_output=True,
+            delta_event_type="plan.step.delta",
+            delta_event_data={"step_id": task.id},
+            prompt_mode=PromptMode.PLAN_EXECUTOR,
+            prompt_assembler=self.prompt_assembler,
         )
         return agent.run(_task_prompt(plan, task), cancellation_event)
 
@@ -189,10 +210,7 @@ class PlanExecuteAgent:
             max_workers=parallelism,
             thread_name_prefix="stellarcode-plan",
         ) as executor:
-            futures = [
-                executor.submit(copy_context().run, execute_task, task)
-                for task in tasks
-            ]
+            futures = [executor.submit(copy_context().run, execute_task, task) for task in tasks]
             outcomes = []
             for task, future in zip(tasks, futures):
                 try:

@@ -1,3 +1,9 @@
+/**
+ * TypeScript mirror of the Python RuntimeEvent protocol.
+ *
+ * Keep additions backward-compatible: the desktop may reconnect to an existing Python
+ * Sidecar and reconstruct UI state from journaled events created before a frontend update.
+ */
 export const RUNTIME_PROTOCOL_VERSION = 1 as const;
 
 export type AgentMode = "react" | "plan" | "team";
@@ -38,6 +44,24 @@ export interface SkillInfo {
   enabled: boolean;
   skill_md_path: string;
   references_path?: string | null;
+  builtin?: boolean;
+  builtin_version?: string;
+  builtin_hash?: string;
+  installed_version?: string;
+  installed_hash?: string;
+  current_version?: string | null;
+  current_hash?: string;
+  customized?: boolean;
+  update_available?: boolean;
+  update_acknowledged?: boolean;
+  upgrade_state?:
+    | "not_bundled"
+    | "current"
+    | "customized"
+    | "update_available"
+    | "custom_kept"
+    | "error";
+  error?: string;
 }
 
 export interface SkillDetail extends SkillInfo {
@@ -48,10 +72,24 @@ export interface SkillSnapshot {
   skills: SkillInfo[];
   total_count: number;
   enabled_count: number;
+  bundled_count?: number;
+  updates_available?: number;
   warnings: string[];
   state_path: string;
   user_dir: string;
   project_dir: string;
+}
+
+export interface SkillDiff {
+  name: string;
+  diff: string;
+  truncated: boolean;
+  additions: number;
+  deletions: number;
+  current_hash: string;
+  builtin_hash: string;
+  current_version?: string | null;
+  builtin_version: string;
 }
 
 export type SkillInstallScope = "user" | "project";
@@ -281,6 +319,10 @@ export interface TaskChangeSet {
   rolled_back: boolean;
   rollback_state?: "idle" | "in_progress" | "completed" | "failed" | "recovery_failed" | string;
   rollback_recovery_event_pending?: boolean;
+  worktree_isolated?: boolean;
+  worktree_path?: string;
+  merge_state?: "active" | "applying" | "merged" | "conflict" | "not_isolated" | string;
+  merge_conflict?: boolean;
   error?: string;
   created_at?: string | null;
   completed_at?: string | null;
@@ -344,6 +386,35 @@ export interface HistorySnapshot {
   context_window: number;
 }
 
+export interface PromptMetricSnapshot {
+  char_count: number;
+  estimated_tokens: number;
+  sha256: string;
+}
+
+export interface PromptLayerSnapshot extends PromptMetricSnapshot {
+  name: string;
+  role: "system" | "user" | string;
+  sensitive: boolean;
+  content_hidden: boolean;
+  content: string;
+}
+
+export interface PromptSnapshot {
+  available: boolean;
+  version: string;
+  mode: string;
+  requested_mode?: AgentMode;
+  generated_at: string;
+  session_id?: string;
+  conversation_title?: string;
+  total: PromptMetricSnapshot;
+  system: PromptMetricSnapshot;
+  layers: PromptLayerSnapshot[];
+  memory_hidden: boolean;
+  assembled_preview: string;
+}
+
 export interface ConversationSummary {
   id: string;
   title: string;
@@ -363,6 +434,7 @@ export interface ConversationTranscriptEntry {
   role: "user" | "assistant" | "plan";
   content: string;
   timestamp: string;
+  task_id?: string;
   attachments?: RuntimeAttachment[];
   plan?: ConversationPlanSnapshot;
 }
@@ -429,6 +501,66 @@ export interface RuntimeEventDataMap {
     status: "started" | "active" | "finished";
     summary?: string;
   };
+  "plan.planning.started": {
+    goal: string;
+  };
+  "plan.planning.delta": {
+    text: string;
+  };
+  "team.run.started": {
+    run_id: string;
+    worker_count: number;
+  };
+  "team.run.completed": {
+    run_id: string;
+    message: string;
+  };
+  "team.run.failed": {
+    run_id: string;
+    message: string;
+  };
+  "team.agent.status": {
+    run_id: string;
+    agent_name: string;
+    agent_role: "planner" | "worker" | "reviewer" | string;
+    team_task_id: string;
+    status: "queued" | "working" | "completed" | "failed";
+  };
+  "team.agent.message": {
+    run_id: string;
+    agent_name: string;
+    agent_role: "planner" | "worker" | "reviewer" | string;
+    team_task_id: string;
+    direction: "inbound" | "outbound";
+    message_kind: string;
+    content: string;
+  };
+  "team.agent.delta": {
+    agent_name: string;
+    agent_role: "planner" | "worker" | "reviewer" | string;
+    team_task_id: string;
+    text: string;
+    reset?: boolean;
+  };
+  "team.agent.tool.started": {
+    agent_name: string;
+    agent_role: "planner" | "worker" | "reviewer" | string;
+    team_task_id: string;
+    tool_call_id: string;
+    name: string;
+    arguments: Record<string, unknown>;
+  };
+  "team.agent.tool.completed": {
+    agent_name: string;
+    agent_role: "planner" | "worker" | "reviewer" | string;
+    team_task_id: string;
+    tool_call_id: string;
+    name: string;
+    result_preview: string;
+    elapsed_ms: number;
+    success: boolean;
+    timed_out: boolean;
+  };
   "tool.started": ToolDescriptor & {
     iteration: number;
   };
@@ -471,6 +603,11 @@ export interface RuntimeEventDataMap {
   "plan.step.started": {
     step_id: string;
     worker?: string;
+  };
+  "plan.step.delta": {
+    step_id: string;
+    text: string;
+    reset?: boolean;
   };
   "plan.step.completed": {
     step_id: string;
@@ -627,103 +764,248 @@ export type RuntimeEvent = {
   [T in RuntimeEventType]: RuntimeEventEnvelope<T>;
 }[RuntimeEventType];
 
+export interface ProjectRequestContext {
+  project_id?: string;
+}
+
+type ProjectScoped<T extends object> = T & ProjectRequestContext;
+
 export interface RuntimeRequestDataMap {
   "runtime.ping": Record<string, never>;
   "workspace.open": {
     project_id: string;
     workspace: string;
   };
-  "workspace.close": Record<string, never>;
-  "runtime.set_access_mode": { mode: AccessMode };
-  "session.list": Record<string, never>;
-  "session.create": {
+  "workspace.close": ProjectRequestContext;
+  "runtime.set_access_mode": ProjectScoped<{ session_id: string; mode: AccessMode }>;
+  "session.list": ProjectRequestContext;
+  "session.create": ProjectScoped<{
     mode: AgentMode;
     title?: string;
-  };
-  "session.open": { session_id: string };
-  "session.rename": { session_id: string; title: string };
-  "session.delete": { session_id: string };
-  "session.reset": {
+  }>;
+  "session.open": ProjectScoped<{ session_id: string }>;
+  "session.rename": ProjectScoped<{ session_id: string; title: string }>;
+  "session.delete": ProjectScoped<{ session_id: string }>;
+  "session.reset": ProjectScoped<{
     session_id: string;
-  };
-  "session.set_mode": {
+  }>;
+  "session.set_mode": ProjectScoped<{
     session_id: string;
     mode: AgentMode;
-  };
-  "session.set_trace": {
+  }>;
+  "session.set_trace": ProjectScoped<{
     session_id: string;
     enabled: boolean;
-  };
-  "mcp.list": Record<string, never>;
-  "mcp.install": {
+  }>;
+  "prompt.snapshot": ProjectScoped<{
+    session_id: string;
+    include_memory?: boolean;
+  }>;
+  "mcp.list": ProjectRequestContext;
+  "mcp.install": ProjectScoped<{
     name: string;
     config: McpInstallConfig;
     overwrite?: boolean;
     confirmed?: boolean;
-  };
-  "mcp.set_enabled": { name: string; enabled: boolean };
-  "mcp.restart": { name: string };
-  "mcp.remove": { name: string };
-  "mcp.logs": { name: string };
-  "rag.snapshot": Record<string, never>;
-  "rag.add_sources": { paths: string[] };
-  "rag.remove_source": { path: string };
-  "rag.index": Record<string, never>;
-  "rag.clear": { confirmed: boolean };
-  "memory.list": { query?: string; limit?: number };
-  "memory.save": { content: string };
-  "memory.delete": { id: string };
-  "memory.clear": { confirmed: boolean };
-  "skill.list": Record<string, never>;
-  "skill.get": { name: string };
-  "skill.set_enabled": { name: string; enabled: boolean };
-  "skill.reload": Record<string, never>;
-  "browser.snapshot": Record<string, never>;
-  "browser.probe": { port: number };
-  "browser.connect": { port?: number; confirmed: boolean };
-  "browser.disconnect": { confirmed: boolean };
-  "browser.tabs": Record<string, never>;
-  "diagnostics.snapshot": Record<string, never>;
-  "diagnostics.run": { profile: "safe" | "build"; confirmed?: boolean };
-  "diagnostics.cancel": { run_id: string };
-  "event.replay": {
+  }>;
+  "mcp.set_enabled": ProjectScoped<{ name: string; enabled: boolean }>;
+  "mcp.restart": ProjectScoped<{ name: string }>;
+  "mcp.remove": ProjectScoped<{ name: string }>;
+  "mcp.logs": ProjectScoped<{ name: string }>;
+  "rag.snapshot": ProjectRequestContext;
+  "rag.add_sources": ProjectScoped<{ paths: string[] }>;
+  "rag.remove_source": ProjectScoped<{ path: string }>;
+  "rag.index": ProjectRequestContext;
+  "rag.clear": ProjectScoped<{ confirmed: boolean }>;
+  "memory.list": ProjectScoped<{ query?: string; limit?: number }>;
+  "memory.save": ProjectScoped<{ content: string }>;
+  "memory.delete": ProjectScoped<{ id: string }>;
+  "memory.clear": ProjectScoped<{ confirmed: boolean }>;
+  "skill.list": ProjectRequestContext;
+  "skill.get": ProjectScoped<{ name: string }>;
+  "skill.diff": ProjectScoped<{ name: string; max_chars?: number }>;
+  "skill.set_enabled": ProjectScoped<{ name: string; enabled: boolean }>;
+  "skill.reload": ProjectRequestContext;
+  "skill.update": ProjectScoped<{
+    name: string;
+    current_hash: string;
+    builtin_hash: string;
+    confirmed: boolean;
+  }>;
+  "skill.keep_custom": ProjectScoped<{
+    name: string;
+    current_hash: string;
+    builtin_hash: string;
+  }>;
+  "skill.restore_default": ProjectScoped<{
+    name: string;
+    current_hash: string;
+    builtin_hash: string;
+    confirmed: boolean;
+  }>;
+  "browser.snapshot": ProjectRequestContext;
+  "browser.probe": ProjectScoped<{ port: number }>;
+  "browser.connect": ProjectScoped<{ port?: number; confirmed: boolean }>;
+  "browser.disconnect": ProjectScoped<{ confirmed: boolean }>;
+  "browser.tabs": ProjectRequestContext;
+  "diagnostics.snapshot": ProjectRequestContext;
+  "diagnostics.run": ProjectScoped<{ profile: "safe" | "build"; confirmed?: boolean }>;
+  "diagnostics.cancel": ProjectScoped<{ run_id: string }>;
+  "event.replay": ProjectScoped<{
     session_id: string;
     after_sequence: number;
     limit?: number;
     event_types?: RuntimeEventType[];
-  };
-  "task.submit": {
+  }>;
+  "task.submit": ProjectScoped<{
     session_id: string;
     prompt: string;
     attachments?: RuntimeAttachment[];
-  };
-  "task.recover": {
+  }>;
+  "task.recover": ProjectScoped<{
     session_id: string;
     task_id: string;
-  };
-  "task.cancel": {
+  }>;
+  "task.cancel": ProjectScoped<{
     session_id: string;
     task_id: string;
-  };
-  "task.diff": {
+  }>;
+  "task.diff": ProjectScoped<{
     session_id: string;
     task_id: string;
     max_chars?: number;
-  };
-  "task.rollback": {
+  }>;
+  "task.rollback": ProjectScoped<{
     session_id: string;
     task_id: string;
     snapshot_id: string;
     confirmed: boolean;
-  };
-  "approval.resolve": {
+  }>;
+  "approval.resolve": ProjectScoped<{
     session_id: string;
     task_id: string;
     approval_id: string;
     decision: ApprovalDecision;
     effective_arguments?: Record<string, unknown>;
-  };
+  }>;
   "runtime.shutdown": Record<string, never>;
+}
+
+export interface EmptyRuntimeResult extends Record<string, never> {}
+
+export interface WorkspaceOpenResult {
+  project_id: string;
+  workspace: string;
+  provider: string;
+  model: string;
+  conversation_count: number;
+  access_mode: AccessMode;
+  recovery?: RuntimeRecoveryTask | null;
+  recoveries?: RuntimeRecoveryTask[];
+  active_tasks?: Array<{
+    task_id: string;
+    session_id: string;
+    phase: string;
+  }>;
+}
+
+export interface SessionSnapshotResult extends ConversationSummary {
+  session_id?: string;
+  provider?: string;
+  model?: string;
+  project_id?: string;
+  workspace?: string;
+  transcript: ConversationTranscriptEntry[];
+}
+
+export interface EventReplayResult {
+  events: RuntimeEvent[];
+  last_sequence: number;
+  has_more: boolean;
+}
+
+export interface TaskAcceptedResult {
+  task_id: string;
+  accepted?: boolean;
+  recovery_attempt?: number;
+}
+
+export interface TaskCancelResult {
+  task_id: string;
+  accepted: boolean;
+}
+
+export interface McpLogsResult {
+  name: string;
+  logs: string;
+}
+
+export interface BrowserMutationResult {
+  message: string;
+  snapshot: BrowserSnapshot;
+}
+
+/**
+ * Result counterpart to RuntimeRequestDataMap.
+ *
+ * Keeping this map next to the wire protocol makes RuntimeClient.request() infer both
+ * request parameters and response data from the method literal.  New protocol methods
+ * must be added to both maps, so an untyped management response cannot silently leak
+ * back into the UI.
+ */
+export interface RuntimeResponseDataMap {
+  "runtime.ping": { runtime_version: string };
+  "workspace.open": WorkspaceOpenResult;
+  "workspace.close": EmptyRuntimeResult;
+  "runtime.set_access_mode": { session_id: string; mode: AccessMode };
+  "session.list": { conversations: ConversationSummary[] };
+  "session.create": SessionSnapshotResult;
+  "session.open": SessionSnapshotResult;
+  "session.rename": ConversationSummary;
+  "session.delete": ConversationSummary;
+  "session.reset": { cleared_message_count: number };
+  "session.set_mode": { mode: AgentMode };
+  "session.set_trace": { enabled: boolean; path?: string | null };
+  "prompt.snapshot": PromptSnapshot;
+  "mcp.list": McpSnapshot;
+  "mcp.install": McpSnapshot;
+  "mcp.set_enabled": McpSnapshot;
+  "mcp.restart": McpSnapshot;
+  "mcp.remove": McpSnapshot;
+  "mcp.logs": McpLogsResult;
+  "rag.snapshot": RagSnapshot;
+  "rag.add_sources": RagSnapshot;
+  "rag.remove_source": RagSnapshot;
+  "rag.index": RagSnapshot;
+  "rag.clear": RagSnapshot;
+  "memory.list": MemorySnapshot;
+  "memory.save": MemorySnapshot;
+  "memory.delete": MemorySnapshot;
+  "memory.clear": MemorySnapshot;
+  "skill.list": SkillSnapshot;
+  "skill.get": SkillDetail;
+  "skill.diff": SkillDiff;
+  "skill.set_enabled": SkillSnapshot;
+  "skill.reload": SkillSnapshot;
+  "skill.update": SkillSnapshot;
+  "skill.keep_custom": SkillSnapshot;
+  "skill.restore_default": SkillSnapshot;
+  "browser.snapshot": BrowserSnapshot;
+  "browser.probe": BrowserProbeSnapshot;
+  "browser.connect": BrowserMutationResult;
+  "browser.disconnect": BrowserMutationResult;
+  "browser.tabs": { output: string };
+  "diagnostics.snapshot": DiagnosticsSnapshot;
+  "diagnostics.run": DiagnosticsSnapshot;
+  "diagnostics.cancel": DiagnosticsSnapshot;
+  "event.replay": EventReplayResult;
+  "task.submit": TaskAcceptedResult;
+  "task.recover": TaskAcceptedResult;
+  "task.cancel": TaskCancelResult;
+  "task.diff": TaskDiffResult;
+  "task.rollback": TaskChangeSet;
+  "approval.resolve": EmptyRuntimeResult;
+  "runtime.shutdown": EmptyRuntimeResult;
 }
 
 export type RuntimeRequestType = keyof RuntimeRequestDataMap;

@@ -1,3 +1,5 @@
+"""Thread-safe JSON-RPC request/response correlation for MCP transports."""
+
 from __future__ import annotations
 
 import threading

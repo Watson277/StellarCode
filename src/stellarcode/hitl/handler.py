@@ -1,3 +1,5 @@
+"""Human-in-the-loop approval interface and blocking decision synchronization."""
+
 from __future__ import annotations
 
 import json

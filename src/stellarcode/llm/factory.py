@@ -1,3 +1,5 @@
+"""Create the configured text/vision provider without leaking provider details upward."""
+
 from __future__ import annotations
 
 import os

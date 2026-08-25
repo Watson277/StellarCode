@@ -6,6 +6,13 @@
   "scripts": {
     "dev": "vite",
     "build": "tsc && vite build",
+    "test:runtime-machine": "node scripts/test-runtime-machine.mjs",
+    "test:runtime-supervision": "node scripts/test-runtime-supervision.mjs",
+    "test:session-drafts": "node scripts/test-session-draft-store.mjs",
+    "test:diff-parser": "node scripts/test-diff-parser.mjs",
+    "test:workspace-layout": "node scripts/test-workspace-layout.mjs",
+    "test:code-answer": "node scripts/test-code-answer.mjs",
+    "test:transcript-order": "node scripts/test-transcript-order.mjs",
     "preview": "vite preview",
     "tauri": "tauri"
   },
@@ -13,6 +20,7 @@
     "@tauri-apps/api": "^2",
     "@tauri-apps/plugin-dialog": "^2",
     "@tauri-apps/plugin-opener": "^2",
+    "highlight.js": "^11.11.1",
     "react": "^19.1.0",
     "react-dom": "^19.1.0",
     "react-markdown": "^10.1.0",

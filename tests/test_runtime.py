@@ -10,9 +10,15 @@ import pytest
 
 from stellarcode.cancellation import TaskCancelledError
 from stellarcode.hitl import ApprovalRequest, Decision
+from stellarcode.llm.types import llm_runtime_scope
 from stellarcode.memory import ProjectMemoryService
-from stellarcode.runtime.core import RuntimeSession, _record_plan_event
-from stellarcode.runtime.hitl import RuntimeHitlHandler
+from stellarcode.runtime.core import (
+    RuntimeSession,
+    _record_plan_event,
+    _task_workspace_prompt_context,
+    _transcript_entry,
+)
+from stellarcode.runtime.hitl import RuntimeHitlHandler, task_approval_scope
 from stellarcode.runtime.protocol import (
     PROTOCOL_VERSION,
     JsonLineWriter,
@@ -26,6 +32,34 @@ from stellarcode.runtime.sidecar import (
     create_parser,
 )
 from stellarcode.trace import TraceRecorder
+
+
+def test_transcript_entry_persists_task_identity_for_assistant_answers():
+    entry = _transcript_entry("assistant", "done", task_id="task-one")
+
+    assert entry["role"] == "assistant"
+    assert entry["content"] == "done"
+    assert entry["task_id"] == "task-one"
+
+
+def test_task_workspace_prompt_context_distinguishes_canonical_and_ephemeral_paths(
+    tmp_path,
+):
+    project = tmp_path / "project"
+    worktree = tmp_path / "runtime" / "w" / "abcd1234"
+
+    context = _task_workspace_prompt_context(project, worktree)
+
+    assert (
+        f"canonical_project_root={json.dumps(str(project.resolve()), ensure_ascii=False)}"
+        in context
+    )
+    assert (
+        f"ephemeral_task_worktree={json.dumps(str(worktree.resolve()), ensure_ascii=False)}"
+        in context
+    )
+    assert "never ephemeral_task_worktree" in context
+    assert "Do not start detached/background processes" in context
 
 
 def test_runtime_conversations_share_only_project_long_term_memory(tmp_path):
@@ -42,6 +76,7 @@ def test_runtime_conversations_share_only_project_long_term_memory(tmp_path):
         plan_workers=1,
         team_workers=1,
         team_retries=0,
+        rag_auto_retrieval=False,
     )
 
     def create(identifier: str):
@@ -63,6 +98,10 @@ def test_runtime_conversations_share_only_project_long_term_memory(tmp_path):
     assert first.memory_manager is first.agent.memory_manager
     assert first.memory_manager is first.plan_agent.memory_manager
     assert first.memory_manager is first.team_agent.memory_manager
+    assert first.agent.rag_auto_retrieval is False
+    assert first.plan_agent.rag_auto_retrieval is False
+    assert first.team_agent.rag_auto_retrieval is False
+    assert first.team_agent.workers[0].rag_auto_retrieval is False
     assert first.memory_manager is not second.memory_manager
     assert first.memory_manager.short_term is not second.memory_manager.short_term
     assert first.memory_manager.token_budget is not second.memory_manager.token_budget
@@ -73,6 +112,27 @@ def test_runtime_conversations_share_only_project_long_term_memory(tmp_path):
     assert [entry.content for entry in second.memory_manager.search("project formatter")] == [
         "All conversations use the same project formatter"
     ]
+
+
+def test_task_approval_scope_is_isolated_between_concurrent_conversations():
+    handler = RuntimeHitlHandler(lambda _event_type, _data: None, enabled=True)
+    barrier = threading.Barrier(2)
+    results: dict[str, bool] = {}
+
+    def observe(name: str, access_mode: str) -> None:
+        with task_approval_scope(access_mode):
+            barrier.wait(timeout=2)
+            results[name] = handler.is_enabled()
+
+    restricted = threading.Thread(target=observe, args=("restricted", "restricted"))
+    full_access = threading.Thread(target=observe, args=("full", "full-access"))
+    restricted.start()
+    full_access.start()
+    restricted.join(timeout=2)
+    full_access.join(timeout=2)
+
+    assert results == {"restricted": True, "full": False}
+    assert handler.is_enabled() is True
 
 
 def test_desktop_keeps_active_finalize_pending_recovery_visible():
@@ -129,6 +189,12 @@ def test_sidecar_parser_accepts_structured_lsp_configuration():
     assert args.diagnostics_lsp_command == r"C:\\Tools\\python-lsp.exe"
     assert json.loads(args.diagnostics_lsp_args_json) == ["--stdio", "--log-level=warning"]
     assert args.diagnostics_lsp_timeout == 30
+
+
+def test_sidecar_parser_accepts_custom_worktree_directory():
+    args = create_parser().parse_args(["--worktree-dir", r"E:\\StellarCodeTemp"])
+
+    assert args.worktree_dir == r"E:\\StellarCodeTemp"
 
 
 def test_runtime_event_journal_continues_sequences_and_replays_after_restart(tmp_path):
@@ -522,6 +588,57 @@ def test_pending_finalization_reuses_the_persisted_post_snapshot(tmp_path):
     assert runtime.task_checkpoints.load()["checkpoint_stage"] == "workspace_finalized"
 
 
+def test_worktree_merge_conflict_converts_completed_intent_to_failed(tmp_path):
+    runtime = object.__new__(RuntimeSession)
+    runtime.task_checkpoints = TaskCheckpointStore(tmp_path / "active-task.json")
+    runtime.task_checkpoints.write(
+        {
+            "task_id": "task-conflict",
+            "session_id": "session-one",
+            "status": "finalize_pending",
+            "checkpoint_stage": "terminal_intent_recorded",
+            "terminal_outcome": "completed",
+            "terminal_data": {"status": "completed", "elapsed_ms": 42},
+            "answer": "Successfully wrote guide.md",
+        }
+    )
+    saved: list[list[dict]] = []
+    memory_messages: list[str] = []
+    conversation = SimpleNamespace(
+        transcript=[
+            {"role": "user", "content": "write guide"},
+            {"role": "assistant", "content": "Successfully wrote guide.md"},
+        ],
+        agent=SimpleNamespace(messages=[]),
+        memory_manager=SimpleNamespace(add_assistant_message=memory_messages.append),
+        updated_at="",
+    )
+    runtime.conversations = {"session-one": conversation}
+    runtime._save_conversation = lambda value: saved.append(list(value.transcript))
+    runtime.finalize_task_changes = lambda _task_id, _outcome: {  # type: ignore[method-assign]
+        "task_id": "task-conflict",
+        "status": "failed",
+        "merge_conflict": True,
+        "error": "same lines changed; worktree retained",
+        "changed_files": [],
+    }
+
+    outcome, terminal = runtime.finalize_pending_task("task-conflict", "session-one")
+
+    assert outcome == "failed"
+    assert terminal["status"] == "failed"
+    assert terminal["error_code"] == "worktree_merge_conflict"
+    assert terminal["recoverable"] is False
+    assert "worktree retained" in terminal["message"]
+    checkpoint = runtime.task_checkpoints.load("task-conflict")
+    assert checkpoint is not None
+    assert checkpoint["terminal_outcome"] == "failed"
+    assert conversation.transcript == [{"role": "user", "content": "write guide"}]
+    assert "were not applied" in conversation.agent.messages[-1]["content"]
+    assert "were not applied" in memory_messages[-1]
+    assert saved[-1] == conversation.transcript
+
+
 def test_terminal_journal_is_commit_point_even_if_transport_fails(tmp_path):
     journal = EventJournal(tmp_path / "events.jsonl")
     completed: list[str] = []
@@ -726,16 +843,81 @@ def test_runtime_hitl_waits_for_and_applies_desktop_decision():
     assert events[0][0] == "approval.requested"
     assert events[0][1]["tool_call_id"] == "call-pytest"
     approval_id = events[0][1]["approval_id"]
-    assert handler.resolve(
-        approval_id,
-        "approve",
-        before_release=lambda: release_order.append("journaled"),
-    ) is True
+    assert (
+        handler.resolve(
+            approval_id,
+            "approve",
+            before_release=lambda: release_order.append("journaled"),
+        )
+        is True
+    )
     thread.join(1)
 
     assert result_holder[0].decision == Decision.APPROVED
     assert release_order == ["journaled", "released"]
     assert handler.resolve(approval_id, "approve") is False
+
+
+def test_runtime_hitl_cancelled_approval_cannot_be_reapproved():
+    events: list[tuple[str, dict]] = []
+    requested = threading.Event()
+
+    def emit(event_type: str, data: dict) -> None:
+        events.append((event_type, data))
+        requested.set()
+
+    handler = RuntimeHitlHandler(emit)
+    results = []
+    request = ApprovalRequest.create(
+        "execute_command",
+        '{"command":"pytest -q"}',
+        tool_call_id="call-cancelled",
+    )
+
+    def wait_for_approval() -> None:
+        with llm_runtime_scope("session-one", "task-one"):
+            results.append(handler.request_approval(request))
+
+    thread = threading.Thread(target=wait_for_approval)
+    thread.start()
+    assert requested.wait(1)
+    approval_id = events[0][1]["approval_id"]
+
+    handler.reject_task("task-one", "Task cancelled by user.")
+
+    assert handler.resolve(approval_id, "approve") is False
+    assert handler.context(approval_id) is None
+    thread.join(1)
+    assert not thread.is_alive()
+    assert results[0].decision == Decision.REJECTED
+    assert results[0].reason == "Task cancelled by user."
+
+
+def test_runtime_hitl_does_not_enqueue_approval_cancelled_during_registration():
+    checks = 0
+    events: list[tuple[str, dict]] = []
+
+    def is_cancelled(_task_id: str) -> bool:
+        nonlocal checks
+        checks += 1
+        return checks >= 2
+
+    handler = RuntimeHitlHandler(
+        lambda event_type, data: events.append((event_type, data)),
+        is_task_cancelled=is_cancelled,
+    )
+    request = ApprovalRequest.create(
+        "execute_command",
+        '{"command":"pytest -q"}',
+        tool_call_id="call-racing-cancel",
+    )
+
+    with llm_runtime_scope("session-one", "task-one"):
+        result = handler.request_approval(request)
+
+    assert result.decision == Decision.REJECTED
+    assert result.reason == "Task cancelled by user."
+    assert events == []
 
 
 def test_runtime_reset_persists_the_current_event_floor(tmp_path):
@@ -806,6 +988,40 @@ def test_sidecar_rejects_approval_resolution_for_another_task(tmp_path):
     assert messages[-1]["error"]["code"] == "approval_context_mismatch"
 
 
+@pytest.mark.parametrize("phase", ["cancelling", "finalizing"])
+def test_sidecar_rejects_approval_resolution_for_non_running_task(tmp_path, phase):
+    messages: list[dict] = []
+    resolve_calls: list[str] = []
+    runtime = SimpleNamespace(
+        project_id="project-one",
+        approval_context=lambda _approval_id: ("session-one", "task-one"),
+        resolve_approval=lambda *_args, **_kwargs: resolve_calls.append("called") or True,
+    )
+    server = SidecarServer(tmp_path, messages.append)
+    server.runtime = runtime
+    server.project_id = "project-one"
+    server._register_task_route(
+        runtime,
+        "session-one",
+        "task-one",
+        phase=phase,
+    )
+
+    server._resolve_approval(
+        "approval-one",
+        {
+            "session_id": "session-one",
+            "task_id": "task-one",
+            "approval_id": "approval-id",
+            "decision": "approve",
+        },
+    )
+
+    assert resolve_calls == []
+    assert messages[-1]["ok"] is False
+    assert messages[-1]["error"]["code"] == "approval_not_pending"
+
+
 def test_runtime_session_switches_access_mode_without_persisting_it():
     runtime = object.__new__(RuntimeSession)
     runtime.hitl_handler = RuntimeHitlHandler(lambda _event_type, _data: None)
@@ -821,6 +1037,60 @@ def test_runtime_session_switches_access_mode_without_persisting_it():
 
     with pytest.raises(ValueError, match="unsupported access mode"):
         runtime.set_access_mode("unlimited")
+
+
+def test_runtime_session_keeps_access_mode_per_idle_conversation():
+    runtime = object.__new__(RuntimeSession)
+    first = SimpleNamespace(access_mode="restricted")
+    second = SimpleNamespace(access_mode="restricted")
+    conversations = {"session-one": first, "session-two": second}
+    runtime._get_conversation = conversations.__getitem__
+    runtime.active_task_for_conversation = lambda session_id: (
+        "task-one" if session_id == "session-one" else None
+    )
+
+    result = runtime.set_conversation_access_mode("session-two", "full-access")
+
+    assert result == {"session_id": "session-two", "mode": "full-access"}
+    assert first.access_mode == "restricted"
+    assert second.access_mode == "full-access"
+    with pytest.raises(RuntimeError, match="while this conversation is running"):
+        runtime.set_conversation_access_mode("session-one", "full-access")
+
+
+def test_sidecar_allows_access_change_for_idle_conversation_while_another_runs(tmp_path):
+    messages: list[dict] = []
+    changes: list[tuple[str, str]] = []
+    runtime = SimpleNamespace(
+        project_id="project-one",
+        set_conversation_access_mode=lambda session_id, mode: (
+            changes.append((session_id, mode)) or {"session_id": session_id, "mode": mode}
+        ),
+    )
+    server = SidecarServer(tmp_path, messages.append)
+    server.runtime = runtime
+    server.project_id = "project-one"
+    server.active_session_id = "session-idle"
+    server._emit_event = lambda *_args, **_kwargs: None  # type: ignore[method-assign]
+    server._register_task_route(runtime, "session-running", "task-running")
+
+    server._set_access_mode(
+        "access-idle",
+        {"session_id": "session-idle", "mode": "full-access"},
+    )
+
+    assert changes == [("session-idle", "full-access")]
+    assert messages[-1]["ok"] is True
+    assert messages[-1]["result"] == {
+        "session_id": "session-idle",
+        "mode": "full-access",
+    }
+
+    with pytest.raises(RuntimeError, match="this conversation task"):
+        server._set_access_mode(
+            "access-running",
+            {"session_id": "session-running", "mode": "full-access"},
+        )
 
 
 def test_runtime_session_cancels_only_the_matching_active_task():
@@ -884,7 +1154,248 @@ def test_sidecar_routes_background_task_cancellation_to_its_project(tmp_path):
 
     assert cancelled == ["task-one"]
     assert messages[-1]["result"] == {"accepted": True, "task_id": "task-one"}
+    assert server.task_routes["task-one"].phase == "cancelling"
     assert server.session_tasks["session-two"] == "task-two"
+
+
+def test_sidecar_rejects_non_object_params_inside_protocol_error_boundary(tmp_path):
+    messages: list[dict] = []
+    server = SidecarServer(tmp_path, messages.append)
+
+    keep_running = server.handle(
+        {
+            "kind": "request",
+            "protocol_version": PROTOCOL_VERSION,
+            "request_id": "invalid-params",
+            "method": "runtime.ping",
+            "params": ["not", "an", "object"],
+        }
+    )
+
+    assert keep_running is True
+    assert messages[-1]["ok"] is False
+    assert messages[-1]["error"] == {
+        "code": "invalid_message",
+        "message": "params must be an object",
+    }
+
+
+def test_sidecar_rejects_inconsistent_task_and_session_project_routes(tmp_path):
+    server = SidecarServer(tmp_path, lambda _message: None)
+    project_one = SimpleNamespace(project_id="project-one")
+    project_two = SimpleNamespace(project_id="project-two")
+    server.runtimes = {"project-one": project_one, "project-two": project_two}
+    server._register_task_route(project_two, "session-one", "task-two")
+    server.session_projects["session-one"] = "project-one"
+
+    with pytest.raises(ValueError, match="but task task-two belongs to project project-two"):
+        server._require_runtime(
+            {"session_id": "session-one", "task_id": "task-two"},
+            session_id="session-one",
+            task_id="task-two",
+        )
+
+
+def test_background_rag_job_does_not_replace_current_project_alias(tmp_path, monkeypatch):
+    messages: list[dict] = []
+    current = SimpleNamespace(project_id="project-current")
+    background = SimpleNamespace(
+        project_id="project-background",
+        rag_snapshot=lambda: {"sources": ["src"], "source_count": 1},
+    )
+    server = SidecarServer(tmp_path, messages.append)
+    server.runtime = current
+    server.project_id = "project-current"
+    server.runtimes = {
+        "project-current": current,
+        "project-background": background,
+    }
+    server.active_rag_job_id = "rag-current"
+
+    class DeferredThread:
+        def __init__(self, **_kwargs):
+            pass
+
+        def start(self) -> None:
+            pass
+
+    monkeypatch.setattr("stellarcode.runtime.sidecar.threading.Thread", DeferredThread)
+
+    server._start_rag_index("rag-background", {"project_id": "project-background"})
+
+    assert messages[-1]["ok"] is True
+    assert server.rag_jobs["project-background"].startswith("rag-")
+    assert server.active_rag_job_id == "rag-current"
+
+
+def test_legacy_approval_fallback_uses_target_project_active_context(tmp_path):
+    messages: list[dict] = []
+    resolved: list[tuple[str, str]] = []
+    current = SimpleNamespace(project_id="project-current")
+    background = SimpleNamespace(
+        project_id="project-background",
+        resolve_approval=lambda approval_id, decision, *_args, **_kwargs: (
+            resolved.append((approval_id, decision)) or True
+        ),
+    )
+    server = SidecarServer(tmp_path, messages.append)
+    server.runtime = current
+    server.project_id = "project-current"
+    server.runtimes = {
+        "project-current": current,
+        "project-background": background,
+    }
+    server._register_task_route(
+        background,
+        "session-background",
+        "task-background",
+        phase="running",
+    )
+    server.project_active_sessions["project-background"] = "session-background"
+    server.active_session_id = "session-current"
+    server.active_task_id = "task-current"
+    server._emit_event = lambda *_args, **_kwargs: None  # type: ignore[method-assign]
+
+    server._resolve_approval(
+        "approval-response",
+        {
+            "project_id": "project-background",
+            "approval_id": "approval-background",
+            "decision": "approve",
+        },
+    )
+
+    assert resolved == [("approval-background", "approve")]
+    assert messages[-1]["ok"] is True
+
+
+def test_workspace_close_clears_project_active_session_alias(tmp_path):
+    messages: list[dict] = []
+    closed: list[str] = []
+    runtime = SimpleNamespace(
+        project_id="project-one",
+        close=lambda: closed.append("project-one"),
+    )
+    server = SidecarServer(tmp_path, messages.append)
+    server.runtime = runtime
+    server.project_id = "project-one"
+    server.runtimes = {"project-one": runtime}
+    server.project_active_sessions["project-one"] = "session-one"
+
+    server._close_workspace("close-one", {"project_id": "project-one"})
+
+    assert closed == ["project-one"]
+    assert "project-one" not in server.project_active_sessions
+    assert server.runtime is None
+    assert any(message.get("request_id") == "close-one" and message.get("ok") for message in messages)
+
+
+@pytest.mark.parametrize("phase", ["cancelling", "finalizing"])
+def test_sidecar_does_not_cancel_after_cancellation_or_finalization_started(
+    tmp_path,
+    phase,
+):
+    messages: list[dict] = []
+    cancellation_calls: list[str] = []
+    runtime = SimpleNamespace(
+        project_id="project-one",
+        cancel_task=lambda task_id: cancellation_calls.append(task_id) or True,
+    )
+    server = SidecarServer(tmp_path, messages.append)
+    server.runtime = runtime
+    server.project_id = "project-one"
+    server._register_task_route(
+        runtime,
+        "session-one",
+        "task-one",
+        phase=phase,
+    )
+
+    server._cancel_task(
+        "cancel-one",
+        {"session_id": "session-one", "task_id": "task-one"},
+    )
+
+    assert cancellation_calls == []
+    assert messages[-1]["ok"] is True
+    assert messages[-1]["result"] == {"accepted": False, "task_id": "task-one"}
+    assert server.task_routes["task-one"].phase == phase
+
+
+def test_sidecar_returns_not_accepted_after_terminal_route_was_released(tmp_path):
+    messages: list[dict] = []
+    cancellation_calls: list[str] = []
+    runtime = SimpleNamespace(
+        project_id="project-one",
+        cancel_task=lambda task_id: cancellation_calls.append(task_id) or True,
+    )
+    server = SidecarServer(tmp_path, messages.append)
+    server.runtime = runtime
+    server.project_id = "project-one"
+    server._register_task_route(runtime, "session-one", "task-one", phase="running")
+    server._release_task_route("task-one")
+
+    server._cancel_task(
+        "cancel-terminal",
+        {"session_id": "session-one", "task_id": "task-one"},
+    )
+
+    assert cancellation_calls == []
+    assert messages[-1]["ok"] is True
+    assert messages[-1]["result"] == {"accepted": False, "task_id": "task-one"}
+
+
+def test_sidecar_cancel_and_finalization_phase_transition_is_atomic(tmp_path):
+    messages: list[dict] = []
+    cancel_entered = threading.Event()
+    release_cancel = threading.Event()
+    finalization_entered = threading.Event()
+    transition_errors: list[Exception] = []
+
+    def cancel_task(_task_id: str) -> bool:
+        cancel_entered.set()
+        assert release_cancel.wait(1)
+        return True
+
+    runtime = SimpleNamespace(project_id="project-one", cancel_task=cancel_task)
+    server = SidecarServer(tmp_path, messages.append)
+    server.runtime = runtime
+    server.project_id = "project-one"
+    server._register_task_route(runtime, "session-one", "task-one", phase="running")
+
+    cancel_thread = threading.Thread(
+        target=server._cancel_task,
+        args=(
+            "cancel-one",
+            {"session_id": "session-one", "task_id": "task-one"},
+        ),
+    )
+
+    def start_finalization() -> None:
+        finalization_entered.set()
+        try:
+            server.task_state.transition("task-one", "finalizing")
+        except Exception as exc:  # pragma: no cover - assertion reports the concrete race
+            transition_errors.append(exc)
+
+    cancel_thread.start()
+    assert cancel_entered.wait(1)
+    finalization_thread = threading.Thread(target=start_finalization)
+    finalization_thread.start()
+    assert finalization_entered.wait(1)
+    # Finalization must wait until cancellation has atomically committed the
+    # cancelling phase; it can then advance through the allowed transition.
+    assert finalization_thread.is_alive()
+    release_cancel.set()
+    cancel_thread.join(1)
+    finalization_thread.join(1)
+
+    assert not cancel_thread.is_alive()
+    assert not finalization_thread.is_alive()
+    assert transition_errors == []
+    assert messages[-1]["ok"] is True
+    assert messages[-1]["result"] == {"accepted": True, "task_id": "task-one"}
+    assert server.task_routes["task-one"].phase == "finalizing"
 
 
 def test_answer_ready_recovery_does_not_call_the_model_and_releases_runtime_task(tmp_path):
@@ -953,8 +1464,8 @@ def test_sidecar_exposes_conversation_trace_toggle(tmp_path):
             "enabled": enabled,
             "path": str(tmp_path / f"{session_id}.jsonl"),
         },
-        record_runtime_event=lambda event_type, data, _session_id, _task_id: (
-            recorded_events.append((event_type, data))
+        record_runtime_event=lambda event_type, data, _session_id, _task_id: recorded_events.append(
+            (event_type, data)
         ),
     )
     server = SidecarServer(tmp_path, messages.append)
@@ -1119,7 +1630,9 @@ def test_sidecar_routes_rag_sources_and_streams_background_index_events(tmp_path
     event_types = [message.get("type") for message in messages if message.get("kind") == "event"]
     assert messages[1]["result"]["status"] == "indexing"
     assert event_types == ["rag.index.started", "rag.index.progress", "rag.index.completed"]
-    completed = next(message for message in messages if message.get("type") == "rag.index.completed")
+    completed = next(
+        message for message in messages if message.get("type") == "rag.index.completed"
+    )
     assert completed["data"]["snapshot"]["chunk_count"] == 2
 
 

@@ -1,3 +1,5 @@
+"""Static AST analysis for code symbols and lightweight project relationships."""
+
 from __future__ import annotations
 
 import ast

@@ -1,3 +1,5 @@
+"""Hybrid semantic, lexical, and symbol retrieval over a project's code index."""
+
 from __future__ import annotations
 
 from dataclasses import replace

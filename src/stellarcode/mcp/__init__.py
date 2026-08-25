@@ -1,3 +1,5 @@
+"""Model Context Protocol configuration, transports, lifecycle, and auditing."""
+
 from stellarcode.mcp.audit import McpAuditLog
 from stellarcode.mcp.client import McpClient, McpToolDescriptor, namespaced_tool_name
 from stellarcode.mcp.config import McpConfigError, McpConfigLoader, McpServerConfig

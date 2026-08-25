@@ -72,8 +72,24 @@ def test_sidecar_routes_memory_skill_and_browser_management(tmp_path):
         save_memory=lambda content: calls.append(("memory.save", content)) or memory,
         delete_memory=lambda entry_id: calls.append(("memory.delete", entry_id)) or memory,
         clear_memory=lambda: calls.append(("memory.clear",)) or memory,
+        prompt_snapshot=lambda session_id, include_sensitive=False: (
+            calls.append(("prompt.snapshot", session_id, include_sensitive))
+            or {"available": True, "memory_hidden": not include_sensitive}
+        ),
         skill_snapshot=lambda: calls.append(("skill.list",)) or skills,
         skill_detail=lambda name: {"name": name, "body": "detail"},
+        skill_diff=lambda name, max_chars: (
+            calls.append(("skill.diff", name, max_chars))
+            or {
+                "name": name,
+                "diff": "--- current/SKILL.md\n+++ bundled/SKILL.md",
+                "current_hash": "a" * 64,
+                "builtin_hash": "b" * 64,
+            }
+        ),
+        update_bundled_skill=lambda name, **kwargs: (
+            calls.append(("skill.change", name, kwargs)) or skills
+        ),
         set_skill_enabled=lambda name, enabled: (
             calls.append(("skill.enabled", name, enabled)) or skills
         ),
@@ -92,10 +108,38 @@ def test_sidecar_routes_memory_skill_and_browser_management(tmp_path):
         ("memory.save", {"content": "stable fact"}),
         ("memory.delete", {"id": "mem-one"}),
         ("memory.clear", {"confirmed": True}),
+        ("prompt.snapshot", {"session_id": "session-one", "include_memory": False}),
         ("skill.list", {}),
         ("skill.get", {"name": "review"}),
+        ("skill.diff", {"name": "review", "max_chars": 4000}),
         ("skill.set_enabled", {"name": "review", "enabled": False}),
         ("skill.reload", {}),
+        (
+            "skill.update",
+            {
+                "name": "review",
+                "current_hash": "a" * 64,
+                "builtin_hash": "b" * 64,
+                "confirmed": True,
+            },
+        ),
+        (
+            "skill.keep_custom",
+            {
+                "name": "review",
+                "current_hash": "a" * 64,
+                "builtin_hash": "b" * 64,
+            },
+        ),
+        (
+            "skill.restore_default",
+            {
+                "name": "review",
+                "current_hash": "a" * 64,
+                "builtin_hash": "b" * 64,
+                "confirmed": True,
+            },
+        ),
         ("browser.snapshot", {}),
         ("browser.probe", {"port": 9222}),
         ("browser.connect", {"confirmed": True}),
@@ -107,7 +151,18 @@ def test_sidecar_routes_memory_skill_and_browser_management(tmp_path):
 
     assert all(message["ok"] for message in messages)
     assert ("memory.list", {"query": "stable", "limit": 10}) in calls
+    assert ("prompt.snapshot", "session-one", False) in calls
     assert ("skill.enabled", "review", False) in calls
+    assert ("skill.diff", "review", 4000) in calls
+    assert (
+        "skill.change",
+        "review",
+        {
+            "action": "update",
+            "expected_current_hash": "a" * 64,
+            "expected_builtin_hash": "b" * 64,
+        },
+    ) in calls
     assert messages[-2]["result"] == {"output": "tab list"}
 
 
@@ -127,6 +182,22 @@ def test_sidecar_requires_confirmation_for_destructive_management(tmp_path):
             ("memory.clear", {}),
             ("browser.connect", {}),
             ("browser.disconnect", {}),
+            (
+                "skill.update",
+                {
+                    "name": "review",
+                    "current_hash": "a" * 64,
+                    "builtin_hash": "b" * 64,
+                },
+            ),
+            (
+                "skill.restore_default",
+                {
+                    "name": "review",
+                    "current_hash": "a" * 64,
+                    "builtin_hash": "b" * 64,
+                },
+            ),
             ("diagnostics.run", {"profile": "build"}),
         ]
     ):

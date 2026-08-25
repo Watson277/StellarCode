@@ -1,3 +1,5 @@
+"""Budgeted skill-index formatting for system-prompt discovery guidance."""
+
 from __future__ import annotations
 
 from stellarcode.skill.model import Skill
@@ -24,8 +26,8 @@ def format_skill_index(enabled: list[Skill] | None) -> str:
             "",
             (
                 "判断准则：当任务描述匹配某个 skill 的触发场景时，调用 "
-                "load_skill(name) 加载完整指引；已加载的 skill 会在下一条用户消息中以 "
-                '"## 已加载 Skill" 段落出现。不要重复加载同一 skill。'
+                "load_skill(name) 加载完整指引；已加载的 skill 会以 "
+                '"## 已加载 Skill" 段落提供给当前任务的下一次模型调用。不要重复加载同一 skill。'
             ),
         ]
     )
@@ -46,4 +48,3 @@ def _truncate_utf8(content: str, limit: int) -> str:
         except UnicodeDecodeError:
             truncated = truncated[:-1]
     return suffix
-

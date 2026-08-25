@@ -1,3 +1,5 @@
+"""Protocol-level MCP client that discovers tools and invokes them over a transport."""
+
 from __future__ import annotations
 
 import json

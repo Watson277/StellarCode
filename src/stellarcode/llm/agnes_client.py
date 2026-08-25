@@ -1,3 +1,5 @@
+"""Agnes OpenAI-compatible provider adapter, including streaming tool calls."""
+
 from __future__ import annotations
 
 import os

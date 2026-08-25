@@ -1,3 +1,5 @@
+"""Task node status and dependency data used by Plan-and-Execute scheduling."""
+
 from __future__ import annotations
 
 import time

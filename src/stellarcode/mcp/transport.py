@@ -1,3 +1,5 @@
+"""Stdio and Streamable HTTP transports; JSON-RPC semantics remain in McpClient."""
+
 from __future__ import annotations
 
 import json

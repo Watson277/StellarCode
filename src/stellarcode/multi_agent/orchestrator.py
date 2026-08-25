@@ -1,22 +1,29 @@
+"""Planner/Worker/Reviewer orchestration over shared tools and project memory."""
+
 from __future__ import annotations
 
 import json
 import queue
 import re
 import threading
+import time
+import uuid
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from contextvars import copy_context
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 from stellarcode.agent import ChatClient
 from stellarcode.cancellation import TaskCancelledError, raise_if_cancelled
 from stellarcode.memory import MemoryManager
 from stellarcode.multi_agent.message import AgentMessage, MessageType
+from stellarcode.multi_agent.message_bus import FileMessageBus, MessageBusError
 from stellarcode.multi_agent.role import AgentRole
 from stellarcode.multi_agent.sub_agent import SubAgent
 from stellarcode.plan import ExecutionPlan, PlanValidationError, Planner, Task, TaskStatus
+from stellarcode.prompt import PromptAssembler
 from stellarcode.skill import SkillContextBuffer, SkillRegistry
 from stellarcode.tools import ToolRegistry
 
@@ -52,6 +59,10 @@ class AgentOrchestrator:
         skill_registry: SkillRegistry | None = None,
         workspace: str | Path | None = None,
         context_window: int = 200_000,
+        rag_auto_retrieval: bool | None = True,
+        message_bus_dir: str | Path | None = None,
+        event_callback: Callable[[str, dict[str, Any]], None] | None = None,
+        prompt_assembler: PromptAssembler | None = None,
     ) -> None:
         if worker_count < 1:
             raise ValueError("worker_count must be at least 1.")
@@ -67,7 +78,20 @@ class AgentOrchestrator:
         self.skill_registry = skill_registry
         self.workspace = Path(workspace or ".").resolve()
         self.context_window = context_window
-        self.plan_parser = Planner(llm_client, self.workspace)
+        self.rag_auto_retrieval = rag_auto_retrieval
+        self.message_bus_dir = Path(
+            message_bus_dir or self.workspace / ".stellarcode" / "team-message-bus"
+        ).resolve()
+        # Team-mode events are deliberately separate from the normal Agent events.
+        # They describe visible collaboration (messages, tools, and status), never
+        # private chain-of-thought content.
+        self.event_callback = event_callback
+        self.prompt_assembler = prompt_assembler or PromptAssembler()
+        self.plan_parser = Planner(
+            llm_client,
+            self.workspace,
+            prompt_assembler=self.prompt_assembler,
+        )
         self.planner = self._new_sub_agent("planner", AgentRole.PLANNER)
         self.workers = [
             self._new_sub_agent(f"worker-{index}", AgentRole.WORKER)
@@ -76,7 +100,9 @@ class AgentOrchestrator:
         self.reviewer = self._new_sub_agent("reviewer", AgentRole.REVIEWER)
         self.last_plan: ExecutionPlan | None = None
         self.last_step_results: dict[str, StepExecutionResult] = {}
+        self.last_message_bus_path: Path | None = None
         self._worker_cursor = 0
+        self._active_message_bus: FileMessageBus | None = None
 
     def run(
         self,
@@ -84,6 +110,14 @@ class AgentOrchestrator:
         cancellation_event: threading.Event | None = None,
     ) -> str:
         raise_if_cancelled(cancellation_event)
+        self._start_message_bus_run()
+        self._emit_team_event(
+            "team.run.started",
+            {
+                "run_id": self._team_run_id(),
+                "worker_count": len(self.workers),
+            },
+        )
         if self.memory_manager:
             self.memory_manager.add_user_message(user_input)
 
@@ -91,11 +125,29 @@ class AgentOrchestrator:
             plan = self.create_plan(user_input, cancellation_event)
         except (MultiAgentError, PlanValidationError, json.JSONDecodeError) as exc:
             result = f"Multi-Agent planning failed: {exc}"
+            self._emit_team_event(
+                "team.run.failed",
+                {"run_id": self._team_run_id(), "message": result},
+            )
             if self.memory_manager:
                 self.memory_manager.add_assistant_message(result)
             return result
 
-        result = self.execute_plan(plan, cancellation_event)
+        try:
+            result = self.execute_plan(plan, cancellation_event)
+        except TaskCancelledError:
+            self._emit_team_event(
+                "team.run.failed",
+                {"run_id": self._team_run_id(), "message": "Team task was cancelled."},
+            )
+            raise
+        self._emit_team_event(
+            "team.run.completed" if not plan.has_failed() else "team.run.failed",
+            {
+                "run_id": self._team_run_id(),
+                "message": result if plan.has_failed() else "Team execution completed.",
+            },
+        )
         if self.memory_manager:
             self.memory_manager.add_assistant_message(result)
         return result
@@ -105,13 +157,19 @@ class AgentOrchestrator:
         user_input: str,
         cancellation_event: threading.Event | None = None,
     ) -> ExecutionPlan:
+        self._ensure_message_bus()
         self._emit("Multi-Agent phase 1/2: planner is creating the execution DAG...")
         task = AgentMessage.task(
             "orchestrator",
             f"Create an execution plan for this user goal:\n{user_input}",
         )
         try:
-            response = self.planner.execute(task, cancellation_event)
+            response = self._execute_agent_via_bus(
+                self.planner,
+                task,
+                task_id="planning",
+                cancellation_event=cancellation_event,
+            )
         finally:
             self.planner.clear_history()
 
@@ -134,6 +192,7 @@ class AgentOrchestrator:
         cancellation_event: threading.Event | None = None,
     ) -> str:
         raise_if_cancelled(cancellation_event)
+        self._ensure_message_bus()
         self.last_plan = plan
         self.last_step_results = {}
         try:
@@ -194,6 +253,7 @@ class AgentOrchestrator:
             worker.clear_history()
         self.last_plan = None
         self.last_step_results = {}
+        self._active_message_bus = None
 
     def parse_review_approval(self, review_content: str | None) -> bool:
         if not review_content or not review_content.strip():
@@ -299,8 +359,7 @@ class AgentOrchestrator:
             thread_name_prefix="stellarcode-team",
         ) as executor:
             futures = {
-                task.id: executor.submit(copy_context().run, run_parallel, task)
-                for task in batch
+                task.id: executor.submit(copy_context().run, run_parallel, task) for task in batch
             }
             return {task.id: futures[task.id].result() for task in batch}
 
@@ -314,10 +373,12 @@ class AgentOrchestrator:
     ) -> StepExecutionResult:
         raise_if_cancelled(cancellation_event)
         task_message = AgentMessage.task("orchestrator", task.description)
-        worker_result = worker.execute_with_context(
+        worker_result = self._execute_agent_via_bus(
+            worker,
             task_message,
-            context,
-            cancellation_event,
+            task_id=task.id,
+            context=context,
+            cancellation_event=cancellation_event,
         )
         if worker_result.type == MessageType.ERROR:
             return StepExecutionResult(
@@ -335,8 +396,9 @@ class AgentOrchestrator:
             )
 
         accepted_result = worker_result.content
-        review = reviewer.review(
-            task.description,
+        review = self._review_via_bus(
+            reviewer,
+            task,
             accepted_result,
             cancellation_event,
         )
@@ -362,10 +424,12 @@ class AgentOrchestrator:
                 f"{context}\n\nThe previous result was rejected by the reviewer.\n"
                 f"Review feedback:\n{feedback}"
             )
-            retry_result = worker.execute_with_context(
+            retry_result = self._execute_agent_via_bus(
+                worker,
                 task_message,
-                retry_context,
-                cancellation_event,
+                task_id=task.id,
+                context=retry_context,
+                cancellation_event=cancellation_event,
             )
             if retry_result.type == MessageType.ERROR:
                 feedback = retry_result.content
@@ -375,8 +439,9 @@ class AgentOrchestrator:
                 continue
 
             accepted_result = retry_result.content
-            review = reviewer.review(
-                task.description,
+            review = self._review_via_bus(
+                reviewer,
+                task,
                 accepted_result,
                 cancellation_event,
             )
@@ -403,6 +468,184 @@ class AgentOrchestrator:
             review_feedback="" if approved else feedback,
             retries=retries,
         )
+
+    def _review_via_bus(
+        self,
+        reviewer: SubAgent,
+        task: Task,
+        execution_result: str,
+        cancellation_event: threading.Event | None,
+    ) -> AgentMessage:
+        """Ask a reviewer through its mailbox rather than by direct peer hand-off."""
+        review_task = AgentMessage.task(
+            "orchestrator",
+            f"Original task:\n{task.description}\n\nExecution result:\n{execution_result}",
+        )
+        return self._execute_agent_via_bus(
+            reviewer,
+            review_task,
+            task_id=task.id,
+            cancellation_event=cancellation_event,
+            message_kind="review_request",
+        )
+
+    def _execute_agent_via_bus(
+        self,
+        agent: SubAgent,
+        task: AgentMessage,
+        *,
+        task_id: str,
+        cancellation_event: threading.Event | None,
+        context: str = "",
+        message_kind: str = "task",
+    ) -> AgentMessage:
+        """Produce one request, let its recipient consume it, then consume its reply.
+
+        The Team execution threads deliberately run this consumer loop locally for
+        now.  The durable mailbox protocol is independent of the threads, so a
+        later worker process can use the exact same send/claim/ack contract.
+        """
+        bus = self._ensure_message_bus()
+        request = bus.send(
+            sender="lead",
+            recipient=agent.name,
+            kind=message_kind,
+            payload={"content": task.content, "context": context},
+            task_id=task_id,
+        )
+        self._emit_team_event(
+            "team.agent.message",
+            {
+                "run_id": self._team_run_id(),
+                "agent_name": agent.name,
+                "agent_role": agent.role.value.lower(),
+                "team_task_id": task_id,
+                "direction": "inbound",
+                "message_kind": message_kind,
+                "content": _team_event_text(task.content),
+            },
+        )
+        self._emit_team_event(
+            "team.agent.status",
+            {
+                "run_id": self._team_run_id(),
+                "agent_name": agent.name,
+                "agent_role": agent.role.value.lower(),
+                "team_task_id": task_id,
+                "status": "queued",
+            },
+        )
+        claimed = bus.claim_matching(
+            agent.name,
+            consumer_id=agent.name,
+            predicate=lambda queued: queued.id == request.id,
+        )
+        if claimed is None:
+            raise MultiAgentError(f"MessageBus could not deliver {request.id} to {agent.name}.")
+
+        try:
+            self._emit_team_event(
+                "team.agent.status",
+                {
+                    "run_id": self._team_run_id(),
+                    "agent_name": agent.name,
+                    "agent_role": agent.role.value.lower(),
+                    "team_task_id": task_id,
+                    "status": "working",
+                },
+            )
+            queued_content = str(claimed.message.payload.get("content") or "")
+            queued_context = str(claimed.message.payload.get("context") or "")
+            delivered_task = AgentMessage.task(claimed.message.sender, queued_content)
+            if queued_context:
+                response = agent.execute_with_context(
+                    delivered_task,
+                    queued_context,
+                    cancellation_event,
+                    team_task_id=task_id,
+                )
+            else:
+                response = agent.execute(
+                    delivered_task,
+                    cancellation_event,
+                    team_task_id=task_id,
+                )
+        except TaskCancelledError:
+            bus.release(claimed)
+            raise
+        except Exception as exc:
+            response = AgentMessage.error(agent.name, agent.role, f"Agent consumer failed: {exc}")
+
+        self._emit_team_event(
+            "team.agent.message",
+            {
+                "run_id": self._team_run_id(),
+                "agent_name": agent.name,
+                "agent_role": agent.role.value.lower(),
+                "team_task_id": task_id,
+                "direction": "outbound",
+                "message_kind": "error" if response.type == MessageType.ERROR else "result",
+                "content": _team_event_text(response.content),
+            },
+        )
+        self._emit_team_event(
+            "team.agent.status",
+            {
+                "run_id": self._team_run_id(),
+                "agent_name": agent.name,
+                "agent_role": agent.role.value.lower(),
+                "team_task_id": task_id,
+                "status": "failed" if response.type == MessageType.ERROR else "completed",
+            },
+        )
+
+        reply_kind = f"{message_kind}_result"
+        bus.send(
+            sender=agent.name,
+            recipient="lead",
+            kind=reply_kind,
+            payload={"agent_message": _serialize_agent_message(response)},
+            task_id=task_id,
+            correlation_id=request.correlation_id,
+            parent_message_id=request.id,
+        )
+        bus.acknowledge(claimed)
+        lead_reply = bus.claim_matching(
+            "lead",
+            consumer_id="lead",
+            predicate=lambda queued: (
+                queued.kind == reply_kind
+                and queued.correlation_id == request.correlation_id
+                and queued.parent_message_id == request.id
+            ),
+        )
+        if lead_reply is None:
+            raise MultiAgentError(f"MessageBus did not return a reply for {request.id}.")
+        try:
+            raw_reply = lead_reply.message.payload.get("agent_message")
+            if not isinstance(raw_reply, dict):
+                raise MessageBusError("Agent reply did not include a structured AgentMessage.")
+            decoded = _deserialize_agent_message(raw_reply)
+        except Exception:
+            # Keep malformed replies eligible for retry/dead-letter inspection.
+            bus.release(lead_reply)
+            raise
+        else:
+            bus.acknowledge(lead_reply)
+            return decoded
+
+    def _start_message_bus_run(self) -> FileMessageBus:
+        """Start a fresh durable mailbox namespace for one Team-mode user task."""
+        run_id = f"team-{int(time.time() * 1000)}-{uuid.uuid4().hex[:12]}"
+        bus = FileMessageBus(self.message_bus_dir / run_id)
+        self._active_message_bus = bus
+        self.last_message_bus_path = bus.root
+        return bus
+
+    def _ensure_message_bus(self) -> FileMessageBus:
+        if self._active_message_bus is None:
+            return self._start_message_bus_run()
+        return self._active_message_bus
 
     def _build_step_context(self, plan: ExecutionPlan, current_task: Task) -> str:
         lines = [f"Overall goal:\n{plan.goal}"]
@@ -431,9 +674,7 @@ class AgentOrchestrator:
             task = plan.get_task(task_id)
             outcome = self.last_step_results.get(task_id)
             worker = outcome.worker_name if outcome else "-"
-            lines.append(
-                f"- {task.id} [{task.status.value}] {task.description} (worker: {worker})"
-            )
+            lines.append(f"- {task.id} [{task.status.value}] {task.description} (worker: {worker})")
             if task.result:
                 lines.append(f"  result: {task.result}")
             if task.error:
@@ -461,11 +702,28 @@ class AgentOrchestrator:
             skill_context_buffer=SkillContextBuffer(),
             workspace=self.workspace,
             context_window=self.context_window,
+            rag_auto_retrieval=self.rag_auto_retrieval,
+            event_callback=self._emit_team_event,
+            prompt_assembler=self.prompt_assembler,
         )
 
     def _emit(self, message: str) -> None:
         if self.progress_callback:
             self.progress_callback(message)
+
+    def _emit_team_event(self, event_type: str, data: dict[str, Any]) -> None:
+        """Best-effort presentation telemetry for the expandable Team card."""
+
+        if not self.event_callback:
+            return
+        try:
+            self.event_callback(event_type, data)
+        except Exception:
+            # Team collaboration must never fail because the desktop is offline.
+            pass
+
+    def _team_run_id(self) -> str:
+        return self.last_message_bus_path.name if self.last_message_bus_path else "team"
 
 
 def _extract_json(text: str) -> str:
@@ -478,3 +736,35 @@ def _extract_json(text: str) -> str:
     if start == -1 or end == -1 or end < start:
         raise PlanValidationError("Response does not contain a JSON object.")
     return stripped[start : end + 1]
+
+
+def _serialize_agent_message(message: AgentMessage) -> dict[str, str | None]:
+    """Keep the mailbox payload independent from Python dataclass pickling."""
+    return {
+        "from_agent": message.from_agent,
+        "from_role": message.from_role.value if message.from_role else None,
+        "content": message.content,
+        "type": message.type.value,
+    }
+
+
+def _deserialize_agent_message(payload: dict[str, object]) -> AgentMessage:
+    """Validate an agent reply before the Lead lets it influence the DAG."""
+    try:
+        role_value = payload.get("from_role")
+        role = AgentRole(str(role_value)) if role_value is not None else None
+        return AgentMessage(
+            from_agent=str(payload["from_agent"]),
+            from_role=role,
+            content=str(payload["content"]),
+            type=MessageType(str(payload["type"])),
+        )
+    except (KeyError, TypeError, ValueError) as exc:
+        raise MessageBusError("Malformed AgentMessage payload in Lead mailbox.") from exc
+
+
+def _team_event_text(value: str, limit: int = 2_400) -> str:
+    """Bound UI/journal payloads while retaining readable child-agent dialogue."""
+
+    text = value.strip()
+    return text if len(text) <= limit else f"{text[:limit]}\n… [truncated]"

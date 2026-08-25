@@ -1,3 +1,5 @@
+"""Validate MCP tool schemas before exposing them as provider Function Calling tools."""
+
 from __future__ import annotations
 
 import json

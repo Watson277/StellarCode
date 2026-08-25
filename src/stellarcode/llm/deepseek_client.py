@@ -1,3 +1,5 @@
+"""DeepSeek provider adapter with request/history compatibility safeguards."""
+
 from __future__ import annotations
 
 import os

@@ -1,3 +1,5 @@
+"""Split source files into line-addressable chunks while preserving symbol context."""
+
 from __future__ import annotations
 
 import ast

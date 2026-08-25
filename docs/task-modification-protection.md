@@ -12,18 +12,23 @@ Side-Git 快照、任务完成后的差异查看，以及带冲突检测的一�
 修改保护必须满足以下约束：
 
 1. Agent 开始执行工具前，先持久化整个工作区的任务基线。
-2. `write_file` 和 `delete_file` 在执行前生成可审阅的文件级 diff。
+2. `write_file`、`apply_patch` 和 `delete_file` 在执行前生成可审阅的文件级 diff。
 3. 成功、失败和取消的任务都记录实际产生的工作区变化。
 4. 用户可以查看任务 diff，并按任务撤销这次任务修改过的文件。
 5. 回滚不能覆盖任务结束后产生的同路径修改；遇到冲突时必须停止。
 6. 快照系统不得修改用户仓库的 `HEAD`、分支、refs、暂存区或提交历史。
 7. Sidecar 崩溃恢复必须继续使用原任务基线，不能把崩溃后的部分修改当成新基线。
+8. 并发任务必须在独立 Git worktree 中执行，最终改动通过冲突预检后串行合并。
 
 ## 三层保护
 
+任务 worktree 是三层保护之前的执行隔离层。其完整生命周期和排除范围见
+`docs/task-git-worktree-isolation.md`；以下 Side-Git PRE/POST 与 rollback 仍是合并回项目后
+的审计和撤销依据。
+
 ### 1. 写入前文件预览
 
-内置 `write_file` 和 `delete_file` 都配置了 previewer。工具调用开始前，Runtime
+内置 `write_file`、`apply_patch` 和 `delete_file` 都配置了 previewer。工具调用开始前，Runtime
 根据当前文件和目标内容生成 `change_preview`：
 
 | 字段 | 含义 |
@@ -41,8 +46,9 @@ Side-Git 快照、任务完成后的差异查看，以及带冲突检测的一�
 | `truncated` | diff 是否被截断 |
 | `error` | 预览失败时的错误说明 |
 
-预览会同时进入 `tool.started` 和受限模式下的 `approval.requested`。完整替换内容不会
-写进工具事件参数；事件中只保留长度说明和有界 diff。
+预览会同时进入 `tool.started` 和受限模式下的 `approval.requested`。完整替换内容和
+`apply_patch` 的精确 `old_text` / `new_text` 不会写进工具事件参数；事件中只保留长度
+说明、编辑统计和有界 diff。
 
 以下内容不会直接显示：
 
@@ -59,8 +65,9 @@ Side-Git 快照、任务完成后的差异查看，以及带冲突检测的一�
 受限模式中，用户批准文件修改后，Runtime 会把预览时的路径和 `before_sha256` 作为
 内部守卫传给文件工具。工具在文件修改锁内重新读取目标；如果审批后、真正写入前文件
 已经变化，本次操作失败，并要求 Agent 重新读取和重新申请审批。这避免用户批准的是 A
-版本，实际覆盖的却是稍后出现的 B 版本。`write_file` 使用临时文件、`fsync` 和
-`os.replace` 原子替换目标。
+版本，实际覆盖的却是稍后出现的 B 版本。`write_file` 与 `apply_patch` 使用临时文件、
+`fsync` 和 `os.replace` 原子替换目标。`apply_patch` 只修改已存在的 UTF-8 文本文件；
+每项 `old_text` 默认必须精确匹配一次，只有显式设置 `replace_all=true` 才允许批量替换。
 
 完全访问模式不等待审批；此时预览用于展示，不代表用户确认。
 

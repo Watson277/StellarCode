@@ -1,0 +1,74 @@
+.file-preview-panel {
+  --file-code-font: "JetBrains Mono", "Cascadia Code", "Fira Code", "SFMono-Regular", Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+  --syntax-comment: #758195;
+  --syntax-keyword: #c792ea;
+  --syntax-string: #a8d27a;
+  --syntax-number: #f3b36a;
+  --syntax-title: #82aaff;
+  --syntax-type: #67d5c0;
+  --syntax-attribute: #ffcb6b;
+  --syntax-meta: #89a7d7;
+  display: grid; width: 100%; height: 100%; min-width: 0; min-height: 0;
+  grid-template-rows: auto auto auto minmax(0, 1fr); background: var(--bg); color: var(--text);
+}
+.file-preview-titlebar { display: flex; min-height: 55px; align-items: center; justify-content: space-between; gap: 12px; padding: 8px 11px; border-bottom: 1px solid var(--border); background: var(--panel-raised); }
+.file-preview-titlebar > div { display: flex; min-width: 0; align-items: center; gap: 8px; }
+.file-preview-titlebar > div:first-child { display: grid; gap: 2px; }
+.file-preview-eyebrow { color: var(--text-faint); font-size: 8px; font-weight: 700; letter-spacing: .08em; text-transform: uppercase; }
+.file-preview-titlebar strong { overflow: hidden; font: 650 12px/1.35 var(--file-code-font); text-overflow: ellipsis; white-space: nowrap; }
+.file-preview-language { padding: 3px 6px; border: 1px solid var(--border); border-radius: 4px; color: var(--syntax-type); font: 700 8px/1 var(--file-code-font); text-transform: uppercase; }
+.file-preview-titlebar button,
+.file-preview-pathbar button,
+.file-preview-meta button { min-height: 26px; padding: 3px 7px; border: 1px solid var(--border); border-radius: 4px; background: var(--panel); color: var(--text-soft); cursor: pointer; font-size: 9px; }
+.file-preview-titlebar button:hover,
+.file-preview-pathbar button:hover,
+.file-preview-meta button:hover { border-color: var(--border-strong); color: var(--text); }
+.file-preview-pathbar { display: flex; min-height: 54px; align-items: center; justify-content: space-between; gap: 10px; padding: 7px 11px; border-bottom: 1px solid var(--border); background: var(--surface-input); }
+.file-preview-pathbar > div { display: grid; min-width: 0; gap: 4px; }
+.file-preview-pathbar span { color: var(--text-faint); font-size: 8px; font-weight: 650; text-transform: uppercase; }
+.file-preview-pathbar code { overflow: hidden; color: var(--text); font: 10px/1.4 var(--file-code-font); text-overflow: ellipsis; white-space: nowrap; }
+.file-preview-meta { display: flex; min-height: 34px; align-items: center; gap: 8px; padding: 4px 11px; border-bottom: 1px solid var(--border); color: var(--text-faint); font: 8px/1 var(--file-code-font); }
+.file-preview-meta strong { color: var(--warn); font-weight: 600; }
+.file-preview-meta button { margin-left: auto; }
+.file-preview-source { min-width: 0; min-height: 0; margin: 0; overflow: auto; padding: 13px 15px 28px; background: var(--bg); color: var(--text-soft); font: 10px/1.6 var(--file-code-font); font-variant-ligatures: contextual; tab-size: 4; white-space: pre; }
+.file-preview-code { font-family: var(--file-code-font); }
+.file-preview-code .hljs-comment,
+.file-preview-code .hljs-quote { color: var(--syntax-comment); font-style: italic; }
+.file-preview-code .hljs-keyword,
+.file-preview-code .hljs-selector-tag,
+.file-preview-code .hljs-literal,
+.file-preview-code .hljs-doctag { color: var(--syntax-keyword); }
+.file-preview-code .hljs-string,
+.file-preview-code .hljs-regexp,
+.file-preview-code .hljs-template-tag,
+.file-preview-code .hljs-template-variable { color: var(--syntax-string); }
+.file-preview-code .hljs-number,
+.file-preview-code .hljs-symbol,
+.file-preview-code .hljs-bullet { color: var(--syntax-number); }
+.file-preview-code .hljs-title,
+.file-preview-code .hljs-section,
+.file-preview-code .hljs-selector-id,
+.file-preview-code .hljs-selector-class { color: var(--syntax-title); }
+.file-preview-code .hljs-type,
+.file-preview-code .hljs-class .hljs-title,
+.file-preview-code .hljs-built_in,
+.file-preview-code .hljs-builtin-name { color: var(--syntax-type); }
+.file-preview-code .hljs-attr,
+.file-preview-code .hljs-attribute,
+.file-preview-code .hljs-name,
+.file-preview-code .hljs-tag { color: var(--syntax-attribute); }
+.file-preview-code .hljs-meta,
+.file-preview-code .hljs-meta .hljs-keyword { color: var(--syntax-meta); }
+.file-preview-code .hljs-variable,
+.file-preview-code .hljs-params,
+.file-preview-code .hljs-property { color: var(--text); }
+.theme-light .file-preview-panel {
+  --syntax-comment: #657184;
+  --syntax-keyword: #7c3fb1;
+  --syntax-string: #3d7a24;
+  --syntax-number: #a34f12;
+  --syntax-title: #285dad;
+  --syntax-type: #087f71;
+  --syntax-attribute: #936315;
+  --syntax-meta: #3f6595;
+}

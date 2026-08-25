@@ -1,3 +1,9 @@
+"""Skill loading tools and task-local buffers for progressive prompt injection.
+
+The Skill index belongs in the system prompt; full guidance is bounded and inserted into
+the next model round only after explicit reference or ``load_skill``.
+"""
+
 from __future__ import annotations
 
 from collections.abc import Iterator
@@ -11,9 +17,7 @@ from stellarcode.tools import ToolDefinition, ToolRegistry
 
 
 MAX_SKILL_BODY_CHARACTERS = 5 * 1024
-_EXPLICIT_SKILL_REFERENCE = re.compile(
-    r"(?<![\w@])@skill:([A-Za-z0-9][A-Za-z0-9._-]*)"
-)
+_EXPLICIT_SKILL_REFERENCE = re.compile(r"(?<![\w@])@skill:([A-Za-z0-9][A-Za-z0-9._-]*)")
 _ACTIVE_CONTEXT_BUFFER: ContextVar[SkillContextBuffer | None] = ContextVar(
     "stellarcode_skill_context_buffer",
     default=None,
@@ -90,7 +94,7 @@ def register_skill_tools(
         target_buffer.push(name, body)
         return (
             f"Loaded skill '{name}' ({original_length} characters). Its full guidance "
-            f"will appear in the next user message under '## 已加载 Skill：{name}'."
+            f"will be supplied to the next model round under '## 已加载 Skill：{name}'."
         )
 
     tool_registry.register(
@@ -99,7 +103,7 @@ def register_skill_tools(
             description=(
                 "Load the full SKILL.md guidance for a skill listed in the system "
                 "prompt's available Skills section. Pass the exact kebab-case name. "
-                "The body is injected into the next user message; do not repeatedly "
+                "The body is supplied to the next model round; do not repeatedly "
                 "load the same skill."
             ),
             parameters={

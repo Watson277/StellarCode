@@ -1,3 +1,5 @@
+"""Parse local, clipboard, and attachment references without reading outside workspace."""
+
 from __future__ import annotations
 
 import re

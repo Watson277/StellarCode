@@ -1,3 +1,5 @@
+"""Approval-aware ToolRegistry wrapper; policy approval never bypasses tool guards."""
+
 from __future__ import annotations
 
 import json
@@ -289,7 +291,7 @@ def _guard_approved_change(
     between approval and the actual atomic replace/unlink.
     """
 
-    if name not in {"write_file", "delete_file"}:
+    if name not in {"write_file", "apply_patch", "delete_file"}:
         return arguments
     if preview is None:
         return arguments

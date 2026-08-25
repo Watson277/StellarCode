@@ -1,3 +1,5 @@
+"""Project-scoped facade for code indexing, retrieval, and embedding configuration."""
+
 from __future__ import annotations
 
 from collections.abc import Callable

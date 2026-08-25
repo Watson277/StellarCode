@@ -1,3 +1,5 @@
+"""SQLite-backed vector/chunk store; persistence lives below retrieval policy."""
+
 from __future__ import annotations
 
 import json

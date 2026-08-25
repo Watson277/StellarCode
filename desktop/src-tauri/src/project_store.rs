@@ -1,3 +1,8 @@
+//! Project registry and safe workspace tree enumeration for the desktop shell.
+//!
+//! This module treats project paths as untrusted input: canonicalization and relative-path
+//! validation prevent the UI's project browser from escaping an opened workspace.
+
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
 use std::fs;

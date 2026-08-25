@@ -1,3 +1,5 @@
+"""High-level browser commands layered over Chrome DevTools MCP and session policy."""
+
 from __future__ import annotations
 
 from dataclasses import dataclass

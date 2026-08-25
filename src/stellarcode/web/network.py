@@ -1,3 +1,5 @@
+"""Network allow-list and SSRF protections shared by fetch and search providers."""
+
 from __future__ import annotations
 
 import ipaddress

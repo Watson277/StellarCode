@@ -1,3 +1,5 @@
+"""Attachment preparation, clipboard input, and vision-model routing helpers."""
+
 from stellarcode.image.clipboard import grab_clipboard_image
 from stellarcode.image.processor import (
     API_IMAGE_MAX_BASE64_SIZE,

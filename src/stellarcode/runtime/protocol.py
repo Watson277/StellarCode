@@ -1,3 +1,9 @@
+"""Versioned, transport-neutral JSONL envelopes for Runtime requests and events.
+
+The event sequence is scoped to a session and is journaled before delivery; clients can
+therefore reconnect and replay events without treating stdout delivery as durability.
+"""
+
 from __future__ import annotations
 
 import json

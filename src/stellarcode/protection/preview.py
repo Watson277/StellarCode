@@ -1,3 +1,5 @@
+"""Bounded before-write diff previews used in approvals and desktop change cards."""
+
 from __future__ import annotations
 
 import difflib

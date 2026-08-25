@@ -71,7 +71,9 @@ def test_python_ast_chunker_extracts_classes_methods_and_functions(tmp_path: Pat
 
 def test_non_python_chunker_splits_large_files_by_line(tmp_path: Path):
     source = tmp_path / "notes.md"
-    source.write_text("\n".join(f"line {index}: {'x' * 80}" for index in range(80)), encoding="utf-8")
+    source.write_text(
+        "\n".join(f"line {index}: {'x' * 80}" for index in range(80)), encoding="utf-8"
+    )
 
     chunks = CodeChunker().chunk_file(source, display_path="notes.md")
 
@@ -88,13 +90,16 @@ def test_python_analyzer_extracts_imports_inheritance_contains_and_calls(tmp_pat
 
     assert CodeRelation("service.py", "file", None, "project.helpers", "imports") in relations
     assert CodeRelation("service.py", "UserService", None, "BaseService", "extends") in relations
-    assert CodeRelation(
-        "service.py",
-        "UserService",
-        "service.py",
-        "UserService.authenticate",
-        "contains",
-    ) in relations
+    assert (
+        CodeRelation(
+            "service.py",
+            "UserService",
+            "service.py",
+            "UserService.authenticate",
+            "contains",
+        )
+        in relations
+    )
     assert any(
         relation.from_name == "UserService.authenticate"
         and relation.relation_type == "calls"
@@ -140,8 +145,7 @@ def test_embedding_client_supports_ollama_and_openai_compatible_payloads(monkeyp
         compatible,
         "_post_json",
         lambda url, payload, use_auth: (
-            calls.append((url, payload, use_auth))
-            or {"data": [{"embedding": [0.3, 0.4]}]}
+            calls.append((url, payload, use_auth)) or {"data": [{"embedding": [0.3, 0.4]}]}
         ),
     )
     assert compatible.embed("world") == [0.3, 0.4]
@@ -397,25 +401,27 @@ def test_rag_source_store_persists_sources_and_invalidates_stale_index_metadata(
     assert len(store.remove(first)) == 1
 
 
-def test_search_code_schema_exposes_desktop_retrieval_policy(tmp_path: Path):
-    manual_registry = build_default_registry(
+def test_search_code_schema_is_a_static_single_tool_contract(tmp_path: Path):
+    registry = build_default_registry(
         tmp_path,
         rag_service=RagService(
             tmp_path,
             storage_dir=tmp_path / "rag",
             embedding_client=EmbeddingClient(provider="local"),
         ),
-        rag_auto_retrieval=False,
     )
 
     search_schema = next(
         schema["function"]
-        for schema in manual_registry.schemas()
+        for schema in registry.schemas()
         if schema["function"]["name"] == "search_code"
     )
 
-    assert "Automatic retrieval is disabled" in search_schema["description"]
-    assert "explicitly asks" in search_schema["description"]
+    assert "semantic code index" in search_schema["description"]
+    assert "Automatic retrieval" not in search_schema["description"]
+    assert "explicitly asks" not in search_schema["description"]
+    assert "glob_files" not in search_schema["description"]
+    assert "grep_code" not in search_schema["description"]
 
     service = RagService(
         tmp_path,

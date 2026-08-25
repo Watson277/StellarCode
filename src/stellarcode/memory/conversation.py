@@ -1,3 +1,5 @@
+"""Bounded short-term conversation memory maintained in chronological order."""
+
 from __future__ import annotations
 
 from collections import OrderedDict

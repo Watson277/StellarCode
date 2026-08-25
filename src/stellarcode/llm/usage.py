@@ -1,3 +1,5 @@
+"""Thread-safe aggregation of per-request token and cost usage."""
+
 from __future__ import annotations
 
 import threading

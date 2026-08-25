@@ -1,3 +1,8 @@
+//! Persisted desktop settings plus validation at the trust boundary.
+//!
+//! Values are validated both when saved and before they are forwarded to the Sidecar. This
+//! prevents a stale or hand-edited JSON settings file from becoming an unsafe process argv.
+
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fs;
@@ -16,6 +21,7 @@ pub struct GeneralSettings {
     pub conversation_font_size: u8,
     pub compact_tools: bool,
     pub compact_plans: bool,
+    pub worktree_directory: String,
 }
 
 impl Default for GeneralSettings {
@@ -27,6 +33,7 @@ impl Default for GeneralSettings {
             conversation_font_size: 12,
             compact_tools: true,
             compact_plans: true,
+            worktree_directory: String::new(),
         }
     }
 }
@@ -180,6 +187,7 @@ pub struct SettingsSnapshot {
     pub env_path: String,
     pub app_data_path: String,
     pub image_cache_path: String,
+    pub default_worktree_path: String,
     pub api_keys: BTreeMap<String, bool>,
 }
 
@@ -217,15 +225,23 @@ impl SettingsStore {
         Ok(self.lock()?.clone())
     }
 
+    /// The non-secret settings file and this user-owned `.env` live together.
+    /// In a release bundle this is the Tauri application-data directory; in a
+    /// development build it remains the repository root for compatibility.
+    pub fn environment_path(&self) -> PathBuf {
+        self.project_root.join(".env")
+    }
+
     pub fn snapshot(&self) -> Result<SettingsSnapshot, String> {
         let image_cache_path = home_dir().join(".stellarcode").join("cache");
         fs::create_dir_all(&image_cache_path).map_err(display_error)?;
         Ok(SettingsSnapshot {
             settings: self.current()?,
             settings_path: self.path.display().to_string(),
-            env_path: self.project_root.join(".env").display().to_string(),
+            env_path: self.environment_path().display().to_string(),
             app_data_path: self.app_data_dir.display().to_string(),
             image_cache_path: image_cache_path.display().to_string(),
+            default_worktree_path: self.app_data_dir.join("runtime").display().to_string(),
             api_keys: configured_api_keys(&self.project_root),
         })
     }
@@ -234,6 +250,7 @@ impl SettingsStore {
         settings.schema_version = SETTINGS_SCHEMA_VERSION;
         validate(&settings)?;
         validate_python_path(&settings.diagnostics.python_path)?;
+        validate_worktree_directory(&settings.general.worktree_directory)?;
         self.save(&settings)?;
         *self.lock()? = settings;
         self.snapshot()
@@ -313,6 +330,29 @@ fn validate(settings: &AppSettings) -> Result<(), String> {
         return Err("context window must be between 16000 and 2000000".into());
     }
     validate_lsp_settings(&settings.diagnostics)?;
+    Ok(())
+}
+
+pub(crate) fn validate_worktree_directory(value: &str) -> Result<(), String> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Ok(());
+    }
+    if value.contains('\0') {
+        return Err("worktree directory must not contain NUL".into());
+    }
+    let directory = Path::new(value);
+    if !directory.is_absolute() {
+        return Err("worktree directory must be an absolute path".into());
+    }
+    let metadata = fs::metadata(directory)
+        .map_err(|_| format!("worktree directory does not exist: {}", directory.display()))?;
+    if !metadata.is_dir() {
+        return Err(format!(
+            "worktree directory must be a directory: {}",
+            directory.display()
+        ));
+    }
     Ok(())
 }
 
@@ -453,7 +493,9 @@ fn display_error(error: impl std::fmt::Display) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{validate, validate_lsp_settings, AppSettings, SettingsStore};
+    use super::{
+        validate, validate_lsp_settings, validate_worktree_directory, AppSettings, SettingsStore,
+    };
     use std::fs;
 
     #[test]
@@ -498,6 +540,9 @@ mod tests {
         settings.agent.max_iterations = 64;
         settings.rag.provider = "local".into();
         settings.rag.automatic_retrieval = false;
+        let worktrees = root.join("worktrees");
+        fs::create_dir_all(&worktrees).unwrap();
+        settings.general.worktree_directory = worktrees.display().to_string();
         let snapshot = store.update(settings).unwrap();
 
         assert_eq!(snapshot.settings.general.conversation_font_size, 14);
@@ -509,6 +554,10 @@ mod tests {
         assert_eq!(snapshot.settings.agent.max_iterations, 64);
         assert_eq!(snapshot.settings.rag.provider, "local");
         assert!(!snapshot.settings.rag.automatic_retrieval);
+        assert_eq!(
+            snapshot.settings.general.worktree_directory,
+            worktrees.display().to_string()
+        );
         assert_eq!(snapshot.api_keys.get("glm"), Some(&true));
         let persisted = fs::read_to_string(app_data.join("settings.json")).unwrap();
         assert!(!persisted.contains("test-secret"));
@@ -521,6 +570,10 @@ mod tests {
         assert_eq!(reloaded.current().unwrap().appearance.theme, "light");
         assert_eq!(reloaded.current().unwrap().appearance.text_color, "#242a33");
         assert_eq!(reloaded.current().unwrap().agent.max_iterations, 64);
+        assert_eq!(
+            reloaded.current().unwrap().general.worktree_directory,
+            worktrees.display().to_string()
+        );
         assert_eq!(
             reloaded.current().unwrap().appearance.panel_color,
             "#e8ebf0"
@@ -552,6 +605,25 @@ mod tests {
         assert!(validate_lsp_settings(&settings).is_err());
         settings.lsp_args = vec!["bad\0arg".into()];
         assert!(validate_lsp_settings(&settings).is_err());
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn validates_optional_absolute_worktree_directory() {
+        let root = std::env::temp_dir().join(format!(
+            "stellarcode-worktree-settings-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let file = root.join("file.txt");
+        fs::write(&file, b"not a directory").unwrap();
+
+        assert!(validate_worktree_directory("").is_ok());
+        assert!(validate_worktree_directory(root.to_str().unwrap()).is_ok());
+        assert!(validate_worktree_directory("relative/path").is_err());
+        assert!(validate_worktree_directory(file.to_str().unwrap()).is_err());
+        assert!(validate_worktree_directory(root.join("missing").to_str().unwrap()).is_err());
 
         fs::remove_dir_all(root).unwrap();
     }

@@ -1,3 +1,5 @@
+"""Append-only MCP audit records with argument redaction at the persistence boundary."""
+
 from __future__ import annotations
 
 import json

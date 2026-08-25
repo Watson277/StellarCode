@@ -1,3 +1,5 @@
+"""Provider-neutral LLM contracts plus concrete text and vision adapters."""
+
 from stellarcode.llm.agnes_client import AgnesApiError, AgnesClient
 from stellarcode.llm.deepseek_client import DeepSeekApiError, DeepSeekClient
 from stellarcode.llm.factory import create_chat_client

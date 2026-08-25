@@ -1,3 +1,5 @@
+"""Named multi-agent roles used to build focused collaboration prompts."""
+
 from __future__ import annotations
 
 from enum import Enum

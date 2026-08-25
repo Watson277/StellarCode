@@ -1,3 +1,5 @@
+"""Tool schemas, execution registry, cancellation, and built-in filesystem tools."""
+
 from stellarcode.tools.builtin import build_default_registry
 from stellarcode.tools.registry import (
     ToolDefinition,

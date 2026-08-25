@@ -1,3 +1,5 @@
+"""Formats retrieved code chunks into bounded, source-attributed prompt context."""
+
 from __future__ import annotations
 
 from pathlib import Path

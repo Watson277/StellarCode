@@ -1,10 +1,16 @@
+"""ReAct execution loop and the prompt layers sent to an LLM provider.
+
+This module owns one conversation's live ``messages`` list.  Runtime persistence,
+task routing, and workspace isolation deliberately live elsewhere so Agent remains the
+single place that translates model tool calls into ToolRegistry executions.
+"""
+
 from __future__ import annotations
 
 import json
 import threading
 import time
 from collections.abc import Callable
-from datetime import datetime
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -26,6 +32,18 @@ from stellarcode.llm.types import (
 )
 from stellarcode.llm.message_history import repair_tool_message_history
 from stellarcode.memory import ConversationHistoryCompactor, MemoryManager
+from stellarcode.prompt import (
+    ContextKind,
+    PromptAssembler,
+    PromptContext,
+    PromptLayer,
+    PromptMode,
+    PromptSnapshot,
+    publish_prompt_snapshot,
+    runtime_context,
+    strip_internal_context_metadata,
+    untrusted_context_message,
+)
 from stellarcode.skill import (
     SkillContextBuffer,
     SkillRegistry,
@@ -39,60 +57,13 @@ from stellarcode.tools.registry import (
 )
 
 
-DEFAULT_SYSTEM_PROMPT = """You are StellarCode, a small coding agent.
+DEFAULT_SYSTEM_PROMPT = """## Execution role
 
-You can answer directly or call tools when you need local file or command context.
-Use tools only when they help. After receiving tool results, continue reasoning and
-produce a concise final answer for the user.
-
-Use list_dir to inspect a directory and delete_file to delete a file. Do not claim that
-a filesystem operation succeeded until its tool result confirms success.
-File tools accept absolute paths and may access locations outside the working directory.
-Tools whose names start with mcp__ come from configured third-party MCP servers. Use
-their descriptions and JSON schemas like built-in tools; do not invent MCP tool names.
-Use web_search for current, recent, or uncertain public information. Use web_fetch when
-the user provides a known HTTP or HTTPS URL, or after web_search identifies a page that
-needs deeper reading. Cite the result URLs in the final answer when web tools are used.
-For a normal public page with a known URL, try web_fetch once because it is cheaper and
-returns clean text. If web_fetch fails, returns an empty or blocked shell, or the page
-needs JavaScript, interaction, forms, console logs, or network inspection, use the
-available chrome-devtools MCP tools. Sites known to resist static fetching, including
-WeChat article pages, may go directly to chrome-devtools. Navigate or open the page,
-wait for the needed content, then prefer mcp__chrome-devtools__take_snapshot for readable
-DOM text. Use take_screenshot only when the user explicitly requests an image or visual
-inspection. Prefer fill_form for multiple fields and wait_for for asynchronous content.
-Chrome starts in isolated mode and cannot see the user's existing cookies or tabs. If a
-task genuinely requires an existing login session, call browser_status and then
-browser_connect. After connecting, use browser_tabs or list_pages to select the relevant
-tab. Call browser_disconnect when shared access is no longer needed. In shared mode,
-close_page may only close a tab opened by StellarCode during the current shared session.
-Private repositories and other authenticated pages must use the shared browser session.
-If browser_connect fails, stop browser work and report its exact setup error. Do not fall
-back to web_fetch, git, gh, or execute_command unless the user explicitly asks to use
-separately configured command-line credentials.
-For identity, profile, birthday, membership, and other factual questions, search once,
-then inspect Search quality and Fetch guidance. Fetch at most three relevant pages when
-the snippets are insufficient or need verification. A low-quality search is not evidence
-that the requested fact is unavailable. Do not keep inventing slightly different queries:
-use the fallback results, fetch the best candidates, or explain the remaining uncertainty.
-Do not repeat a successful search or fetch unless the user asks for a refresh.
-When several tool calls are independent, return them together in one response so they
-can run in parallel. Keep dependent tool calls in separate rounds.
-Avoid full-disk recursive scans. Narrow exploration with list_dir, read_file, and
-search_code instead.
-User messages may contain @image:<path>, @image:"path with spaces", or @clipboard.
-When an image attachment is present, inspect the actual image instead of inferring its
-contents from the filename or prior context. Tool-returned images arrive in a following
-user-role attachment message for API compatibility.
-Desktop user messages may also contain @skill:<name> and
-@mcp:<mcp__server__tool> references. An explicitly referenced enabled Skill is loaded
-into that same task. Treat an MCP reference as a preference for that exact discovered
-tool when relevant, not as permission to call it blindly or bypass approval and policy.
-
-Follow the retrieval policy stated in the search_code tool description. When automatic
-retrieval is enabled, use search_code for questions about how the current codebase works
-before answering; when it is disabled, only use RAG on the user's explicit request. Use
-read_file when exact surrounding source is needed after retrieval.
+Fulfill the user's request directly when no workspace evidence or action is needed.
+Otherwise inspect, act, and verify iteratively with the available tools. Continue from
+tool results until the requested outcome is complete, a policy decision stops the action,
+or a concrete blocker requires user input. Do not stop after merely describing what could
+be done.
 """
 
 
@@ -103,8 +74,7 @@ class ChatClient(Protocol):
         tools: list[dict[str, Any]] | None = None,
         temperature: float = 0.2,
         on_delta: Callable[[str], None] | None = None,
-    ) -> ChatResult | dict[str, Any]:
-        ...
+    ) -> ChatResult | dict[str, Any]: ...
 
 
 class Agent:
@@ -123,11 +93,16 @@ class Agent:
         skill_context_buffer: SkillContextBuffer | None = None,
         workspace: str | Path | None = None,
         context_window: int = 200_000,
+        rag_auto_retrieval: bool | None = True,
         history_summary: str = "",
         history_compaction_count: int = 0,
         history_last_compacted_at: str | None = None,
         llm_operation_name: str = "react",
         stream_output: bool = True,
+        delta_event_type: str = "assistant.delta",
+        delta_event_data: dict[str, Any] | None = None,
+        prompt_mode: PromptMode = PromptMode.REACT,
+        prompt_assembler: PromptAssembler | None = None,
     ) -> None:
         if max_web_search_calls < 1:
             raise ValueError("max_web_search_calls must be at least 1.")
@@ -148,6 +123,15 @@ class Agent:
         self._current_query = ""
         self.llm_operation_name = llm_operation_name
         self.stream_output = stream_output
+        # Plan mode reuses the provider streaming path but routes each step's
+        # visible text to its own plan card instead of the main assistant bubble.
+        self.delta_event_type = delta_event_type
+        self.delta_event_data = dict(delta_event_data or {})
+        self.prompt_mode = prompt_mode
+        self.prompt_assembler = prompt_assembler or PromptAssembler()
+        self._current_memory_context = ""
+        self._last_prompt_snapshot: PromptSnapshot | None = None
+        self.rag_auto_retrieval = rag_auto_retrieval
         self.history_compactor = ConversationHistoryCompactor(
             context_window=context_window,
             summary=history_summary,
@@ -158,6 +142,8 @@ class Agent:
 
     def reset(self) -> None:
         self.messages = [{"role": "system", "content": self.base_system_prompt}]
+        self._current_memory_context = ""
+        self._last_prompt_snapshot = None
         self.history_compactor.reset()
         if self.skill_context_buffer:
             self.skill_context_buffer.clear()
@@ -173,11 +159,9 @@ class Agent:
         prune_historical_images(self.messages)
         if self.memory_manager:
             self.memory_manager.add_user_message(user_input)
-        self._refresh_system_prompt(user_input)
+        self._refresh_system_prompt(user_input, include_memory_context=True)
 
-        self.messages.append(
-            self.image_parser.user_message(self._prepend_skill_bodies(user_input))
-        )
+        self.messages.append(self.image_parser.user_message(self._prepend_skill_bodies(user_input)))
         self._checkpoint("user_message")
         return self._run_iterations(cancellation_event)
 
@@ -193,7 +177,7 @@ class Agent:
         self._web_search_calls = 0
         prune_historical_images(self.messages)
         self.messages, _ = repair_tool_message_history(self.messages)
-        self._refresh_system_prompt(original_input)
+        self._refresh_system_prompt(original_input, include_memory_context=True)
         self.messages.append(
             {
                 "role": "user",
@@ -218,10 +202,16 @@ class Agent:
 
         for iteration in range(1, self.max_iterations + 1):
             raise_if_cancelled(cancellation_event)
+            # One registry snapshot drives both the prompt's capability policy and the
+            # provider schemas. Dynamic MCP/browser registration can therefore take
+            # effect on the next model round without the two views drifting apart.
+            tool_definitions = self.tool_registry.list_tools()
+            available_tools = frozenset(tool.name for tool in tool_definitions)
             try:
                 assistant_message = self._chat(
-                    self.tool_registry.schemas(),
+                    [tool.to_openai_tool() for tool in tool_definitions],
                     cancellation_event,
+                    available_tools=available_tools,
                 )
             except TaskCancelledError:
                 raise
@@ -268,6 +258,7 @@ class Agent:
                     if repeated_failures[fingerprint] >= 2:
                         repeated_failure_result = tool_result
             self._append_tool_images(execution_results)
+            self._append_loaded_skill_context()
             self._checkpoint("tool_results")
             raise_if_cancelled(cancellation_event)
             if repeated_failure_result is not None:
@@ -391,20 +382,74 @@ class Agent:
             if message is not None:
                 self.messages.append(message)
 
-    def _refresh_system_prompt(self, query: str) -> None:
-        content = f"{self.base_system_prompt}\n\n{runtime_context()}"
+    def _refresh_system_prompt(
+        self,
+        query: str,
+        *,
+        available_tools: frozenset[str] | None = None,
+        include_memory_context: bool = False,
+        publish_snapshot: bool = True,
+    ) -> None:
+        # Rebuild instead of append. Stable policies remain in the system role;
+        # query-sensitive Memory is replaced separately as untrusted user context.
+        skill_index = ""
         if self.skill_registry:
             skill_index = format_skill_index(self.skill_registry.enabled_skills())
-            if skill_index:
-                content = f"{content}\n\n{skill_index}"
-        if self.memory_manager:
-            memory_context = self.memory_manager.build_context_for_query(query)
-            if memory_context:
-                content = f"{content}\n\n{memory_context}"
-        self.messages[0] = {
-            "role": "system",
-            "content": self.history_compactor.decorate_system_prompt(content),
-        }
+        if include_memory_context and self.memory_manager:
+            self._current_memory_context = self.memory_manager.build_context_for_query(query)
+        assembly = self.prompt_assembler.assemble(
+            self.prompt_mode,
+            PromptContext(
+                base_prompt=self.base_system_prompt,
+                runtime_context=runtime_context(),
+                skill_index=skill_index,
+                memory_context=self._current_memory_context,
+                available_tools=(
+                    available_tools
+                    if available_tools is not None
+                    else frozenset(tool.name for tool in self.tool_registry.list_tools())
+                ),
+                rag_auto_retrieval=self.rag_auto_retrieval,
+            ),
+        )
+        system_message = {"role": "system", "content": assembly.system_prompt}
+        if self.messages and self.messages[0].get("role") == "system":
+            self.messages[0] = system_message
+        else:
+            self.messages.insert(0, system_message)
+        self.messages = self.history_compactor.sync_summary_context(self.messages)
+
+        summary_layers: list[PromptLayer] = []
+        summary_message = untrusted_context_message(
+            ContextKind.CONVERSATION_SUMMARY,
+            self.history_compactor.summary,
+        )
+        if summary_message is not None:
+            summary_layers.append(
+                PromptLayer(
+                    "conversation_summary",
+                    "user",
+                    str(summary_message["content"]),
+                    sensitive=True,
+                )
+            )
+        self._last_prompt_snapshot = assembly.snapshot(
+            self.prompt_mode,
+            additional_layers=summary_layers,
+        )
+        if publish_snapshot:
+            publish_prompt_snapshot(self.llm_client, self._last_prompt_snapshot)
+
+        if include_memory_context:
+            self.messages.extend(assembly.context_messages)
+
+    def prompt_snapshot(self, *, include_sensitive: bool = False) -> dict[str, Any]:
+        """Return the current ReAct prompt preview without exposing Memory by default."""
+
+        if self._last_prompt_snapshot is None:
+            self._refresh_system_prompt("", publish_snapshot=False)
+        assert self._last_prompt_snapshot is not None
+        return self._last_prompt_snapshot.to_dict(include_sensitive=include_sensitive)
 
     def _prepend_skill_bodies(self, user_input: str) -> str:
         if not self.skill_context_buffer:
@@ -413,6 +458,25 @@ class Agent:
         if not loaded:
             return user_input
         return f"{loaded}\n用户输入：\n{user_input}"
+
+    def _append_loaded_skill_context(self) -> None:
+        """Make a tool-loaded Skill available in the very next model round."""
+
+        if not self.skill_context_buffer:
+            return
+        loaded = self.skill_context_buffer.drain()
+        if not loaded:
+            return
+        self.messages.append(
+            {
+                "role": "user",
+                "content": (
+                    f"{loaded}\n"
+                    "Use this guidance for the current task. Continue from the tool results "
+                    "above without asking the user to repeat the request."
+                ),
+            }
+        )
 
     def _finish_after_repeated_failure(
         self,
@@ -433,7 +497,11 @@ class Agent:
         )
         self._checkpoint("repeated_failure_prompt")
         try:
-            assistant_message = self._chat(None, cancellation_event)
+            assistant_message = self._chat(
+                None,
+                cancellation_event,
+                available_tools=frozenset(),
+            )
         except TaskCancelledError:
             raise
         except Exception as exc:
@@ -474,7 +542,11 @@ class Agent:
         self._checkpoint("iteration_limit_prompt")
         final_error = ""
         try:
-            assistant_message = self._chat(None, cancellation_event)
+            assistant_message = self._chat(
+                None,
+                cancellation_event,
+                available_tools=frozenset(),
+            )
             self.messages.append(assistant_message)
             self._checkpoint("assistant_final")
             content = str(assistant_message.get("content") or "").strip()
@@ -485,9 +557,7 @@ class Agent:
         except TaskCancelledError:
             raise
         except Exception as exc:
-            final_error = (
-                f"Final answer request failed: {type(exc).__name__}: {exc}"
-            )
+            final_error = f"Final answer request failed: {type(exc).__name__}: {exc}"
 
         content = _iteration_limit_diagnostic(
             self.max_iterations,
@@ -536,7 +606,16 @@ class Agent:
         self,
         tools: list[dict[str, Any]] | None,
         cancellation_event: threading.Event | None,
+        *,
+        available_tools: frozenset[str] | None = None,
     ) -> dict[str, Any]:
+        if available_tools is not None:
+            self._refresh_system_prompt(
+                self._current_query,
+                available_tools=available_tools,
+            )
+        # Message-history compaction is distinct from long-term memory.  It
+        # shrinks the exact provider payload while preserving tool boundaries.
         compaction_needed = self.history_compactor.needs_compaction(self.messages, tools)
         compaction = None
         if compaction_needed:
@@ -559,7 +638,10 @@ class Agent:
             )
             if compaction is not None:
                 self.messages = compaction.messages
-                self._refresh_system_prompt(self._current_query)
+                self._refresh_system_prompt(
+                    self._current_query,
+                    available_tools=available_tools,
+                )
                 self._checkpoint("history_compacted")
                 self._emit_event(
                     "history.compacted",
@@ -595,15 +677,14 @@ class Agent:
             pending_chars = 0
             last_flush = time.monotonic()
             emitted_delta = True
-            self._emit_event("assistant.delta", {"text": text})
+            self._emit_event(
+                self.delta_event_type,
+                {**self.delta_event_data, "text": text},
+            )
 
         def collect_delta(text: str) -> None:
             nonlocal pending_chars
-            if (
-                not text
-                or cancellation_event is not None
-                and cancellation_event.is_set()
-            ):
+            if not text or cancellation_event is not None and cancellation_event.is_set():
                 return
             pending_delta.append(text)
             pending_chars += len(text)
@@ -614,11 +695,12 @@ class Agent:
             collect_delta if self.stream_output and self.event_callback is not None else None
         )
         try:
+            provider_messages = strip_internal_context_metadata(self.messages)
             with llm_operation(self.llm_operation_name):
                 raw = cancellable_call(
                     lambda: chat_with_optional_delta(
                         self.llm_client,
-                        self.messages,
+                        provider_messages,
                         tools=tools,
                         temperature=0.2,
                         on_delta=delta_callback,
@@ -630,13 +712,16 @@ class Agent:
         result = normalize_chat_result(
             raw,
             client=self.llm_client,
-            messages=self.messages,
+            messages=provider_messages,
             tools=tools,
         )
         if emitted_delta and result.message.get("tool_calls"):
             # A model may emit a short preamble before requesting tools. Remove that
             # provisional text so the following final-answer stream does not append to it.
-            self._emit_event("assistant.delta", {"text": "", "reset": True})
+            self._emit_event(
+                self.delta_event_type,
+                {**self.delta_event_data, "text": "", "reset": True},
+            )
         if self.memory_manager:
             self.memory_manager.token_budget.record_usage(
                 result.usage.input_tokens,
@@ -724,10 +809,7 @@ def _iteration_limit_diagnostic(
 ) -> str:
     lines = [
         f"Agent could not finish after {max_iterations} tool-call rounds.",
-        (
-            "Reason: the model requested tools in every round and did not produce "
-            "a final answer."
-        ),
+        ("Reason: the model requested tools in every round and did not produce a final answer."),
     ]
     if final_error:
         lines.append(final_error)
@@ -764,19 +846,6 @@ def _tool_result_summary(result: ToolExecutionResult) -> str:
         if key in {"Search provider", "Results", "Search quality"}:
             metadata[key] = value
     values = [
-        metadata[key]
-        for key in ("Search provider", "Results", "Search quality")
-        if key in metadata
+        metadata[key] for key in ("Search provider", "Results", "Search quality") if key in metadata
     ]
     return f" ({', '.join(values)})" if values else ""
-
-
-def runtime_context(now: datetime | None = None) -> str:
-    local_now = now.astimezone() if now is not None else datetime.now().astimezone()
-    timezone_name = local_now.tzname() or str(local_now.utcoffset() or "local")
-    return (
-        "Runtime context:\n"
-        f"- Current local date: {local_now.date().isoformat()}\n"
-        f"- Current local time: {local_now.strftime('%H:%M:%S')} ({timezone_name})\n"
-        "- Treat words such as today, latest, current, and recently relative to this date."
-    )

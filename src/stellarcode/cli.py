@@ -1,7 +1,10 @@
+"""Command-line entry point that assembles the interactive StellarCode Runtime."""
+
 from __future__ import annotations
 
 import argparse
 import atexit
+import sys
 from collections.abc import Callable
 from pathlib import Path
 
@@ -252,14 +255,20 @@ def handle_browser_command(command: str, controller: BrowserController) -> str:
 
 
 def main() -> None:
+    if len(sys.argv) > 1 and sys.argv[1] == "benchmark-agent":
+        from stellarcode.benchmark import main as benchmark_main
+
+        raise SystemExit(benchmark_main(sys.argv[2:]))
+    if len(sys.argv) > 1 and sys.argv[1] == "benchmark-run":
+        from stellarcode.benchmark_runner import main as benchmark_runner_main
+
+        raise SystemExit(benchmark_runner_main(sys.argv[2:]))
     args = create_parser().parse_args()
 
     load_dotenv()
     workspace = Path(args.workspace).resolve()
     trace_dir = (
-        Path(args.trace_dir).resolve()
-        if args.trace_dir
-        else workspace / ".stellarcode" / "traces"
+        Path(args.trace_dir).resolve() if args.trace_dir else workspace / ".stellarcode" / "traces"
     )
     trace_recorder = TraceRecorder(trace_dir)
     if args.trace:
@@ -296,7 +305,10 @@ def main() -> None:
         user_dir=user_skills_dir,
         project_dir=workspace / ".stellarcode" / "skills",
         state_store=skill_state_store,
-        startup_warnings=bootstrap_bundled_skills(user_skills_dir),
+        startup_warnings=bootstrap_bundled_skills(
+            user_skills_dir,
+            state_store=skill_state_store,
+        ),
     )
     skill_registry.reload()
     skill_context_buffer = SkillContextBuffer()
@@ -313,9 +325,7 @@ def main() -> None:
     )
     try:
         mcp_manager.load_configured_servers()
-        mcp_manager.start_all(
-            progress=lambda message: console.print(message, markup=False)
-        )
+        mcp_manager.start_all(progress=lambda message: console.print(message, markup=False))
     except McpConfigError as exc:
         console.print(f"MCP configuration error: {exc}", markup=False)
     atexit.register(mcp_manager.close)
@@ -330,6 +340,7 @@ def main() -> None:
     memory_manager = MemoryManager(
         storage_dir=args.memory_dir,
         short_term_tokens=args.short_memory_tokens,
+        llm_client=llm_client,
     )
     agent = Agent(
         llm_client=llm_client,
@@ -340,6 +351,7 @@ def main() -> None:
         skill_registry=skill_registry,
         skill_context_buffer=skill_context_buffer,
         workspace=workspace,
+        rag_auto_retrieval=True,
     )
     plan_agent = PlanExecuteAgent(
         llm_client=llm_client,
@@ -351,6 +363,7 @@ def main() -> None:
         skill_registry=skill_registry,
         skill_context_buffer=skill_context_buffer,
         workspace=workspace,
+        rag_auto_retrieval=True,
     )
     team_agent = AgentOrchestrator(
         llm_client=llm_client,
@@ -362,6 +375,7 @@ def main() -> None:
         progress_callback=lambda message: console.print(message, markup=False),
         skill_registry=skill_registry,
         workspace=workspace,
+        rag_auto_retrieval=True,
     )
     plan_mode = False
     team_mode = False
@@ -382,24 +396,16 @@ def main() -> None:
     console.print("Type /plan for Plan-and-Execute or /team for one Multi-Agent task.")
     console.print("Type /react to return to ReAct, /clear to reset the current context.")
     console.print(
-        "Type /memory for memory status, /save <fact> to persist, "
-        "/recall <query> to search."
+        "Type /memory for memory status, /save <fact> to persist, /recall <query> to search."
     )
     console.print("Type /index, /search <query>, or /graph <name> for code RAG.")
-    ready_mcp = sum(
-        server.status == McpServerStatus.READY for server in mcp_manager.servers()
-    )
+    ready_mcp = sum(server.status == McpServerStatus.READY for server in mcp_manager.servers())
     console.print(
-        f"MCP servers: {ready_mcp}/{len(mcp_manager.servers())} ready; "
-        "type /mcp for details."
+        f"MCP servers: {ready_mcp}/{len(mcp_manager.servers())} ready; type /mcp for details."
     )
-    console.print(
-        "Type /browser status or /browser connect to reuse a logged-in Chrome session."
-    )
+    console.print("Type /browser status or /browser connect to reuse a logged-in Chrome session.")
     console.print(f"{startup_summary(skill_registry)}; type /skill for details.")
-    console.print(
-        'Attach images with @image:<path>, @image:"path with spaces", or @clipboard.'
-    )
+    console.print('Attach images with @image:<path>, @image:"path with spaces", or @clipboard.')
     skill_warnings = format_skill_warnings(skill_registry, skill_state_store)
     if skill_warnings:
         console.print(skill_warnings, markup=False)
@@ -460,8 +466,7 @@ def main() -> None:
             continue
         if user_input == "/hitl" or user_input.startswith("/hitl "):
             console.print(
-                "HITL is controlled by access mode; use /mode restricted or "
-                "/mode full-access"
+                "HITL is controlled by access mode; use /mode restricted or /mode full-access"
             )
             continue
         if user_input == "/memory":
@@ -499,8 +504,7 @@ def main() -> None:
             else:
                 console.print(
                     "\n".join(
-                        f"- {entry.id} [{entry.type.value}] {entry.content}"
-                        for entry in results
+                        f"- {entry.id} [{entry.type.value}] {entry.content}" for entry in results
                     )
                 )
             continue

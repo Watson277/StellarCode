@@ -1,3 +1,5 @@
+"""Atomic JSON persistence for project-level, user-auditable long-term facts."""
+
 from __future__ import annotations
 
 import json

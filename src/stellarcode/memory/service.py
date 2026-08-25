@@ -1,6 +1,9 @@
+"""Project-level memory owner that shares facts while isolating conversation caches."""
+
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Any
 
 from stellarcode.memory.entry import MemoryEntry, MemoryType
 from stellarcode.memory.long_term import LongTermMemory
@@ -25,11 +28,13 @@ class ProjectMemoryService:
         self,
         *,
         short_term_tokens: int = 8192,
+        llm_client: Any | None = None,
     ) -> MemoryManager:
         return MemoryManager(
             short_term_tokens=short_term_tokens,
             context_window=self.context_window,
             long_term=self.long_term,
+            llm_client=llm_client,
         )
 
     def snapshot(self, query: str = "", limit: int = 200) -> dict[str, object]:

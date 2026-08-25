@@ -37,6 +37,18 @@ Unknown additive fields must be ignored. An unknown `protocol_version`, message 
 request `method`, or event `type` must produce an explicit protocol error rather than being
 silently interpreted.
 
+## State machine ownership
+
+The desktop and Python Runtime use separate state machines. The desktop machine owns only
+connection/focus/submit/cancel/replay UI state; Python owns live task routes and the
+`accepted -> running/cancelling -> finalizing -> released` lifecycle. A successful request
+acknowledges acceptance but does not make the desktop authoritative for task completion.
+Only a matching terminal event or a reconciled `workspace.open` recovery snapshot releases
+the frontend task route. `workspace.open.active_tasks[]` may include the additive `phase`
+field (`accepted`, `running`, `cancelling`, or `finalizing`). Durable recovery continues to
+come from checkpoints and EventJournal, not from either process's in-memory state. See
+`docs/frontend-runtime-state-machines.md`.
+
 ## Request and response
 
 Example request:
@@ -62,7 +74,7 @@ Initial request methods:
 | `runtime.ping` | Runtime version and capabilities |
 | `workspace.open` | Workspace/model metadata |
 | `workspace.close` | Close acknowledgement |
-| `runtime.set_access_mode` | Updated `restricted` or `full-access` mode |
+| `runtime.set_access_mode` | Updated per-conversation `restricted` or `full-access` mode (`session_id` required) |
 | `session.list` | Persisted conversations for the active project |
 | `session.create` | New `session_id` |
 | `session.open` | Conversation snapshot |
@@ -71,6 +83,12 @@ Initial request methods:
 | `session.reset` | Reset acknowledgement |
 | `session.set_mode` | Updated `react`, `plan`, or `team` mode |
 | `session.set_trace` | Updated per-conversation Trace state and log path |
+| `prompt.snapshot` | Versioned Prompt layers, character/estimated-Token counts and SHA-256 hashes; Memory/summary bodies are redacted unless `include_memory=true` |
+
+Access mode is isolated by conversation. A task freezes its conversation's mode when
+execution begins, so changing an idle conversation cannot weaken or strengthen another
+conversation that is already running. Full access remains process-local and resets when
+the project Runtime is restarted.
 | `mcp.list` | Current server states, safe configuration metadata, and discovered tools |
 | `mcp.install` | Updated MCP snapshot after writing and starting a project server |
 | `mcp.set_enabled` | Updated MCP snapshot after persisting a project enable override |
@@ -86,6 +104,9 @@ Initial request methods:
 | `memory.delete` / `memory.clear` | Delete one fact or confirmed-clear project memory |
 | `skill.list` / `skill.get` | Structured Skill inventory and detail |
 | `skill.set_enabled` / `skill.reload` | Persist global-by-name enablement or rescan Skill directories |
+| `skill.diff` | Bounded current-to-bundled Diff plus optimistic current/bundled hashes |
+| `skill.update` / `skill.restore_default` | Confirmed replacement after both reviewed hashes still match |
+| `skill.keep_custom` | Preserve the local tree and acknowledge only the reviewed bundled release |
 | `browser.snapshot` / `browser.probe` | Current Chrome session state or explicit local CDP probe |
 | `browser.connect` / `browser.disconnect` | Confirmed shared/isolated Chrome transition |
 | `browser.tabs` | Bounded Chrome DevTools tab output |
@@ -113,6 +134,11 @@ while different sessions may run concurrently within one project or across proje
 cancellation and approval resolution are routed by durable `task_id`/`session_id`, not by the
 currently selected workspace. Per-task checkpoints are stored independently, and task-scoped
 events always enter the owning project's journal even after the user switches projects.
+
+Every project-scoped desktop request also carries an explicit `project_id`. The Sidecar validates
+that `project_id`, `session_id`, and `task_id` resolve to the same owner before dispatch. After a
+process restart the desktop reopens every project that owned active work, reconciles the union of
+`active_tasks[]` and `recoveries[]`, and sends each `task.recover` to that explicit project.
 
 Management jobs such as RAG indexing and diagnostics remain project-scoped. A project may
 reject mutations while its own management job is active without blocking tasks in another
@@ -185,6 +211,11 @@ the Runtime writes redacted JSONL entries for LLM requests/responses, full tool 
 approval activity, incoming Runtime requests, and Runtime events. The active file path is
 returned by `session.set_trace` and included in the conversation snapshot. Trace files are
 stored under `<workspace>/.stellarcode/traces`.
+
+Every shared Prompt assembly also adds a `prompt_assembled` Trace entry. It records the
+Prompt version and each layer's role, character count, preflight Token estimate, sensitivity
+flag, and SHA-256 hash without duplicating any layer body. This makes Prompt drift auditable
+without adding Memory text to the new observability event.
 
 ### Task and assistant
 
@@ -260,11 +291,17 @@ Each `tool_call_id` must have one `tool.started` and exactly one terminal tool e
 arguments and result previews must pass the same redaction policy used by trace logging.
 Large results remain in Python history and are represented by bounded previews in events.
 
-`write_file` 和 `delete_file` 的 `tool.started.data.change_preview` 描述执行前的文件
+`workspace.snapshot.created` 的 protection payload 可包含 `worktree_isolated`、
+`worktree_path` 和 `merge_state`。`worktree_isolated=true` 表示该任务的内置文件操作和命令
+cwd 正在独立 Git worktree 中执行。终态 `changes.merge_state=merged` 表示 patch 已安全合并；
+`merge_conflict=true` 表示预检拒绝覆盖新项目状态，任务改为 failed 且 worktree 被保留。
+
+`write_file`、`apply_patch` 和 `delete_file` 的 `tool.started.data.change_preview` 描述执行前的文件
 状态，包括操作类型、路径、工作区范围、`rollback_protected`、`protection_reason`、
 SHA-256、增删统计和有界 unified diff。`protection_reason` 的稳定值为
 `outside_workspace`、`generated_or_internal_path`、`sensitive_path` 或 `preview_error`。
-`write_file` 的完整替换内容不会写入事件参数。敏感路径隐藏 diff，二进制文件只报告
+`write_file` 的完整替换内容和 `apply_patch` 的精确替换文本不会写入事件参数；后者只记录
+编辑数量与字符统计。敏感路径隐藏 diff，二进制文件只报告
 内容发生变化。未受保护路径仍可在策略允许时执行，但前端必须明确标记它不能由任务级
 Side-Git 回滚。该预览是文件工具能力，不代表任意 shell/MCP 副作用都能在执行前转换为
 逐文件 diff。
@@ -297,18 +334,29 @@ Python validates the request's session/task against the active approval context 
 `approval.resolved` before waking the blocked tool thread, so an acknowledged decision cannot
 be lost or appear after the tool outcome in durable history.
 
-对于 `write_file` 和 `delete_file`，`approval.requested.data.change_preview` 与
+对于 `write_file`、`apply_patch` 和 `delete_file`，`approval.requested.data.change_preview` 与
 `tool.started` 使用相同结构。批准后 Runtime 将预览时的路径和修改前哈希绑定到实际
 操作；如果审批和执行之间目标文件发生变化，工具必须失败并重新读取，而不能执行已经
 过期的覆盖操作。
 
 ### Plan and Multi-Agent
 
+- `plan.planning.started` / `plan.planning.delta`
 - `plan.created`
 - `plan.step.started`
+- `plan.step.delta`
 - `plan.step.completed`
 - `plan.step.failed`
 - `plan.step.skipped`
+
+Plan deltas are emitted from the same provider streaming interface as ReAct, but carry a
+`step_id` and render only inside that step. Planner deltas are visible in the temporary
+planning card until `plan.created` replaces it with the validated DAG. A reset removes a
+provisional tool-call preamble rather than treating it as a step result.
+
+Team collaboration adds `team.agent.delta`; it is scoped by Agent name and Team task id and
+is rendered in that child Agent's expandable dialogue. The terminal MessageBus reply replaces
+the accumulated child stream, so the durable result remains authoritative.
 
 Parallel step events can interleave, but session sequence numbers provide a stable rendering
 order. A Worker name is presentation metadata and must not be used as a task identifier.
@@ -366,6 +414,14 @@ execution event journal. This avoids duplicating long-term Memory content or Ski
 session replay. Memory mutation and Skill/Browser transitions are rejected while another
 workspace mutation is active. Clearing Memory and connecting shared Chrome require an explicit
 confirmation flag; Browser snapshots never probe a TCP endpoint implicitly.
+
+Bundled Skill snapshots expose versions, whole-tree SHA-256 hashes, customization flags, and
+`current`, `customized`, `update_available`, `custom_kept`, or `error` upgrade state. The
+Runtime automatically upgrades only copies that still equal their trusted installed hash.
+Explicit update/restore requests require `confirmed: true` and the hashes returned by the latest
+`skill.diff`; stale previews fail closed. `skill.keep_custom` carries the same hashes but does not
+write Skill content. Bundled reconciliation is limited to the exact User-layer template path and
+never mutates a same-name Project override.
 
 Workspace diagnostics use these non-session events:
 
@@ -737,7 +793,9 @@ a late old-process `runtime.shutdown` event from making the new process's sequen
 
 ## Deferred from v1
 
-- Structured Plan/Team step events (progress is currently sent as `assistant.thinking`)
+- Rich Team streaming beyond text deltas (for example, structured per-token reasoning or
+  provider-native tool-call deltas). Team text streaming is already exposed through
+  `team.agent.delta` and rendered in the expandable child-Agent card.
 - Packaged/frozen Python runtime distribution
 - Multiple desktop clients attached to one Runtime
 - Remote/network transport

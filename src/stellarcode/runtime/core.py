@@ -1,3 +1,10 @@
+"""Project Runtime composition root.
+
+``RuntimeSession`` owns project-scoped services (MCP, RAG, long-term memory and
+workspace protection) and creates isolated conversation runtimes.  It is intentionally
+the boundary between durable project state and short-lived Agent/Plan/Team instances.
+"""
+
 from __future__ import annotations
 
 import json
@@ -15,7 +22,12 @@ from dotenv import load_dotenv
 
 from stellarcode.agent import Agent
 from stellarcode.cancellation import TaskCancelledError
-from stellarcode.browser import BrowserController, BrowserGuard, BrowserSession, register_browser_tools
+from stellarcode.browser import (
+    BrowserController,
+    BrowserGuard,
+    BrowserSession,
+    register_browser_tools,
+)
 from stellarcode.diagnostics import DiagnosticsService, LspConfig
 from stellarcode.llm import TokenUsage, UsageLedger, create_chat_client
 from stellarcode.llm.types import current_llm_scope, llm_runtime_scope
@@ -32,19 +44,34 @@ from stellarcode.plan import ExecutionPlan, PlanExecuteAgent, Task, TaskStatus, 
 from stellarcode.path_utils import subprocess_safe_path
 from stellarcode.protection import WorkspaceProtectionService
 from stellarcode.rag import EmbeddingClient, RagService, RagSourceStore
-from stellarcode.runtime.hitl import RuntimeHitlHandler
+from stellarcode.runtime.hitl import RuntimeHitlHandler, task_approval_scope
 from stellarcode.runtime.attachments import PreparedAttachments, prepare_attachments
 from stellarcode.runtime.recovery import EventJournal, TaskCheckpointStore
 from stellarcode.skill import (
+    BundledSkillManager,
     SkillContextBuffer,
     SkillRegistry,
     SkillStateStore,
-    bootstrap_bundled_skills,
     explicit_skill_context,
     register_skill_tools,
 )
+from stellarcode.task_workspace import task_workspace_scope
 from stellarcode.tools import build_default_registry
 from stellarcode.trace import ScopedTraceRecorder, TracingChatClient
+
+
+def _load_runtime_environment(workspace: Path) -> None:
+    """Load user and project `.env` files without relying on process CWD.
+
+    A packaged desktop build passes an app-data `.env` explicitly. Development
+    keeps using the repository `.env`; the process environment is never
+    overridden in either case.
+    """
+
+    configured = os.getenv("STELLARCODE_ENV_FILE", "").strip()
+    if configured:
+        load_dotenv(Path(configured), override=False)
+    load_dotenv(workspace / ".env", override=False)
 
 
 @dataclass(frozen=True)
@@ -52,6 +79,7 @@ class RuntimeSettings:
     workspace: Path
     project_id: str = "unregistered"
     data_dir: Path | None = None
+    worktree_dir: Path | None = None
     mode: str = "react"
     access_mode: str = "restricted"
     max_iterations: int = 8
@@ -73,6 +101,7 @@ class ConversationRuntime:
     id: str
     title: str
     mode: str
+    access_mode: str
     created_at: str
     updated_at: str
     title_is_custom: bool
@@ -93,6 +122,7 @@ class ConversationRuntime:
             "id": self.id,
             "title": self.title,
             "mode": self.mode,
+            "access_mode": self.access_mode,
             "created_at": self.created_at,
             "updated_at": self.updated_at,
             "message_count": len(self.transcript),
@@ -113,9 +143,9 @@ class RuntimeSession:
         emit: Any,
         event_journal: EventJournal | None = None,
     ) -> None:
-        load_dotenv()
         self.settings = settings
         self.workspace = subprocess_safe_path(settings.workspace)
+        _load_runtime_environment(self.workspace)
         self.project_id = settings.project_id
         self.access_mode = settings.access_mode
         self._emit = emit
@@ -147,10 +177,13 @@ class RuntimeSession:
         self.workspace_protection = WorkspaceProtectionService(
             self.workspace,
             self.project_data_dir / "workspace-protection",
+            worktree_root=(
+                settings.worktree_dir.resolve() / "projects" / self.project_id / "w"
+                if settings.worktree_dir is not None
+                else None
+            ),
         )
-        self.event_journal = event_journal or EventJournal(
-            self.project_data_dir / "events.jsonl"
-        )
+        self.event_journal = event_journal or EventJournal(self.project_data_dir / "events.jsonl")
         self.task_checkpoints = TaskCheckpointStore(
             self.project_data_dir / "recovery" / "active-task.json"
         )
@@ -165,6 +198,7 @@ class RuntimeSession:
         self.hitl_handler = RuntimeHitlHandler(
             lambda event_type, data: self._emit_event(event_type, data),
             enabled=settings.access_mode == "restricted",
+            is_task_cancelled=self._is_task_cancelled,
         )
         self.registry = build_default_registry(
             self.workspace,
@@ -173,12 +207,15 @@ class RuntimeSession:
             max_parallel_tools=settings.max_parallel_tools,
             tool_batch_timeout_seconds=settings.tool_batch_timeout,
             trace_recorder=self.trace_recorder,
-            rag_auto_retrieval=settings.rag_auto_retrieval,
         )
         state_path = Path.home() / ".stellarcode" / "skills.json"
         user_skills_dir = Path.home() / ".stellarcode" / "skills"
-        skill_bootstrap_warnings = bootstrap_bundled_skills(user_skills_dir)
         self.skill_state_store = SkillStateStore(state_path)
+        self.skill_upgrade_manager = BundledSkillManager(
+            user_skills_dir,
+            self.skill_state_store,
+        )
+        skill_bootstrap_warnings = self.skill_upgrade_manager.bootstrap()
         self.skill_registry = SkillRegistry(
             user_dir=user_skills_dir,
             project_dir=self.workspace / ".stellarcode" / "skills",
@@ -248,6 +285,45 @@ class RuntimeSession:
     def memory_snapshot(self, query: str = "", limit: int = 200) -> dict[str, Any]:
         return self.project_memory.snapshot(query, limit)
 
+    def prompt_snapshot(
+        self,
+        conversation_id: str,
+        *,
+        include_sensitive: bool = False,
+    ) -> dict[str, Any]:
+        """Return the latest actual Prompt, or a mode-correct preflight preview."""
+
+        conversation = self._get_conversation(conversation_id)
+        latest = self.llm_client.prompt_snapshot(
+            conversation_id,
+            include_sensitive=include_sensitive,
+        )
+        compatible_modes = {
+            "react": {"react"},
+            "plan": {"plan-builder", "plan-executor"},
+            "team": {"team-planner", "team-worker", "team-reviewer"},
+        }
+        if latest is not None and latest.get("mode") in compatible_modes[conversation.mode]:
+            snapshot = latest
+        elif conversation.mode == "plan":
+            snapshot = conversation.plan_agent.planner.prompt_snapshot(
+                include_sensitive=include_sensitive
+            )
+        elif conversation.mode == "team":
+            snapshot = conversation.team_agent.planner.prompt_snapshot(
+                include_sensitive=include_sensitive
+            )
+        else:
+            snapshot = conversation.agent.prompt_snapshot(
+                include_sensitive=include_sensitive
+            )
+        return {
+            **snapshot,
+            "session_id": conversation_id,
+            "conversation_title": conversation.title,
+            "requested_mode": conversation.mode,
+        }
+
     def save_memory(self, content: str) -> dict[str, Any]:
         entry, created = self.project_memory.save(content)
         return {
@@ -267,19 +343,39 @@ class RuntimeSession:
 
     def skill_snapshot(self) -> dict[str, Any]:
         disabled = self.skill_state_store.disabled()
+        bundled_statuses = self.skill_upgrade_manager.statuses()
         skills = [
-            self._skill_data(skill, enabled=skill.name not in disabled)
+            self._skill_data(
+                skill,
+                enabled=skill.name not in disabled,
+                bundled_status=(
+                    bundled_statuses.get(skill.name)
+                    if self._is_active_bundled_user_skill(
+                        skill,
+                        frozenset(bundled_statuses),
+                    )
+                    else None
+                ),
+            )
             for skill in self.skill_registry.all_skills()
         ]
         warnings = list(
             dict.fromkeys(
-                (*self.skill_registry.warnings(), *self.skill_state_store.warnings())
+                (
+                    *self.skill_registry.warnings(),
+                    *self.skill_state_store.warnings(),
+                    *self.skill_upgrade_manager.warnings(),
+                )
             )
         )
         return {
             "skills": skills,
             "enabled_count": sum(1 for skill in skills if skill["enabled"]),
             "total_count": len(skills),
+            "bundled_count": sum(1 for skill in skills if skill["builtin"]),
+            "updates_available": sum(
+                1 for skill in skills if skill["update_available"]
+            ),
             "warnings": warnings,
             "user_dir": str(self.skill_registry.user_dir or ""),
             "project_dir": str(self.skill_registry.project_dir or ""),
@@ -290,10 +386,19 @@ class RuntimeSession:
         skill = self.skill_registry.find_any_skill(name)
         if skill is None:
             raise ValueError(f"Skill not found: {name}")
+        bundled_statuses = self.skill_upgrade_manager.statuses()
         return {
             **self._skill_data(
                 skill,
                 enabled=skill.name not in self.skill_state_store.disabled(),
+                bundled_status=(
+                    bundled_statuses.get(skill.name)
+                    if self._is_active_bundled_user_skill(
+                        skill,
+                        frozenset(bundled_statuses),
+                    )
+                    else None
+                ),
             ),
             "body": skill.body,
         }
@@ -302,9 +407,7 @@ class RuntimeSession:
         if self.skill_registry.find_any_skill(name) is None:
             raise ValueError(f"Skill not found: {name}")
         updated = (
-            self.skill_state_store.enable(name)
-            if enabled
-            else self.skill_state_store.disable(name)
+            self.skill_state_store.enable(name) if enabled else self.skill_state_store.disable(name)
         )
         if not updated:
             warnings = self.skill_state_store.warnings()
@@ -313,11 +416,92 @@ class RuntimeSession:
         return self.skill_snapshot()
 
     def reload_skills(self) -> dict[str, Any]:
+        if self.skill_registry.user_dir is not None:
+            self.skill_upgrade_manager.bootstrap()
         self.skill_registry.reload()
         return self.skill_snapshot()
 
+    def skill_diff(self, name: str, max_chars: int = 120_000) -> dict[str, Any]:
+        if not self._is_active_bundled_name(name):
+            raise ValueError(f"Active Skill is not an editable bundled Skill: {name}")
+        return self.skill_upgrade_manager.diff(name, max_chars=max_chars)
+
+    def update_bundled_skill(
+        self,
+        name: str,
+        *,
+        action: str,
+        expected_current_hash: str,
+        expected_builtin_hash: str,
+    ) -> dict[str, Any]:
+        if not self._is_active_bundled_name(name):
+            raise ValueError(f"Active Skill is not an editable bundled Skill: {name}")
+        if action == "update":
+            self.skill_upgrade_manager.update(
+                name,
+                expected_current_hash=expected_current_hash,
+                expected_builtin_hash=expected_builtin_hash,
+            )
+        elif action == "keep_custom":
+            self.skill_upgrade_manager.keep_custom(
+                name,
+                expected_current_hash=expected_current_hash,
+                expected_builtin_hash=expected_builtin_hash,
+            )
+        elif action == "restore_default":
+            self.skill_upgrade_manager.restore_default(
+                name,
+                expected_current_hash=expected_current_hash,
+                expected_builtin_hash=expected_builtin_hash,
+            )
+        else:
+            raise ValueError(f"unsupported bundled Skill action: {action}")
+        self.skill_registry.reload()
+        return self.skill_snapshot()
+
+    def _is_active_bundled_name(self, name: str) -> bool:
+        skill = self.skill_registry.find_any_skill(name)
+        return skill is not None and self._is_active_bundled_user_skill(skill)
+
+    def _is_active_bundled_user_skill(
+        self,
+        skill: Any,
+        bundled_names: frozenset[str] | None = None,
+    ) -> bool:
+        user_dir = self.skill_registry.user_dir
+        names = (
+            bundled_names
+            if bundled_names is not None
+            else frozenset(self.skill_upgrade_manager.statuses())
+        )
+        return bool(
+            user_dir is not None
+            and skill.source.value == "user"
+            and skill.skill_md_path.parent == user_dir / skill.name
+            and skill.name in names
+        )
+
     @staticmethod
-    def _skill_data(skill: Any, *, enabled: bool) -> dict[str, Any]:
+    def _skill_data(
+        skill: Any,
+        *,
+        enabled: bool,
+        bundled_status: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        upgrade = bundled_status or {
+            "builtin": False,
+            "builtin_version": "",
+            "builtin_hash": "",
+            "installed_version": "",
+            "installed_hash": "",
+            "current_version": skill.version or "",
+            "current_hash": "",
+            "customized": False,
+            "update_available": False,
+            "update_acknowledged": False,
+            "upgrade_state": "not_bundled",
+            "error": "",
+        }
         return {
             "name": skill.name,
             "description": skill.description,
@@ -330,13 +514,12 @@ class RuntimeSession:
             "references_path": (
                 str(skill.references_dir) if skill.references_dir is not None else None
             ),
+            **upgrade,
         }
 
     def browser_snapshot(self) -> dict[str, Any]:
         server = self.mcp_manager.server("chrome-devtools")
-        server_data = (
-            self.mcp_manager.server_snapshot(server) if server is not None else None
-        )
+        server_data = self.mcp_manager.server_snapshot(server) if server is not None else None
         return {
             "mode": self.browser_session.mode.value,
             "browser_url": self.browser_session.browser_url,
@@ -344,14 +527,10 @@ class RuntimeSession:
             "agent_opened_pages": list(self.browser_session.agent_opened_pages),
             "chrome_server": {
                 "status": (
-                    str(server_data["status"])
-                    if server_data is not None
-                    else "not_configured"
+                    str(server_data["status"]) if server_data is not None else "not_configured"
                 ),
                 "error": str(server_data["error"]) if server_data is not None else "",
-                "tool_count": (
-                    int(server_data["tool_count"]) if server_data is not None else 0
-                ),
+                "tool_count": (int(server_data["tool_count"]) if server_data is not None else 0),
             },
         }
 
@@ -414,7 +593,8 @@ class RuntimeSession:
             "embedding_model": model,
             "embedding_base_url": self.rag_service.embedding_client.base_url,
             "embedding_api_key_configured": bool(self.rag_service.embedding_client.api_key),
-            "needs_rebuild": bool(sources) and (
+            "needs_rebuild": bool(sources)
+            and (
                 stats.chunk_count == 0
                 or not metadata.get("last_indexed_at")
                 or indexed_provider != provider
@@ -445,14 +625,16 @@ class RuntimeSession:
         if not sources:
             raise ValueError("add at least one file or folder before building the RAG index")
         result = self.rag_service.index_sources(sources, progress_callback=progress_callback)
-        if result.chunk_count == 0 and result.error_count > 0:
-            raise RuntimeError(result.message)
+        # Persist failed attempts too.  Otherwise a Settings refresh turns an
+        # actionable indexing failure into an indistinguishable empty index.
         result_data = asdict(result)
         self.rag_source_store.record_index(
             result_data,
             embedding_provider=self.rag_service.embedding_client.provider,
             embedding_model=self.rag_service.embedding_client.model,
         )
+        if result.chunk_count == 0 and result.error_count > 0:
+            raise RuntimeError(result.message)
         return self.rag_snapshot()
 
     def clear_rag_index(self) -> dict[str, Any]:
@@ -521,6 +703,7 @@ class RuntimeSession:
             trace_enabled=False,
             trace_path=None,
             transcript=[],
+            access_mode=self.access_mode,
         )
         self.conversations[identifier] = conversation
         self._active_conversation_id = identifier
@@ -606,13 +789,28 @@ class RuntimeSession:
             updated_at=_timestamp(),
         )
         try:
-            with llm_runtime_scope(conversation_id, task_id):
-                if conversation.mode == "plan":
-                    answer = conversation.plan_agent.run(prepared.agent_prompt, cancellation_event)
-                elif conversation.mode == "team":
-                    answer = conversation.team_agent.run(prepared.agent_prompt, cancellation_event)
-                else:
-                    answer = conversation.agent.run(prepared.agent_prompt, cancellation_event)
+            task_workspace = self.workspace_protection.task_workspace(
+                task_id,
+                conversation_id,
+            )
+            with task_workspace_scope(self.workspace, task_workspace):
+                with llm_runtime_scope(conversation_id, task_id):
+                    with task_approval_scope(conversation.access_mode):
+                        if conversation.mode == "plan":
+                            answer = conversation.plan_agent.run(
+                                prepared.agent_prompt,
+                                cancellation_event,
+                            )
+                        elif conversation.mode == "team":
+                            answer = conversation.team_agent.run(
+                                prepared.agent_prompt,
+                                cancellation_event,
+                            )
+                        else:
+                            answer = conversation.agent.run(
+                                prepared.agent_prompt,
+                                cancellation_event,
+                            )
             self.task_checkpoints.update(
                 task_id,
                 status="answer_ready",
@@ -620,7 +818,9 @@ class RuntimeSession:
                 answer=answer,
                 updated_at=_timestamp(),
             )
-            conversation.transcript.append(_transcript_entry("assistant", answer))
+            conversation.transcript.append(
+                _transcript_entry("assistant", answer, task_id=task_id)
+            )
             conversation.updated_at = _timestamp()
             self._save_conversation(conversation)
             return answer
@@ -634,7 +834,7 @@ class RuntimeSession:
                 )
             conversation.memory_manager.add_assistant_message(cancellation_message)
             conversation.transcript.append(
-                _transcript_entry("assistant", cancellation_message)
+                _transcript_entry("assistant", cancellation_message, task_id=task_id)
             )
             conversation.updated_at = _timestamp()
             self._save_conversation(conversation)
@@ -671,18 +871,38 @@ class RuntimeSession:
     ) -> PreparedAttachments:
         """Durably accept a task before acknowledging task.submit."""
 
+        # Snapshot/isolate before recording the user turn or acknowledging the
+        # request.  This gives every accepted task one immutable merge baseline,
+        # including tasks that fail before their first tool call.
         conversation = self._get_conversation(conversation_id)
         prepared = prepare_attachments(prompt, attachments)
         self._register_task(task_id, conversation_id)
         try:
-            protection = self.workspace_protection.begin_task(task_id, conversation_id)
+            protection = self.workspace_protection.begin_task(
+                task_id,
+                conversation_id,
+                isolated=True,
+            )
             if not protection.get("protected"):
                 raise RuntimeError(
                     "Workspace modification protection could not create a task snapshot: "
                     f"{protection.get('error') or 'unknown Git snapshot error'}"
                 )
             self._emit_event("workspace.snapshot.created", protection)
+            # The model must see the isolated worktree path, while user-facing
+            # project metadata continues to name the canonical workspace.
+            workspace_context = _task_workspace_prompt_context(
+                self.workspace,
+                protection.get("worktree_path"),
+            )
+            prepared = PreparedAttachments(
+                agent_prompt=f"{workspace_context}\n\n{prepared.agent_prompt}",
+                metadata=prepared.metadata,
+            )
             conversation.skill_context_buffer.clear()
+            # ``@skill-*`` and ``@mcp-*`` are explicit per-turn instructions.
+            # They are deliberately prepended to the user request instead of
+            # permanently expanding the system prompt for later turns.
             reference_context = _explicit_reference_context(
                 prompt,
                 self.skill_registry,
@@ -853,11 +1073,29 @@ class RuntimeSession:
         ):
             return outcome, terminal_data
         changes = self.finalize_task_changes(task_id, outcome)
+        if changes.get("merge_conflict"):
+            outcome = "failed"
+            terminal_data = {
+                **terminal_data,
+                "status": "failed",
+                "error_code": "worktree_merge_conflict",
+                "message": str(
+                    changes.get("error")
+                    or "The isolated task changes conflict with newer project edits."
+                ),
+                "recoverable": False,
+            }
+            self._discard_unapplied_task_answer(
+                checkpoint,
+                conversation_id,
+                str(terminal_data["message"]),
+            )
         terminal_data = {**terminal_data, "changes": changes}
         updated = self.task_checkpoints.update(
             task_id,
             status="finalize_pending",
             checkpoint_stage="workspace_finalized",
+            terminal_outcome=outcome,
             terminal_data=terminal_data,
             finalize_error="",
             updated_at=_timestamp(),
@@ -865,6 +1103,34 @@ class RuntimeSession:
         if updated is None:
             raise RuntimeError("unfinished task checkpoint disappeared after finalization")
         return outcome, terminal_data
+
+    def _discard_unapplied_task_answer(
+        self,
+        checkpoint: dict[str, Any],
+        conversation_id: str,
+        reason: str,
+    ) -> None:
+        """Remove a success claim when an isolated patch cannot be merged."""
+
+        answer = str(checkpoint.get("answer") or "")
+        if not answer:
+            return
+        conversation = self._get_conversation(conversation_id)
+        for index in range(len(conversation.transcript) - 1, -1, -1):
+            entry = conversation.transcript[index]
+            if entry.get("role") == "user":
+                break
+            if entry.get("role") == "assistant" and entry.get("content") == answer:
+                conversation.transcript.pop(index)
+                break
+        correction = (
+            "Workspace finalization failed, so the generated answer and isolated file "
+            f"changes were not applied to the project. Reason: {reason}"
+        )
+        conversation.agent.messages.append({"role": "assistant", "content": correction})
+        conversation.memory_manager.add_assistant_message(correction)
+        conversation.updated_at = _timestamp()
+        self._save_conversation(conversation)
 
     def resume_task(self, task_id: str, conversation_id: str) -> str:
         self._ensure_task_state()
@@ -885,7 +1151,9 @@ class RuntimeSession:
                 conversation.transcript[-1].get("role") == "assistant"
                 and conversation.transcript[-1].get("content") == answer
             ):
-                conversation.transcript.append(_transcript_entry("assistant", answer))
+                conversation.transcript.append(
+                    _transcript_entry("assistant", answer, task_id=task_id)
+                )
                 conversation.updated_at = _timestamp()
                 self._save_conversation(conversation)
             self._release_task(task_id)
@@ -893,27 +1161,39 @@ class RuntimeSession:
 
         original_prompt = str(checkpoint.get("agent_prompt") or checkpoint.get("prompt") or "")
         try:
-            with llm_runtime_scope(conversation_id, task_id):
-                if conversation.mode == "react":
-                    answer = conversation.agent.resume(original_prompt, cancellation_event)
-                elif conversation.mode == "plan":
-                    restored_plan = self._restore_execution_plan(conversation, task_id)
-                    if restored_plan is not None:
-                        answer = conversation.plan_agent.execute_plan(
-                            restored_plan,
-                            cancellation_event,
-                        )
-                    else:
-                        answer = conversation.plan_agent.run(
-                            self._mode_recovery_prompt(conversation, original_prompt),
-                            cancellation_event,
-                        )
-                else:
-                    recovery_prompt = self._mode_recovery_prompt(
-                        conversation,
-                        original_prompt,
-                    )
-                    answer = conversation.team_agent.run(recovery_prompt, cancellation_event)
+            task_workspace = self.workspace_protection.task_workspace(
+                task_id,
+                conversation_id,
+            )
+            with task_workspace_scope(self.workspace, task_workspace):
+                with llm_runtime_scope(conversation_id, task_id):
+                    with task_approval_scope(conversation.access_mode):
+                        if conversation.mode == "react":
+                            answer = conversation.agent.resume(
+                                original_prompt,
+                                cancellation_event,
+                            )
+                        elif conversation.mode == "plan":
+                            restored_plan = self._restore_execution_plan(conversation, task_id)
+                            if restored_plan is not None:
+                                answer = conversation.plan_agent.execute_plan(
+                                    restored_plan,
+                                    cancellation_event,
+                                )
+                            else:
+                                answer = conversation.plan_agent.run(
+                                    self._mode_recovery_prompt(conversation, original_prompt),
+                                    cancellation_event,
+                                )
+                        else:
+                            recovery_prompt = self._mode_recovery_prompt(
+                                conversation,
+                                original_prompt,
+                            )
+                            answer = conversation.team_agent.run(
+                                recovery_prompt,
+                                cancellation_event,
+                            )
             self.task_checkpoints.update(
                 task_id,
                 status="answer_ready",
@@ -921,7 +1201,9 @@ class RuntimeSession:
                 answer=answer,
                 updated_at=_timestamp(),
             )
-            conversation.transcript.append(_transcript_entry("assistant", answer))
+            conversation.transcript.append(
+                _transcript_entry("assistant", answer, task_id=task_id)
+            )
             conversation.updated_at = _timestamp()
             self._save_conversation(conversation)
             return answer
@@ -1088,6 +1370,12 @@ class RuntimeSession:
         self.hitl_handler.reject_task(task_id, "Task cancelled by user.")
         return True
 
+    def _is_task_cancelled(self, task_id: str) -> bool:
+        self._ensure_task_state()
+        with self._task_lock:
+            cancel_event = self._task_cancel_events.get(task_id)
+            return bool(cancel_event and cancel_event.is_set())
+
     def _register_task(self, task_id: str, conversation_id: str) -> None:
         self._ensure_task_state()
         with self._task_lock:
@@ -1246,6 +1534,15 @@ class RuntimeSession:
         self.hitl_handler.set_enabled(mode == "restricted")
         self.access_mode = mode
 
+    def set_conversation_access_mode(self, conversation_id: str, mode: str) -> dict[str, Any]:
+        if mode not in {"restricted", "full-access"}:
+            raise ValueError(f"unsupported access mode: {mode}")
+        conversation = self._get_conversation(conversation_id)
+        if self.active_task_for_conversation(conversation_id):
+            raise RuntimeError("cannot change access mode while this conversation is running")
+        conversation.access_mode = mode
+        return {"session_id": conversation_id, "mode": mode}
+
     def resolve_approval(
         self,
         approval_id: str,
@@ -1310,8 +1607,11 @@ class RuntimeSession:
         agent_messages: list[dict[str, Any]] | None = None,
         history: dict[str, Any] | None = None,
         usage: dict[str, Any] | None = None,
+        access_mode: str | None = None,
     ) -> ConversationRuntime:
-        memory_manager = self.project_memory.create_conversation_manager()
+        memory_manager = self.project_memory.create_conversation_manager(
+            llm_client=self.llm_client,
+        )
         skill_context_buffer = SkillContextBuffer()
         for item in transcript:
             role = item.get("role")
@@ -1332,6 +1632,7 @@ class RuntimeSession:
             "skill_registry": self.skill_registry,
             "workspace": self.workspace,
             "context_window": self.settings.context_window,
+            "rag_auto_retrieval": self.settings.rag_auto_retrieval,
         }
         history_data = history or {}
         agent = Agent(
@@ -1364,11 +1665,23 @@ class RuntimeSession:
             worker_count=self.settings.team_workers,
             max_retries_per_step=self.settings.team_retries,
             max_iterations_per_agent=self.settings.max_iterations,
+            event_callback=event_callback,
+            # Mailboxes survive a Sidecar restart without cluttering user code.
+            message_bus_dir=(
+                getattr(self, "project_data_dir", self.workspace / ".stellarcode" / "runtime")
+                / "team-message-bus"
+                / identifier
+            ),
         )
         return ConversationRuntime(
             id=identifier,
             title=title,
             mode=mode,
+            access_mode=(
+                access_mode
+                if access_mode in {"restricted", "full-access"}
+                else getattr(self, "access_mode", "restricted")
+            ),
             created_at=created_at,
             updated_at=updated_at,
             title_is_custom=title_is_custom,
@@ -1402,26 +1715,17 @@ class RuntimeSession:
                     updated_at=str(payload.get("updated_at") or _timestamp()),
                     title_is_custom=bool(payload.get("title_is_custom")),
                     trace_enabled=bool(payload.get("trace_enabled")),
-                    trace_path=(
-                        str(payload["trace_path"])
-                        if payload.get("trace_path")
-                        else None
-                    ),
+                    trace_path=(str(payload["trace_path"]) if payload.get("trace_path") else None),
                     transcript=list(payload.get("transcript") or []),
-                    event_floor_sequence=_nonnegative_int(
-                        payload.get("event_floor_sequence")
-                    ),
+                    event_floor_sequence=_nonnegative_int(payload.get("event_floor_sequence")),
                     agent_messages=agent_messages,
                     history=(
-                        payload.get("history")
-                        if isinstance(payload.get("history"), dict)
-                        else None
+                        payload.get("history") if isinstance(payload.get("history"), dict) else None
                     ),
                     usage=(
-                        payload.get("usage")
-                        if isinstance(payload.get("usage"), dict)
-                        else None
+                        payload.get("usage") if isinstance(payload.get("usage"), dict) else None
                     ),
+                    access_mode=getattr(self, "access_mode", "restricted"),
                 )
                 self.conversations[identifier] = conversation
                 if repair_count:
@@ -1698,11 +2002,35 @@ def _nonnegative_int(value: Any) -> int:
         return 0
 
 
+def _task_workspace_prompt_context(
+    project_workspace: str | Path,
+    task_workspace: object,
+) -> str:
+    """Describe task isolation without letting the model expose it as the project path."""
+
+    canonical = str(Path(project_workspace).resolve())
+    isolated = str(Path(str(task_workspace)).resolve()) if task_workspace else ""
+    return "\n".join(
+        (
+            "<stellarcode_workspace_context>",
+            f"canonical_project_root={json.dumps(canonical, ensure_ascii=False)}",
+            f"ephemeral_task_worktree={json.dumps(isolated, ensure_ascii=False)}",
+            "All relative file and command operations are routed to the ephemeral worktree.",
+            "The worktree is an internal implementation detail and is deleted after merge.",
+            "When the user asks for the project or file location, report a path under "
+            "canonical_project_root, never ephemeral_task_worktree.",
+            "Do not start detached/background processes from the ephemeral worktree.",
+            "</stellarcode_workspace_context>",
+        )
+    )
+
+
 def _transcript_entry(
     role: str,
     content: str,
     *,
     attachments: list[dict[str, Any]] | None = None,
+    task_id: str | None = None,
 ) -> dict[str, Any]:
     entry: dict[str, Any] = {
         "id": f"message-{uuid.uuid4().hex}",
@@ -1712,6 +2040,8 @@ def _transcript_entry(
     }
     if attachments:
         entry["attachments"] = attachments
+    if task_id:
+        entry["task_id"] = task_id
     return entry
 
 
@@ -1808,5 +2138,7 @@ def _record_plan_event(
 
 
 def _automatic_title(prompt: str) -> str:
-    first_line = next((line.strip() for line in prompt.splitlines() if line.strip()), "New conversation")
+    first_line = next(
+        (line.strip() for line in prompt.splitlines() if line.strip()), "New conversation"
+    )
     return first_line[:48]

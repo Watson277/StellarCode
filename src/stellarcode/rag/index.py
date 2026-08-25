@@ -1,3 +1,5 @@
+"""Incremental project code index: AST-aware chunks plus durable vector metadata."""
+
 from __future__ import annotations
 
 from collections.abc import Callable

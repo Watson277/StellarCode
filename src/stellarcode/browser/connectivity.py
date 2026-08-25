@@ -1,3 +1,5 @@
+"""Low-level Chrome DevTools connectivity probes without browser-side effects."""
+
 from __future__ import annotations
 
 from dataclasses import dataclass

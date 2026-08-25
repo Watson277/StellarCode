@@ -1,3 +1,5 @@
+"""Immutable RAG chunks, relations, and ranked retrieval result data models."""
+
 from __future__ import annotations
 
 from dataclasses import dataclass

@@ -1,3 +1,5 @@
+"""Small lexical retriever used to inject only query-relevant memories into prompts."""
+
 from __future__ import annotations
 
 import math
@@ -6,6 +8,9 @@ import time
 from dataclasses import dataclass
 
 from stellarcode.memory.entry import MemoryEntry, MemoryType
+
+
+_PROMPT_CONTEXT_TYPES = frozenset({MemoryType.FACT, MemoryType.SUMMARY})
 
 
 @dataclass
@@ -45,9 +50,16 @@ class MemoryRetriever:
         long_entries: list[MemoryEntry],
         max_tokens: int = 500,
     ) -> str:
+        query_tokens = _tokenize(query)
+        prompt_short_entries = [
+            entry for entry in short_entries if _eligible_prompt_entry(entry, query_tokens)
+        ]
+        prompt_long_entries = [
+            entry for entry in long_entries if _eligible_prompt_entry(entry, query_tokens)
+        ]
         selected: list[str] = []
         used_tokens = 0
-        for entry in self.retrieve(query, short_entries, long_entries):
+        for entry in self.retrieve(query, prompt_short_entries, prompt_long_entries):
             if used_tokens + entry.token_count > max_tokens:
                 continue
             selected.append(f"- [{entry.type.value}] {entry.content}")
@@ -55,6 +67,17 @@ class MemoryRetriever:
         if not selected:
             return ""
         return "Relevant memory:\n" + "\n".join(selected)
+
+
+def _eligible_prompt_entry(entry: MemoryEntry, query_tokens: set[str]) -> bool:
+    """Keep raw conversations and tool output out of the system message."""
+
+    if entry.type not in _PROMPT_CONTEXT_TYPES or not query_tokens:
+        return False
+    entry_tokens = _tokenize(entry.content)
+    for value in entry.metadata.values():
+        entry_tokens.update(_tokenize(value))
+    return bool(query_tokens & entry_tokens)
 
 
 def _score(entry: MemoryEntry, query_tokens: set[str], source_weight: float) -> float:
@@ -72,7 +95,11 @@ def _score(entry: MemoryEntry, query_tokens: set[str], source_weight: float) -> 
     time_decay = math.exp(-age_hours / 168.0)
     type_weight = 1.15 if entry.type in {MemoryType.FACT, MemoryType.SUMMARY} else 1.0
 
-    return (0.65 * content_overlap + 0.2 * metadata_overlap + 0.15 * time_decay) * source_weight * type_weight
+    return (
+        (0.65 * content_overlap + 0.2 * metadata_overlap + 0.15 * time_decay)
+        * source_weight
+        * type_weight
+    )
 
 
 def _tokenize(text: str) -> set[str]:
@@ -83,4 +110,3 @@ def _tokenize(text: str) -> set[str]:
         words.add(chunk)
         words.update(chunk[i : i + 2] for i in range(max(len(chunk) - 1, 0)))
     return {word for word in words if len(word.strip()) >= 2}
-

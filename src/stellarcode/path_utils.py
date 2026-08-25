@@ -1,3 +1,5 @@
+"""Path normalisation helpers for subprocesses and Windows-safe execution."""
+
 from __future__ import annotations
 
 import os

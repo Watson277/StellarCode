@@ -1,3 +1,5 @@
+"""Conversation memory, project long-term memory, retrieval, and compaction."""
+
 from stellarcode.memory.entry import MemoryEntry, MemoryType, estimate_tokens
 from stellarcode.memory.history_compactor import (
     ConversationHistoryCompactor,

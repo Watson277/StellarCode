@@ -1,3 +1,5 @@
+"""Typed memory records and stable identifiers used by all memory stores."""
+
 from __future__ import annotations
 
 import time

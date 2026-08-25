@@ -1,3 +1,5 @@
+"""HTML-to-Markdown extraction with noise removal for web-fetch tool results."""
+
 from __future__ import annotations
 
 import re

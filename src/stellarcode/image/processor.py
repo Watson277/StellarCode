@@ -1,3 +1,5 @@
+"""Normalize image bytes into bounded provider-safe content parts for multimodal chat."""
+
 from __future__ import annotations
 
 import base64

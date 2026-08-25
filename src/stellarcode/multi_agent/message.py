@@ -1,3 +1,5 @@
+"""Structured messages exchanged between coordinator and sub-agent roles."""
+
 from __future__ import annotations
 
 from dataclasses import dataclass

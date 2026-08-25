@@ -1,3 +1,5 @@
+"""Skill metadata and source provenance, separate from deferred SKILL.md bodies."""
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -21,4 +23,3 @@ class Skill:
     body: str
     skill_md_path: Path
     references_dir: Path | None = None
-

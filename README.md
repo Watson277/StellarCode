@@ -39,6 +39,27 @@ npm run tauri dev
 The CLI remains available and does not need to be replaced. The desktop transport and its
 typed messages are documented in `docs/desktop-runtime-event-protocol.md`.
 
+### Windows installer (no Python / Node / Rust required for end users)
+
+The release installer bundles a PyInstaller `stellarcode-sidecar.exe` with the Tauri app.
+It does **not** use the developer virtual environment, source tree, or `.env` after
+installation. On the release build machine, run:
+
+```powershell
+cd desktop
+.\scripts\build-windows-release.ps1 -InstallBuildTools
+```
+
+The command first packages the Python Runtime, then produces a Windows MSI installer under
+`src-tauri\target\release\bundle\msi\` (and an NSIS installer too when that Tauri target is
+available). End users install the generated installer and launch
+StellarCode directly; they do not install Python, Node.js, Rust, npm, or Cargo.
+
+API keys cannot be bundled. On first launch, StellarCode safely creates a user-owned `.env`
+beside `settings.json` in its Tauri application-data directory. Use **Settings → Models →
+Show .env** to add a key, then restart Runtime. Project `.env` files can still supply
+project-specific configuration when no user or system value is already set.
+
 Unexpected Sidecar exits are recovered automatically. The desktop restarts Python with
 bounded backoff, replays missed per-session events from the project journal, restores the
 unfinished task checkpoint, and continues ReAct history from the last safe message/tool
@@ -48,8 +69,12 @@ retry instead of being executed blindly.
 One desktop Sidecar now keeps independently loaded project Runtimes alive. Each conversation
 owns its own task slot, cancellation signal, checkpoint, short-term context, Skill buffer,
 usage ledger, and Trace target, so tasks in different projects or conversations can continue
-in the background while the user switches the visible workspace. The sidebar marks running
-conversations and project task counts. A conversation still accepts only one task at a time.
+in the background while the user switches the visible workspace. Every accepted task now runs
+built-in project file operations and commands in its own Side-Git-backed Git worktree. Final
+patches are checked and merged into the project serially; conflicting tasks fail without
+overwriting the newer project state and retain their worktree for inspection. The sidebar
+marks running conversations and project task counts. A conversation still accepts only one
+task at a time. See `docs/task-git-worktree-isolation.md` for lifecycle and scope.
 
 Desktop Plan mode displays the generated DAG as a persistent live plan card. Overall
 progress and each step's dependencies, running state, result, failure, or skipped state are
@@ -57,8 +82,10 @@ updated through structured RuntimeEvents and restored when the conversation is r
 
 Every desktop task is protected before execution by an isolated Side-Git snapshot stored in
 StellarCode application data. It never stages, commits, resets, or changes the user's Git
-repository. `write_file` and `delete_file` approvals include a bounded pre-change diff and
-verify the approved file hash again under the mutation lock before an atomic replace/unlink.
+repository. `write_file`, `apply_patch`, and `delete_file` approvals include a bounded
+pre-change diff and verify the approved file hash again under the mutation lock before an
+atomic replace/unlink. `apply_patch` performs ordered exact-text edits, refuses ambiguous
+matches unless `replace_all` is explicit, and preserves the file's dominant newline style.
 After completed, failed, and cancelled tasks, the transcript shows the protected file set,
 lazy full diff, and a task-level Undo action. Undo restores only that task's paths, refuses
 to overwrite later edits, preserves unrelated changes, and uses its own crash-recoverable
@@ -94,6 +121,9 @@ and schemas, and can manage or add project-local stdio/HTTP servers.
 General includes a persisted Simplified Chinese/English language selector that localizes all
 built-in desktop navigation, dialogs, approvals, task/tool/Plan states, and settings pages;
 model replies, project files, and third-party MCP content keep their original language.
+General also lets users choose a custom root for temporary task worktrees. An empty value keeps
+the default Tauri application-data location on the system drive; changing it restarts Runtime
+and affects new task worktrees without moving conversations, snapshots, or existing task data.
 Appearance includes
 fixed dark/light presets, custom accent, background, panel, and font colors, automatically
 dimmed secondary text, and client-wide font scaling. Model and Agent overrides are passed to
@@ -115,6 +145,62 @@ stellarcode --mode full-access
 ```
 
 Python 3.10 and newer are supported.
+
+## Aider Polyglot benchmark Agent interface
+
+For an end-to-end StellarCode evaluation, the benchmark runner must give the
+Agent a clean per-case workspace and keep tests and reference implementations
+private. The non-interactive interface is:
+
+```powershell
+stellarcode benchmark-agent `
+  --workspace E:\bench\case-001 `
+  --prompt-file E:\bench\case-001\PROMPT.md `
+  --editable-file affine_cipher.py `
+  --result-file E:\bench-results\case-001.json `
+  --max-iterations 30
+```
+
+The workspace may contain only the task prompt and source files. This mode
+exposes `read_file`, `list_dir`, `glob_files`, `grep_code`, `write_file`, and
+`apply_patch`; it blocks network, shell, MCP, memory, project-generation, and
+paths outside the workspace. `write_file` and `apply_patch` may modify only
+the files named with `--editable-file`. The result JSON contains termination,
+elapsed time, changed-file hashes, and a tool-event trail. The external runner
+must run hidden tests after this command returns and calculate pass rates.
+
+Use `benchmark-run` to do that end-to-end without copying files by hand:
+
+```powershell
+stellarcode benchmark-run `
+  --clean-root "E:\study2\LLM Internship\PaiCLI\polyglot-python-agent-clean" `
+  --tests-root "E:\study2\LLM Internship\PaiCLI\polyglot-benchmark-main\python\exercises\practice" `
+  --results-dir "E:\study2\LLM Internship\PaiCLI\polyglot-results" `
+  --case affine-cipher `
+  --tries 1
+```
+
+It creates disposable work and private-test copies under `--results-dir`, calls
+the Agent, copies only declared Python source files into the private copy, then
+runs `python -m pytest -q`. It never changes either supplied dataset directory.
+Omit `--case` to run all cleaned Python cases. `summary.json` contains pass rates
+and the complete per-case agent/test records.
+
+If a C++ run already generated answers but testing could not start (for example,
+CMake was installed afterward), test the saved `private-tests` copies without
+calling the Agent again:
+
+```powershell
+.\scripts\test_saved_polyglot_cpp_results.ps1 `
+  -ResultsRoot "E:\study2\LLM Internship\PaiCLI\polyglot-results-cpp-deepseek-v4-flash"
+```
+
+It writes `cpp-test-summary-attempt-1.json` under the results directory. By
+default it removes only each saved attempt's `build` directory to force a clean
+compile; pass `-KeepBuild` to retain existing build outputs.
+The script adjusts the disposable private copy's CMake exercise-name lookup;
+this is required because its folder is named `private-tests` rather than the
+exercise name, and it does not change the saved Agent source files.
 
 ## Complete Trace Mode
 
@@ -152,6 +238,13 @@ errors, tool arguments, complete untruncated command stdout/stderr, elapsed time
 requests and decisions, and final task results. Concurrent events include their thread
 name and tool-call ID.
 
+Prompt assembly emits a separate `prompt_assembled` event containing the Prompt version,
+mode, and per-layer character count, estimated Token count, sensitivity flag, and SHA-256
+hash. This metadata event never contains the layer bodies. The desktop **Settings → Prompt**
+page presents the same snapshot for the current conversation; retrieved Memory and compacted
+summary bodies are omitted by Runtime unless the user explicitly enables their temporary
+local display.
+
 Credential-like fields and inline Bearer tokens are replaced with `[REDACTED]`. Base64
 image payloads are omitted while their type and encoded size are retained. Trace files
 still contain sensitive working context, so do not commit or share them casually.
@@ -160,8 +253,9 @@ still contain sensitive working context, so do not commit or share them casually
 
 - OpenAI-compatible GLM and Agnes chat clients with automatic text/vision routing
 - Tool registry with JSON Schema definitions
-- Built-in `read_file`, `write_file`, `delete_file`, `list_dir`, `execute_command`,
-  `web_search`, `web_fetch`, and `search_code` tools
+- Built-in `read_file`, `write_file`, `apply_patch`, `delete_file`, `list_dir`,
+  `glob_files`, `grep_code`, `execute_command`, `web_search`, `web_fetch`, and
+  `search_code` tools
 - ReAct loop with max-iteration protection
 - Plan-and-Execute with DAG dependencies and topological ordering
 - Short-term memory, persistent long-term JSON memory, retrieval, and compression
@@ -173,6 +267,8 @@ still contain sensitive working context, so do not commit or share them casually
 - SQLite vector storage with project isolation and hybrid semantic/keyword ranking
 - Human approval for dangerous tools with serialized Multi-Agent prompts
 - Ordered parallel tool execution shared by ReAct, Plan tasks, and Multi-Agent Workers
+- Per-task Git worktree isolation with checked, serialized terminal merges
+- Separate frontend control and Python Runtime task state machines
 - DAG-layer parallelism for independent Plan-and-Execute tasks
 - Four-tool default concurrency cap, cooperative batch cancellation, command process-tree
   cleanup on timeout, and command-output truncation
@@ -182,7 +278,8 @@ still contain sensitive working context, so do not commit or share them casually
   task rollback, and interrupted-rollback recovery without touching the user's Git state
 - Provider-history compression with tool-call-safe turn grouping and persisted summaries
 - Exact provider Token usage with estimated fallback and per-task/conversation ledgers
-- SSE assistant streaming for DeepSeek, GLM, and Agnes with authoritative final-message
+- SSE streaming for ReAct, Plan, and Team for DeepSeek, GLM, and Agnes; Plan step and
+  Team child-Agent deltas render in their own cards with authoritative final-message
   reconciliation, live context occupancy, cache/reasoning usage, and cost accounting
 - Automatic Zhipu, SerpAPI, or SearXNG web search provider selection
 - SSRF-protected, rate-limited web fetching with HTML-to-Markdown extraction
@@ -344,10 +441,14 @@ Configure concurrency and the tool-batch timeout at startup:
 stellarcode --plan-workers 4 --max-parallel-tools 4 --tool-batch-timeout 90
 ```
 
-The prompt asks the model to use focused `list_dir`, `read_file`, and `search_code`
-exploration. Restricted mode also blocks obvious POSIX and Windows full-disk recursive
-scan commands before approval. Full-access mode bypasses that policy and intentionally
-keeps the unrestricted command behavior defined by its access contract.
+The bundled `code-exploration` Skill owns the cross-tool workflow: discover candidates with
+`glob_files`, locate exact symbols or strings with `grep_code`, read focused source with
+`read_file`, and use `search_code` only for fuzzy semantic retrieval. Tool schemas describe
+only each tool's own contract, while the system prompt retains global safety and verification
+rules. Both exact-search tools prefer local `rg` and fall back to bounded Python scanning when
+`rg` is unavailable. Restricted mode also blocks obvious POSIX and Windows full-disk recursive
+scan commands before approval. Full-access mode bypasses that policy and intentionally keeps
+the unrestricted command behavior defined by its access contract.
 
 ## Memory
 
@@ -368,6 +469,13 @@ Runtime restart and concurrent writes cannot replace newer facts with a stale co
 The **Manage → Memory** page exposes this same project store for audit, filtering, explicit
 save/delete, and confirmed clear operations; it does not mix conversation history into the
 long-term fact list.
+
+Retrieved Memory and compacted conversation summaries are not placed in the system prompt.
+They are attached to the relevant turn as standard `user` messages containing a versioned
+`stellarcode.context/v1` JSON envelope marked `trusted=false`. The stable system policy treats
+these records as evidence rather than instructions, and Runtime-only type metadata is removed
+before provider requests. This keeps query-specific content out of the cached system prefix
+and prevents Memory text from changing permissions or task scope.
 
 ## Multi-Agent
 
@@ -395,6 +503,19 @@ stellarcode --team-workers 2 --team-retries 2
 Only Workers receive tool schemas. Planner and Reviewer return structured JSON and do
 not call tools. The orchestrator injects completed dependency results into the next
 Worker's task context, truncated to 500 characters per dependency.
+
+Team roles communicate through a per-run, append-only JSONL **MessageBus**.  The Lead
+produces task/review requests into recipient mailboxes; Workers and Reviewers claim them
+with a lease, append structured replies to the Lead mailbox, and acknowledge the original
+message only after the reply is durable.  Mailbox lines are never deleted during a run:
+expired leases are retried, exhausted messages enter `dead-letter.jsonl`, and completed
+messages remain available for audit.  Desktop mailboxes are stored under the project Runtime
+data directory; CLI mailboxes are local state in `.stellarcode/team-message-bus/`.
+
+In the desktop client, the same collaboration is emitted as durable `team.*` RuntimeEvents.
+The main transcript therefore shows one compact Team card; expand it to inspect each
+Planner, Worker, and Reviewer request, reply, tool invocation, and status without mixing
+their activity into the main assistant conversation.
 
 ## Code RAG
 
@@ -426,8 +547,10 @@ source list.
 Desktop RAG settings can override the non-secret `EMBEDDING_PROVIDER`, `EMBEDDING_MODEL`, and
 `EMBEDDING_BASE_URL` values for the next Runtime. `EMBEDDING_API_KEY` remains in `.env` or the
 system environment and is never copied into desktop settings. Automatic retrieval is enabled
-by default, which tells ReAct, Plan, and Team agents to use `search_code` for semantic
-codebase questions; it can be switched to explicit-request-only mode.
+by default and is injected once as Runtime capability state for ReAct, Plan, and Team workers;
+it can be switched to explicit-request-only mode. The static `search_code` schema contains no
+retrieval workflow. The `code-exploration` Skill interprets the mode and does not require an
+RAG index for exact `glob_files` or `grep_code` exploration.
 
 `/index [path]` rebuilds the index for the workspace or a specified directory. Python files are parsed with the
 standard-library `ast` module; supported non-Python files use line-based chunks. The
@@ -505,14 +628,27 @@ override User Skills with the same frontmatter `name`:
 
 Packaged default Skills are templates rather than a third registry layer. On first
 startup, each missing template (for example `web-access`) is copied into the User
-directory. Existing User copies are never overwritten, so every discovered Skill is
-visible and editable in either the User or Project directory.
+directory. StellarCode records the bundled version plus a SHA-256 hash of the complete
+Skill tree, including `SKILL.md` and `references/`. A copy that still matches its trusted
+installed hash is upgraded automatically with the application. A changed or legacy copy
+without a trusted baseline is never overwritten: the desktop marks it as customized and,
+when bundled content changes, shows **New version available**.
+
+The Settings → Skills page can display a bounded text Diff from the current User copy to
+the new bundled copy. **Update** and **Restore default** require confirmation and send both
+Diff hashes back to Runtime; the operation is rejected if either tree changed after the
+preview. **Keep custom** acknowledges only that exact local/bundled pair without changing
+files, and a later bundled release appears as a new update again. Directory replacement and
+the baseline state update are serialized across CLI/desktop processes; if baseline persistence
+fails, the previous Skill directory is restored. Project Skills remain ordinary overrides and
+are never changed by the bundled updater.
 
 Only a compact name and description index is added to the system prompt. When a task
 matches a description, the model calls the safe built-in `load_skill` tool. The full
-body, capped at 5 KB, is queued and prepended once to the next user message under
-`## 已加载 Skill：<name>`. This keeps normal turns small while making detailed guidance
-available on demand. `/clear` discards pending Skill context.
+body, capped at 5 KB, is supplied once as user-role context under
+`## 已加载 Skill：<name>` for the next model round of the same task. This keeps normal
+turns small while making detailed guidance available on demand without waiting for another
+user message. `/clear` discards pending Skill context.
 
 Each Multi-Agent role owns an independent Skill context buffer. The active buffer is
 carried through `contextvars` into parallel ToolRegistry threads, so concurrent Workers
@@ -530,9 +666,10 @@ Manage Skills without restarting StellarCode:
 /skill reload
 ```
 
-Enable state is stored in `~/.stellarcode/skills.json` as a `disabled` list, so newly added
-Skills are enabled by default. `/skill reload` rescans all three layers and applies to
-the next LLM turn.
+Enable state and bundled version/hash baselines are stored in
+`~/.stellarcode/skills.json`; newly added Skills are enabled by default. `/skill reload`
+installs missing packaged templates, safely reconciles clean copies, rescans the User and
+Project layers, and applies to the next LLM turn.
 
 The built-in `web-access` Skill teaches the Agent to choose among `web_search`,
 `web_fetch`, isolated Chrome DevTools, and a shared logged-in Chrome session. Its
@@ -542,6 +679,10 @@ WeChat articles, Zhihu, X, Xiaohongshu, and Juejin. A normal prompt is enough:
 ```text
 > 阅读这个知乎链接并总结主要观点
 ```
+
+The built-in `code-exploration` Skill is the single workflow source for file discovery,
+exact search, semantic RAG, focused reading, editing, and verification. System and Tool
+Schema layers deliberately do not repeat those sequencing rules.
 
 To create a project Skill, add `.stellarcode/skills/code-review/SKILL.md`:
 
@@ -727,16 +868,17 @@ stellarcode
 stellarcode --mode restricted
 ```
 
-The policy requires approval for `write_file`, `delete_file`, and the future-facing
-`create_project` tool. `execute_command` is classified from its complete command text.
+The policy requires approval for `write_file`, `apply_patch`, `delete_file`, and the
+future-facing `create_project` tool. `execute_command` is classified from its complete
+command text.
 A strict allowlist lets common environment inspection commands run without approval,
 including `conda env list`, `conda info`, `conda list`, `python --version`,
 `conda run -n <env> python --version`, `pip list/show/freeze`, `Get-Command`,
 `where.exe`, `Test-Path`, `Resolve-Path`, and `nvidia-smi`. Pipelines and semicolon
 groups are safe only when every segment is allowlisted. `python -c`, package installs,
 redirection, command substitution, filesystem changes, and all unrecognized commands
-remain high risk. Read-only `read_file`, `list_dir`, `search_code`, `web_search`, and
-`web_fetch` calls also run without a prompt.
+remain high risk. Read-only `read_file`, `list_dir`, `glob_files`, `grep_code`,
+`search_code`, `web_search`, and `web_fetch` calls also run without a prompt.
 
 Each approval request shows the tool, localized risk level, risk description, and JSON
 arguments in a bordered Rich terminal panel. Long argument values are truncated and

@@ -1,3 +1,5 @@
+"""Incrementally assemble OpenAI-compatible SSE deltas into one assistant message."""
+
 from __future__ import annotations
 
 import json

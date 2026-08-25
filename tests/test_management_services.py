@@ -64,6 +64,11 @@ def test_runtime_skill_management_returns_details_and_persists_state(tmp_path):
     runtime = object.__new__(RuntimeSession)
     runtime.skill_registry = registry
     runtime.skill_state_store = state_store
+    runtime.skill_upgrade_manager = SimpleNamespace(
+        statuses=lambda: {},
+        warnings=lambda: (),
+        bootstrap=lambda: (),
+    )
 
     snapshot = runtime.skill_snapshot()
     detail = runtime.skill_detail("review")

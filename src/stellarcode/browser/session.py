@@ -1,3 +1,5 @@
+"""Mutable browser connection state; policy decisions live in BrowserGuard instead."""
+
 from __future__ import annotations
 
 import threading

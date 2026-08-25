@@ -1,3 +1,5 @@
+"""Persist user-selected RAG source paths separately from generated index artifacts."""
+
 from __future__ import annotations
 
 import json

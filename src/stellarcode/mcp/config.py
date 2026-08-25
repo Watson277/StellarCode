@@ -1,3 +1,9 @@
+"""Load, merge, validate, and prepare user/project MCP server configuration.
+
+Configuration is data only: command spawning happens later in ``McpServerManager`` so
+validation and secret interpolation can be audited before a server starts.
+"""
+
 from __future__ import annotations
 
 import json

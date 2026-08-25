@@ -1,3 +1,5 @@
+"""Bounded HTTP fetch pipeline that applies network policy before every request hop."""
+
 from __future__ import annotations
 
 import re

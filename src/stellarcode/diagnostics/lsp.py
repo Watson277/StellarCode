@@ -1,3 +1,9 @@
+"""Minimal defensive JSON-RPC client for an explicitly configured local LSP server.
+
+It accepts diagnostics only; Workspace Edit and arbitrary server requests are rejected
+so a language server cannot silently mutate the opened project.
+"""
+
 from __future__ import annotations
 
 import json

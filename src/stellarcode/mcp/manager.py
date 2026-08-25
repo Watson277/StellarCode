@@ -1,3 +1,10 @@
+"""MCP server lifecycle and dynamic ToolRegistry integration.
+
+An MCP server's discovered tools become normal namespaced tool definitions. The Agent
+therefore sees MCP capabilities through the same Function Calling schema and safety
+pipeline as built-in tools.
+"""
+
 from __future__ import annotations
 
 import threading

@@ -1,3 +1,5 @@
+"""Parse and validate SKILL.md frontmatter before a file becomes available to agents."""
+
 from __future__ import annotations
 
 import re
@@ -18,17 +20,13 @@ def parse_frontmatter(full_text: str | None) -> FrontmatterResult:
 
     normalized = full_text.replace("\r\n", "\n").replace("\r", "\n")
     if not normalized.startswith("---\n"):
-        return FrontmatterResult(
-            {}, normalized, ("missing frontmatter opening marker ---",)
-        )
+        return FrontmatterResult({}, normalized, ("missing frontmatter opening marker ---",))
 
     lines = normalized.split("\n")
     try:
         end_index = lines.index("---", 1)
     except ValueError:
-        return FrontmatterResult(
-            {}, normalized, ("missing frontmatter closing marker ---",)
-        )
+        return FrontmatterResult({}, normalized, ("missing frontmatter closing marker ---",))
 
     warnings: list[str] = []
     frontmatter = _parse_fields(lines[1:end_index], warnings)
@@ -58,15 +56,11 @@ def _parse_fields(lines: list[str], warnings: list[str]) -> dict[str, Any]:
             index += 1
             continue
         if not raw_value:
-            warnings.append(
-                f"frontmatter field '{key}' has no value or uses unsupported nesting"
-            )
+            warnings.append(f"frontmatter field '{key}' has no value or uses unsupported nesting")
             index += 1
             continue
         if raw_value.startswith("{"):
-            warnings.append(
-                f"frontmatter field '{key}' uses an unsupported nested object"
-            )
+            warnings.append(f"frontmatter field '{key}' uses an unsupported nested object")
             index += 1
             continue
 
@@ -124,4 +118,3 @@ def _unquote(value: str) -> str:
     if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
         return value[1:-1]
     return value
-

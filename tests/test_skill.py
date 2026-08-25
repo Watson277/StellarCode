@@ -5,13 +5,17 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 
+import pytest
+
 from stellarcode.agent import Agent
-from stellarcode.multi_agent import AgentOrchestrator
+from stellarcode.multi_agent import AgentMessage, AgentOrchestrator, AgentRole, SubAgent
 from stellarcode.skill import (
+    BundledSkillManager,
     SkillContextBuffer,
     SkillRegistry,
     SkillSource,
     SkillStateStore,
+    SkillUpgradeError,
     activate_skill_context,
     bootstrap_bundled_skills,
     bundled_skills_dir,
@@ -20,6 +24,7 @@ from stellarcode.skill import (
     handle_skill_command,
     parse_frontmatter,
     register_skill_tools,
+    skill_tree_hash,
 )
 from stellarcode.tools import ToolDefinition, ToolInvocation, ToolRegistry
 
@@ -43,6 +48,34 @@ def _write_skill(
         encoding="utf-8",
     )
     return path
+
+
+def _write_bundled_skill(
+    root: Path,
+    name: str,
+    version: str,
+    body: str,
+    *,
+    reference: str = "",
+) -> Path:
+    skill_dir = root / name
+    skill_dir.mkdir(parents=True, exist_ok=True)
+    (skill_dir / "SKILL.md").write_text(
+        "---\n"
+        f"name: {name}\n"
+        "description: Bundled test skill\n"
+        f'version: "{version}"\n'
+        "author: StellarCode\n"
+        "tags: [test]\n"
+        "---\n\n"
+        f"{body}\n",
+        encoding="utf-8",
+    )
+    if reference:
+        references = skill_dir / "references"
+        references.mkdir()
+        (references / "guide.md").write_text(reference, encoding="utf-8")
+    return skill_dir
 
 
 def test_frontmatter_parser_supports_multiline_and_inline_list():
@@ -97,9 +130,7 @@ def test_state_store_persists_only_disabled_names(tmp_path):
     store.enable("web-access")
 
     assert store.disabled() == frozenset({"code-review"})
-    assert json.loads(store.file.read_text(encoding="utf-8")) == {
-        "disabled": ["code-review"]
-    }
+    assert json.loads(store.file.read_text(encoding="utf-8")) == {"disabled": ["code-review"]}
 
 
 def test_registry_filters_disabled_skills_and_commands_toggle_state(tmp_path):
@@ -118,9 +149,7 @@ def test_registry_filters_disabled_skills_and_commands_toggle_state(tmp_path):
     assert "Enabled" in enabled
     assert registry.find_skill("web-access") is not None
     assert "web-access" in handle_skill_command("/skill", registry, store)
-    assert "Follow this guidance" in handle_skill_command(
-        "/skill show web-access", registry, store
-    )
+    assert "Follow this guidance" in handle_skill_command("/skill show web-access", registry, store)
 
 
 def test_skill_commands_display_registry_warnings(tmp_path):
@@ -201,7 +230,7 @@ def test_skill_index_respects_count_and_utf8_budget(tmp_path):
     assert len(index.encode("utf-8")) <= 4096
 
 
-def test_load_skill_tool_queues_body_for_next_agent_user_message(tmp_path):
+def test_load_skill_tool_injects_body_into_next_model_round_of_same_task(tmp_path):
     skills_root = tmp_path / "skills"
     _write_skill(
         skills_root,
@@ -242,13 +271,12 @@ def test_load_skill_tool_queues_body_for_next_agent_user_message(tmp_path):
                         }
                     ],
                 }
-            if self.calls == 2:
-                assert messages[-1]["role"] == "tool"
-                return {"role": "assistant", "content": "Skill queued."}
+            assert self.calls == 2
+            assert messages[-2]["role"] == "tool"
             assert messages[-1]["role"] == "user"
             assert "## 已加载 Skill：web-access" in messages[-1]["content"]
             assert "Always inspect the page evidence." in messages[-1]["content"]
-            assert "继续读取网页" in messages[-1]["content"]
+            assert "current task" in messages[-1]["content"]
             return {"role": "assistant", "content": "Used the loaded guidance."}
 
     client = SkillClient()
@@ -259,8 +287,7 @@ def test_load_skill_tool_queues_body_for_next_agent_user_message(tmp_path):
         skill_context_buffer=buffer,
     )
 
-    assert agent.run("读取网页") == "Skill queued."
-    assert agent.run("继续读取网页") == "Used the loaded guidance."
+    assert agent.run("读取网页") == "Used the loaded guidance."
     assert buffer.is_empty()
 
 
@@ -285,6 +312,53 @@ def test_explicit_skill_reference_loads_enabled_guidance_for_current_task(tmp_pa
 
     state.disable("web-access")
     assert explicit_skill_context("@skill:web-access investigate", registry) == ""
+
+
+def test_team_worker_receives_loaded_skill_in_same_assigned_step(tmp_path):
+    skills_root = tmp_path / "skills"
+    _write_skill(skills_root, "code-exploration", body="Inspect exact source before editing.")
+    registry = SkillRegistry(skills_root, None)
+    registry.reload()
+    tools = ToolRegistry()
+    register_skill_tools(tools, registry)
+
+    class WorkerClient:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def chat(self, messages, tools=None, temperature=0.2, on_delta=None):
+            self.calls += 1
+            if self.calls == 1:
+                return {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [
+                        {
+                            "id": "load-code",
+                            "type": "function",
+                            "function": {
+                                "name": "load_skill",
+                                "arguments": '{"name":"code-exploration"}',
+                            },
+                        }
+                    ],
+                }
+            assert "## 已加载 Skill：code-exploration" in messages[-1]["content"]
+            assert "Inspect exact source before editing." in messages[-1]["content"]
+            return {"role": "assistant", "content": "worker used skill"}
+
+    worker = SubAgent(
+        "worker",
+        AgentRole.WORKER,
+        WorkerClient(),
+        tools,
+        skill_registry=registry,
+        skill_context_buffer=SkillContextBuffer(),
+    )
+
+    result = worker.execute(AgentMessage.task("lead", "inspect the code"))
+
+    assert result.content == "worker used skill"
 
 
 def test_parallel_tool_threads_route_skill_loads_to_the_calling_context(tmp_path):
@@ -350,13 +424,14 @@ def test_multi_agent_assigns_an_independent_skill_buffer_to_every_role(tmp_path)
     assert len({id(buffer) for buffer in buffers}) == len(buffers)
 
 
-def test_bundled_web_access_is_installed_into_user_skills(tmp_path):
+def test_bundled_workflow_skills_are_installed_into_user_skills(tmp_path):
     user_skills = tmp_path / "user-skills"
     assert bootstrap_bundled_skills(user_skills) == ()
     registry = SkillRegistry(user_skills, None)
     registry.reload()
 
     skill = registry.find_skill("web-access")
+    code_skill = registry.find_skill("code-exploration")
 
     assert skill is not None
     assert skill.source == SkillSource.USER
@@ -364,6 +439,13 @@ def test_bundled_web_access_is_installed_into_user_skills(tmp_path):
     assert skill.references_dir is not None
     assert (skill.references_dir / "cdp-cheatsheet.md").is_file()
     assert (skill.references_dir / "site-patterns" / "github.com.md").is_file()
+    assert code_skill is not None
+    assert code_skill.source == SkillSource.USER
+    assert code_skill.skill_md_path == user_skills / "code-exploration" / "SKILL.md"
+    assert "glob_files" in code_skill.body
+    assert "grep_code" in code_skill.body
+    assert "search_code" in code_skill.body
+    assert "Runtime capability state" in code_skill.body
     assert bundled_skills_dir().is_dir()
 
 
@@ -373,3 +455,226 @@ def test_bundled_skill_bootstrap_never_overwrites_user_copy(tmp_path):
 
     assert bootstrap_bundled_skills(user_skills) == ()
     assert "custom user guidance" in custom.read_text(encoding="utf-8")
+
+
+def test_bundled_skill_records_hash_and_auto_upgrades_only_clean_copy(tmp_path):
+    bundled = tmp_path / "bundled"
+    user = tmp_path / "user"
+    source = _write_bundled_skill(
+        bundled,
+        "review",
+        "1.0.0",
+        "Review version one.",
+        reference="reference one",
+    )
+    store = SkillStateStore(tmp_path / "skills.json")
+    manager = BundledSkillManager(user, store, bundled)
+
+    assert manager.bootstrap() == ()
+    first_hash = skill_tree_hash(source)
+    assert skill_tree_hash(user / "review") == first_hash
+    assert store.bundled_records()["review"]["installed_hash"] == first_hash
+
+    (source / "SKILL.md").write_text(
+        (source / "SKILL.md")
+        .read_text(encoding="utf-8")
+        .replace('version: "1.0.0"', 'version: "2.0.0"')
+        .replace("Review version one.", "Review version two."),
+        encoding="utf-8",
+    )
+    (source / "references" / "guide.md").write_text(
+        "reference two",
+        encoding="utf-8",
+    )
+
+    assert manager.bootstrap() == ()
+    status = manager.status("review")
+    assert status["upgrade_state"] == "current"
+    assert status["builtin_version"] == "2.0.0"
+    assert status["current_hash"] == skill_tree_hash(source)
+    assert "Review version two." in (user / "review" / "SKILL.md").read_text(
+        encoding="utf-8"
+    )
+
+
+def test_custom_bundled_skill_is_preserved_and_can_acknowledge_update(tmp_path):
+    bundled = tmp_path / "bundled"
+    user = tmp_path / "user"
+    source = _write_bundled_skill(bundled, "review", "1.0.0", "Version one.")
+    store = SkillStateStore(tmp_path / "skills.json")
+    manager = BundledSkillManager(user, store, bundled)
+    manager.bootstrap()
+    installed = user / "review" / "SKILL.md"
+    installed.write_text(
+        installed.read_text(encoding="utf-8") + "\nUser customization.\n",
+        encoding="utf-8",
+    )
+    (source / "SKILL.md").write_text(
+        (source / "SKILL.md")
+        .read_text(encoding="utf-8")
+        .replace('version: "1.0.0"', 'version: "2.0.0"')
+        .replace("Version one.", "Version two."),
+        encoding="utf-8",
+    )
+
+    manager.bootstrap()
+    status = manager.status("review")
+    assert status["upgrade_state"] == "update_available"
+    assert status["customized"] is True
+    assert "User customization." in installed.read_text(encoding="utf-8")
+
+    diff = manager.diff("review")
+    kept = manager.keep_custom(
+        "review",
+        expected_current_hash=diff["current_hash"],
+        expected_builtin_hash=diff["builtin_hash"],
+    )
+    assert kept["upgrade_state"] == "custom_kept"
+    assert "User customization." in installed.read_text(encoding="utf-8")
+
+    (source / "SKILL.md").write_text(
+        (source / "SKILL.md")
+        .read_text(encoding="utf-8")
+        .replace('version: "2.0.0"', 'version: "3.0.0"'),
+        encoding="utf-8",
+    )
+    assert manager.status("review")["upgrade_state"] == "update_available"
+
+
+def test_bundled_skill_diff_update_restore_and_stale_hash_protection(tmp_path):
+    bundled = tmp_path / "bundled"
+    user = tmp_path / "user"
+    source = _write_bundled_skill(bundled, "review", "1.0.0", "Default guidance.")
+    store = SkillStateStore(tmp_path / "skills.json")
+    manager = BundledSkillManager(user, store, bundled)
+    manager.bootstrap()
+    installed = user / "review" / "SKILL.md"
+    installed.write_text(
+        installed.read_text(encoding="utf-8") + "\nCustom guidance.\n",
+        encoding="utf-8",
+    )
+    (source / "SKILL.md").write_text(
+        (source / "SKILL.md")
+        .read_text(encoding="utf-8")
+        .replace('version: "1.0.0"', 'version: "2.0.0"'),
+        encoding="utf-8",
+    )
+
+    preview = manager.diff("review")
+    assert "current/SKILL.md" in preview["diff"]
+    installed.write_text(
+        installed.read_text(encoding="utf-8") + "Changed after preview.\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(SkillUpgradeError, match="changed after the preview"):
+        manager.update(
+            "review",
+            expected_current_hash=preview["current_hash"],
+            expected_builtin_hash=preview["builtin_hash"],
+        )
+
+    preview = manager.diff("review")
+    updated = manager.update(
+        "review",
+        expected_current_hash=preview["current_hash"],
+        expected_builtin_hash=preview["builtin_hash"],
+    )
+    assert updated["upgrade_state"] == "current"
+    assert skill_tree_hash(user / "review") == skill_tree_hash(source)
+
+    installed.write_text(
+        installed.read_text(encoding="utf-8") + "\nAnother customization.\n",
+        encoding="utf-8",
+    )
+    preview = manager.diff("review")
+    restored = manager.restore_default(
+        "review",
+        expected_current_hash=preview["current_hash"],
+        expected_builtin_hash=preview["builtin_hash"],
+    )
+    assert restored["upgrade_state"] == "current"
+    assert "Another customization." not in installed.read_text(encoding="utf-8")
+
+
+def test_bundled_skill_update_rolls_back_when_baseline_write_fails(
+    tmp_path,
+    monkeypatch,
+):
+    bundled = tmp_path / "bundled"
+    user = tmp_path / "user"
+    source = _write_bundled_skill(bundled, "review", "1.0.0", "Default guidance.")
+    store = SkillStateStore(tmp_path / "skills.json")
+    manager = BundledSkillManager(user, store, bundled)
+    manager.bootstrap()
+    installed = user / "review" / "SKILL.md"
+    installed.write_text(
+        installed.read_text(encoding="utf-8") + "\nImportant customization.\n",
+        encoding="utf-8",
+    )
+    (source / "SKILL.md").write_text(
+        (source / "SKILL.md")
+        .read_text(encoding="utf-8")
+        .replace('version: "1.0.0"', 'version: "2.0.0"'),
+        encoding="utf-8",
+    )
+    preview = manager.diff("review")
+    previous_hash = skill_tree_hash(user / "review")
+    monkeypatch.setattr(store, "set_bundled_record", lambda _name, _record: False)
+
+    with pytest.raises(SkillUpgradeError, match="persist bundled Skill state"):
+        manager.update(
+            "review",
+            expected_current_hash=preview["current_hash"],
+            expected_builtin_hash=preview["builtin_hash"],
+        )
+
+    assert skill_tree_hash(user / "review") == previous_hash
+    assert "Important customization." in installed.read_text(encoding="utf-8")
+
+
+def test_large_same_size_skill_files_produce_hash_diff(tmp_path):
+    bundled = tmp_path / "bundled"
+    user = tmp_path / "user"
+    source = _write_bundled_skill(bundled, "review", "1.0.0", "Default.")
+    payload_size = 2 * 1024 * 1024 + 1
+    (source / "large.txt").write_bytes(b"a" * payload_size)
+    store = SkillStateStore(tmp_path / "skills.json")
+    manager = BundledSkillManager(user, store, bundled)
+    manager.bootstrap()
+    (user / "review" / "large.txt").write_bytes(b"b" * payload_size)
+
+    preview = manager.diff("review")
+
+    assert "No differences." not in preview["diff"]
+    assert "sha256=" in preview["diff"]
+
+
+def test_bundled_skill_rejects_frontmatter_name_mismatch(tmp_path):
+    bundled = tmp_path / "bundled"
+    user = tmp_path / "user"
+    source = _write_bundled_skill(bundled, "review", "1.0.0", "Default.")
+    skill_md = source / "SKILL.md"
+    skill_md.write_text(
+        skill_md.read_text(encoding="utf-8").replace("name: review", "name: other"),
+        encoding="utf-8",
+    )
+    manager = BundledSkillManager(user, SkillStateStore(tmp_path / "skills.json"), bundled)
+
+    warnings = manager.bootstrap()
+
+    assert warnings
+    assert "must match its directory" in warnings[0]
+    assert not (user / "review").exists()
+
+
+def test_skill_reload_installs_new_bundled_workflow_skills(tmp_path):
+    user_skills = tmp_path / "user-skills"
+    store = SkillStateStore(tmp_path / "skills.json")
+    registry = SkillRegistry(user_skills, None, store)
+    registry.reload()
+
+    result = handle_skill_command("/skill reload", registry, store)
+
+    assert "Skills reloaded" in result
+    assert registry.find_skill("web-access") is not None
+    assert registry.find_skill("code-exploration") is not None

@@ -1,3 +1,9 @@
+"""Safe workspace diagnostics orchestrator.
+
+Fast syntax checks are non-executing. Build and LSP providers are explicit local process
+launches with constrained environment, output, time, and cancellation budgets.
+"""
+
 from __future__ import annotations
 
 import copy

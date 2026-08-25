@@ -1,0 +1,293 @@
+.supervision-center { position: relative; display: inline-flex; color: var(--text); }
+.supervision-sr-only {
+  position: absolute; width: 1px; height: 1px; overflow: hidden; padding: 0; margin: -1px;
+  border: 0; clip: rect(0 0 0 0); white-space: nowrap;
+}
+.supervision-trigger {
+  display: inline-flex; min-height: 30px; align-items: center; gap: 6px; padding: 3px 8px;
+  border: 1px solid transparent; border-radius: 6px; background: transparent;
+  color: var(--text-soft); cursor: pointer; font-size: 11px;
+}
+.supervision-trigger:hover, .supervision-trigger[aria-expanded="true"] {
+  border-color: var(--border); background: var(--panel-hover); color: var(--text);
+}
+.supervision-trigger:focus-visible, .supervision-close:focus-visible,
+.supervision-tabs button:focus-visible, .supervision-action:focus-visible,
+.supervision-arguments summary:focus-visible, .supervision-error button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.supervision-trigger.needs-attention { color: var(--text); }
+.supervision-trigger-icon { color: var(--accent); font-size: 16px; line-height: 1; }
+.supervision-trigger-label { font-weight: 650; }
+.supervision-count {
+  display: inline-grid; min-width: 18px; height: 18px; place-items: center; padding: 0 5px;
+  border-radius: 999px; font-size: 9px; font-weight: 800;
+}
+.supervision-count.active { background: color-mix(in srgb, var(--good) 18%, var(--panel)); color: var(--good); }
+.supervision-count.warning { background: color-mix(in srgb, var(--warn) 20%, var(--panel)); color: var(--warn); }
+.supervision-trigger-failure {
+  display: inline-grid; width: 17px; height: 17px; place-items: center; border-radius: 50%;
+  background: color-mix(in srgb, var(--danger) 18%, var(--panel)); color: var(--danger);
+  font-size: 10px; font-weight: 900;
+}
+.supervision-backdrop {
+  position: fixed; z-index: 1400; inset: 0; display: flex; justify-content: flex-end;
+  background: rgb(7 9 12 / 58%); backdrop-filter: blur(2px); animation: supervision-fade-in 120ms ease-out;
+}
+.supervision-drawer {
+  display: grid; width: min(580px, 94vw); height: 100%; grid-template-rows: auto auto auto minmax(0, 1fr);
+  overflow: hidden; border-left: 1px solid var(--border-strong); background: var(--panel);
+  box-shadow: -20px 0 60px rgb(0 0 0 / 32%); animation: supervision-slide-in 160ms ease-out;
+}
+.supervision-header {
+  display: flex; min-width: 0; align-items: flex-start; justify-content: space-between; gap: 18px;
+  padding: 18px 18px 14px; border-bottom: 1px solid var(--border);
+}
+.supervision-header > div { min-width: 0; }
+.supervision-header h2 {
+  margin: 0 0 4px; color: var(--text-heading, var(--text)); font-size: 16px;
+  font-weight: 700; letter-spacing: -.01em;
+}
+.supervision-header p { margin: 0; color: var(--text-faint); font-size: 11px; line-height: 1.45; }
+.supervision-close {
+  display: grid; width: 30px; height: 30px; flex: 0 0 30px; place-items: center;
+  border: 1px solid transparent; border-radius: 6px; background: transparent;
+  color: var(--text-soft); cursor: pointer; font-size: 20px; line-height: 1;
+}
+.supervision-close:hover { border-color: var(--border); background: var(--panel-hover); color: var(--text); }
+.supervision-error {
+  display: flex; min-width: 0; align-items: center; justify-content: space-between; gap: 12px;
+  padding: 9px 14px; border-bottom: 1px solid color-mix(in srgb, var(--danger) 45%, var(--border));
+  background: color-mix(in srgb, var(--danger) 10%, var(--panel)); color: var(--danger);
+  font-size: 10px; line-height: 1.45;
+}
+.supervision-error:empty { height: 0; padding: 0; border: 0; }
+.supervision-error span { min-width: 0; overflow-wrap: anywhere; }
+.supervision-error button {
+  flex: 0 0 auto; padding: 3px 7px; border: 1px solid currentColor; border-radius: 4px;
+  background: transparent; color: inherit; cursor: pointer; font-size: 9px;
+}
+.supervision-tabs { display: flex; align-items: end; gap: 4px; padding: 0 14px; border-bottom: 1px solid var(--border); }
+.supervision-tabs button {
+  position: relative; display: inline-flex; min-height: 43px; align-items: center; gap: 7px;
+  padding: 0 11px; background: transparent; color: var(--text-faint); cursor: pointer;
+  font-size: 11px; font-weight: 650;
+}
+.supervision-tabs button::after {
+  position: absolute; right: 9px; bottom: -1px; left: 9px; height: 2px;
+  background: transparent; content: "";
+}
+.supervision-tabs button:hover, .supervision-tabs button.active { color: var(--text); }
+.supervision-tabs button.active::after { background: var(--accent); }
+.supervision-tabs button > span {
+  min-width: 17px; padding: 1px 5px; border-radius: 999px; background: var(--panel-raised);
+  color: var(--text-soft); font-size: 9px; text-align: center;
+}
+.supervision-tabs button > span.warning {
+  background: color-mix(in srgb, var(--warn) 18%, var(--panel)); color: var(--warn);
+}
+.supervision-panel {
+  min-height: 0; overflow: auto; overscroll-behavior: contain; scrollbar-gutter: stable;
+}
+.supervision-list { display: grid; gap: 10px; padding: 14px; }
+.supervision-card {
+  min-width: 0; overflow: hidden; border: 1px solid var(--border); border-radius: 8px;
+  background: var(--bg); box-shadow: 0 1px 2px rgb(0 0 0 / 12%);
+}
+.supervision-card:hover { border-color: var(--border-strong); }
+.task-card[data-status="waiting_approval"], .approval-item { border-left: 3px solid var(--warn); }
+.task-card[data-status="failed"] { border-left: 3px solid var(--danger); }
+.task-card[data-status="recovering"] { border-left: 3px solid var(--accent); }
+.task-card[data-status="finalizing"] { border-left: 3px solid var(--accent); }
+.supervision-card-heading {
+  display: flex; min-width: 0; align-items: center; justify-content: space-between;
+  gap: 10px; padding: 11px 12px 8px;
+}
+.supervision-card-title { display: flex; min-width: 0; align-items: center; gap: 9px; }
+.supervision-card-title > div {
+  display: flex; min-width: 0; align-items: center; gap: 5px; overflow: hidden;
+  font-size: 11px; white-space: nowrap;
+}
+.supervision-card-title strong, .supervision-card-title span:last-child { overflow: hidden; text-overflow: ellipsis; }
+.supervision-card-title strong { flex: 0 1 auto; color: var(--text); }
+.supervision-card-title span { color: var(--text-faint); }
+.supervision-card-title span:last-child { flex: 1; color: var(--text-soft); }
+.supervision-status-dot {
+  width: 8px; height: 8px; flex: 0 0 8px; border-radius: 50%; background: var(--text-faint);
+}
+.supervision-status-dot.status-running, .supervision-status-dot.status-completed { background: var(--good); }
+.supervision-status-dot.status-accepted { background: var(--text-soft); }
+.supervision-status-dot.status-waiting_approval, .supervision-status-dot.status-stopping { background: var(--warn); }
+.supervision-status-dot.status-recovering { background: var(--accent); }
+.supervision-status-dot.status-finalizing { background: var(--accent); }
+.supervision-status-dot.status-failed { background: var(--danger); }
+.supervision-status-dot.active { animation: supervision-status-pulse 1.8s ease-in-out infinite; }
+.supervision-status-badge, .supervision-risk-badge {
+  flex: 0 0 auto; padding: 3px 7px; border: 1px solid var(--border); border-radius: 999px;
+  background: var(--panel-raised); color: var(--text-soft); font-size: 9px; font-weight: 700; white-space: nowrap;
+}
+.supervision-status-badge.status-running, .supervision-status-badge.status-completed { color: var(--good); }
+.supervision-status-badge.status-accepted { color: var(--text-soft); }
+.supervision-status-badge.status-waiting_approval, .supervision-status-badge.status-stopping { color: var(--warn); }
+.supervision-status-badge.status-recovering { color: var(--accent); }
+.supervision-status-badge.status-finalizing { color: var(--accent); }
+.supervision-status-badge.status-failed { color: var(--danger); }
+.supervision-activity { padding: 2px 12px 10px 29px; }
+.supervision-activity strong {
+  display: block; overflow: hidden; color: var(--text-soft); font-size: 11px; font-weight: 500;
+  line-height: 1.45; text-overflow: ellipsis; white-space: nowrap;
+}
+.supervision-activity p {
+  display: -webkit-box; margin: 5px 0 0; overflow: hidden; color: var(--danger);
+  font-size: 10px; line-height: 1.45; -webkit-box-orient: vertical; -webkit-line-clamp: 2;
+}
+.supervision-metrics {
+  display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); margin: 0; padding: 9px 12px;
+  border-top: 1px solid var(--border); background: color-mix(in srgb, var(--panel-raised) 44%, transparent);
+}
+.supervision-metrics > div { min-width: 0; padding: 0 9px; border-right: 1px solid var(--border); }
+.supervision-metrics > div:first-child { padding-left: 0; }
+.supervision-metrics > div:last-child { padding-right: 0; border-right: 0; }
+.supervision-metrics dt, .supervision-approval-context dt {
+  margin-bottom: 3px; color: var(--text-faint); font-size: 9px;
+}
+.supervision-metrics dd, .supervision-approval-context dd {
+  margin: 0; overflow: hidden; color: var(--text); font: 10px/1.35 "Cascadia Code", Consolas, monospace;
+  text-overflow: ellipsis; white-space: nowrap;
+}
+.supervision-actions {
+  display: flex; min-height: 43px; align-items: center; gap: 7px; padding: 7px 11px;
+  border-top: 1px solid var(--border);
+}
+.supervision-action-spacer { flex: 1; }
+.supervision-action {
+  display: inline-flex; min-height: 28px; align-items: center; justify-content: center; gap: 6px;
+  padding: 4px 10px; border: 1px solid var(--border-strong); border-radius: 5px;
+  background: var(--panel-raised); color: var(--text-soft); cursor: pointer; font-size: 10px; font-weight: 600;
+}
+.supervision-action:hover:not(:disabled) { background: var(--panel-hover); color: var(--text); }
+.supervision-action.action-primary {
+  border-color: color-mix(in srgb, var(--accent) 65%, var(--border));
+  background: color-mix(in srgb, var(--accent) 74%, #173256); color: var(--accent-contrast, white);
+}
+.supervision-action.action-danger {
+  border-color: color-mix(in srgb, var(--danger) 55%, var(--border)); color: var(--danger);
+}
+.supervision-action.action-warning {
+  border-color: color-mix(in srgb, var(--warn) 72%, var(--border));
+  background: color-mix(in srgb, var(--warn) 16%, var(--panel-raised)); color: var(--text);
+}
+.supervision-action.action-critical {
+  border-color: color-mix(in srgb, var(--danger) 78%, var(--border));
+  background: color-mix(in srgb, var(--danger) 17%, var(--panel-raised)); color: var(--danger);
+}
+.supervision-action:disabled { cursor: default; opacity: .5; }
+.supervision-spinner {
+  width: 10px; height: 10px; border: 1px solid currentColor; border-right-color: transparent;
+  border-radius: 50%; animation: supervision-spin 650ms linear infinite;
+}
+.supervision-risk-icon {
+  display: inline-grid; width: 20px; height: 20px; flex: 0 0 20px; place-items: center;
+  border: 1px solid var(--warn); border-radius: 50%; color: var(--warn); font-size: 11px; font-weight: 900;
+}
+.supervision-risk-badge.risk-low { color: var(--text-soft); }
+.supervision-risk-badge.risk-medium { color: var(--warn); }
+.supervision-risk-badge.risk-high {
+  border-color: color-mix(in srgb, var(--danger) 45%, var(--border)); color: var(--danger);
+}
+.approval-item[data-risk="high"] { border-left-color: var(--danger); }
+.approval-item[data-risk="high"] .supervision-risk-icon { border-color: var(--danger); color: var(--danger); }
+.supervision-tool-summary { display: grid; gap: 4px; padding: 2px 12px 10px 41px; }
+.supervision-tool-summary strong { color: var(--text); font: 11px/1.4 "Cascadia Code", Consolas, monospace; }
+.supervision-tool-summary span { color: var(--text-soft); font-size: 10px; line-height: 1.45; }
+.supervision-approval-context {
+  display: grid; grid-template-columns: minmax(0, 1fr) auto auto; gap: 12px; margin: 0; padding: 9px 12px;
+  border-top: 1px solid var(--border); background: color-mix(in srgb, var(--panel-raised) 44%, transparent);
+}
+.supervision-approval-context > div { min-width: 0; }
+.supervision-change-preview { border-top: 1px solid var(--border); }
+.supervision-change-summary {
+  display: grid; grid-template-columns: auto minmax(0, 1fr) auto; align-items: center;
+  gap: 8px; padding: 9px 12px; background: color-mix(in srgb, var(--accent) 5%, var(--bg));
+}
+.supervision-change-summary .change-operation {
+  padding: 2px 6px; border: 1px solid var(--border-strong); border-radius: 4px;
+  color: var(--accent); font-size: 9px; font-weight: 700; white-space: nowrap;
+}
+.supervision-change-summary .operation-delete { color: var(--danger); }
+.supervision-change-summary .operation-no_change { color: var(--text-faint); }
+.supervision-change-summary code {
+  min-width: 0; overflow: hidden; color: var(--text-soft);
+  font: 9px/1.4 "Cascadia Code", Consolas, monospace; text-overflow: ellipsis; white-space: nowrap;
+}
+.supervision-change-summary .change-stat {
+  color: var(--text-soft); font: 9px/1.4 "Cascadia Code", Consolas, monospace; white-space: nowrap;
+}
+.change-warning, .change-error {
+  margin: 0; padding: 7px 12px; border-top: 1px solid var(--border);
+  color: var(--warn); font-size: 9px; line-height: 1.45;
+}
+.change-error { color: var(--danger); }
+.supervision-change-diff { border-top: 1px solid var(--border); }
+.supervision-change-diff summary {
+  display: flex; min-height: 32px; align-items: center; justify-content: space-between; gap: 8px;
+  padding: 7px 12px; color: var(--text-soft); cursor: pointer; font-size: 9px; user-select: none;
+}
+.supervision-change-diff summary:hover { background: var(--panel-hover); color: var(--text); }
+.supervision-change-diff summary > span { color: var(--warn); }
+.supervision-change-diff pre {
+  max-height: 280px; margin: 0; overflow: auto; padding: 10px 12px; border-top: 1px solid var(--border);
+  background: var(--surface-deep); color: var(--text-soft);
+  font: 9px/1.5 "Cascadia Code", Consolas, monospace; white-space: pre;
+}
+.supervision-arguments { border-top: 1px solid var(--border); }
+.supervision-arguments summary {
+  padding: 8px 12px; color: var(--text-faint); cursor: pointer; font-size: 9px; user-select: none;
+}
+.supervision-arguments summary:hover { color: var(--text); }
+.supervision-arguments pre {
+  max-height: 180px; margin: 0; overflow: auto; padding: 10px 12px; border-top: 1px solid var(--border);
+  background: var(--surface-deep); color: var(--text-soft); font: 9px/1.5 "Cascadia Code", Consolas, monospace;
+  overflow-wrap: anywhere; white-space: pre-wrap;
+}
+.supervision-empty {
+  display: grid; min-height: 260px; place-items: center; align-content: center; gap: 7px;
+  padding: 28px; text-align: center;
+}
+.supervision-empty > span {
+  display: grid; width: 34px; height: 34px; margin-bottom: 3px; place-items: center;
+  border: 1px solid color-mix(in srgb, var(--good) 42%, var(--border)); border-radius: 50%;
+  color: var(--good); font-size: 15px;
+}
+.supervision-empty strong { color: var(--text); font-size: 12px; }
+.supervision-empty p {
+  max-width: 320px; margin: 0; color: var(--text-faint); font-size: 10px; line-height: 1.5;
+}
+@keyframes supervision-fade-in { from { opacity: 0; } }
+@keyframes supervision-slide-in { from { transform: translateX(24px); opacity: .5; } }
+@keyframes supervision-status-pulse { 50% { opacity: .45; } }
+@keyframes supervision-spin { to { transform: rotate(360deg); } }
+
+@media (max-width: 640px) {
+  .supervision-trigger-label { display: none; }
+  .supervision-drawer { width: 100%; }
+  .supervision-header { padding: 15px 14px 12px; }
+  .supervision-tabs { padding: 0 9px; }
+  .supervision-list { gap: 8px; padding: 9px; }
+  .supervision-card-title > div { display: grid; gap: 1px; }
+  .supervision-card-title > div > span[aria-hidden="true"] { display: none; }
+  .supervision-metrics { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 9px 0; }
+  .supervision-metrics > div:nth-child(2) { border-right: 0; }
+  .supervision-metrics > div:nth-child(3) { padding-left: 0; }
+  .supervision-approval-context { grid-template-columns: minmax(0, 1fr) auto; }
+  .supervision-approval-context > div:last-child { display: none; }
+  .supervision-actions { flex-wrap: wrap; }
+  .supervision-action-spacer { display: none; }
+  .approval-actions .supervision-action:first-child { width: 100%; }
+  .supervision-change-summary { grid-template-columns: auto minmax(0, 1fr); }
+  .supervision-change-summary .change-stat { grid-column: 2; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .supervision-backdrop, .supervision-drawer, .supervision-status-dot.active, .supervision-spinner { animation: none; }
+}
+@media (forced-colors: active) {
+  .supervision-card, .supervision-drawer, .supervision-action, .supervision-trigger { border: 1px solid CanvasText; }
+}

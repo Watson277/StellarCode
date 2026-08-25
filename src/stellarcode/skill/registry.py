@@ -1,14 +1,19 @@
+"""Discover and merge user/project Skills without injecting every SKILL.md eagerly."""
+
 from __future__ import annotations
 
 import threading
-import shutil
-import uuid
 from collections.abc import Iterable
 from pathlib import Path
 
 from stellarcode.skill.model import Skill, SkillSource
 from stellarcode.skill.parser import parse_frontmatter
 from stellarcode.skill.state import SkillStateStore
+from stellarcode.skill.upgrade import (
+    BundledSkillManager,
+    SkillUpgradeError,
+    skill_tree_hash,
+)
 
 
 class SkillRegistry:
@@ -86,8 +91,12 @@ class SkillRegistry:
             if not skill_md.is_file():
                 continue
             try:
+                # Discovery follows the same bounded tree validation as bundled
+                # upgrades, so a custom Skill cannot escape through a symlink or
+                # Windows junction in SKILL.md or references/.
+                skill_tree_hash(skill_dir)
                 parsed = parse_frontmatter(skill_md.read_text(encoding="utf-8"))
-            except OSError as exc:
+            except (OSError, UnicodeError, SkillUpgradeError) as exc:
                 warnings.append(f"could not read {skill_md}: {exc}")
                 continue
             warnings.extend(f"{skill_md}: {warning}" for warning in parsed.warnings)
@@ -106,41 +115,16 @@ class SkillRegistry:
             )
 
 
-def bundled_skills_dir() -> Path:
-    return Path(__file__).resolve().parent.parent / "skills"
-
-
 def bootstrap_bundled_skills(
     user_dir: str | Path,
     bundled_dir: str | Path | None = None,
+    state_store: SkillStateStore | None = None,
 ) -> tuple[str, ...]:
-    """Installs missing bundled Skill templates into the editable user layer."""
-    target_root = Path(user_dir)
-    source_root = Path(bundled_dir) if bundled_dir is not None else bundled_skills_dir()
-    warnings: list[str] = []
-    try:
-        target_root.mkdir(parents=True, exist_ok=True)
-        sources = sorted(path for path in source_root.iterdir() if path.is_dir())
-    except OSError as exc:
-        return (f"could not initialize user Skill directory {target_root}: {exc}",)
+    """Install or safely reconcile bundled Skills in the editable user layer."""
 
-    for source in sources:
-        if not (source / "SKILL.md").is_file():
-            continue
-        target = target_root / source.name
-        if target.exists():
-            continue
-        temporary = target_root / f".{source.name}.install-{uuid.uuid4().hex}"
-        try:
-            shutil.copytree(source, temporary)
-            temporary.replace(target)
-        except OSError as exc:
-            if not target.exists():
-                warnings.append(f"could not install bundled Skill {source.name}: {exc}")
-        finally:
-            if temporary.exists():
-                shutil.rmtree(temporary, ignore_errors=True)
-    return tuple(warnings)
+    target_root = Path(user_dir)
+    store = state_store or SkillStateStore(target_root.parent / "skills.json")
+    return BundledSkillManager(target_root, store, bundled_dir).bootstrap()
 
 
 def _string_field(frontmatter: dict[str, object], key: str) -> str | None:
@@ -153,4 +137,3 @@ def _string_list_field(frontmatter: dict[str, object], key: str) -> tuple[str, .
     if not isinstance(value, list):
         return ()
     return tuple(item for item in value if isinstance(item, str))
-

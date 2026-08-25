@@ -1,3 +1,5 @@
+"""Safe web-search/fetch providers and content extraction for Agent tools."""
+
 from stellarcode.web.fetch import WebFetcher, WebFetchError
 from stellarcode.web.model import SearchResult, format_search_results
 from stellarcode.web.network import (

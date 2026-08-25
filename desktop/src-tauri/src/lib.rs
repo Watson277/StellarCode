@@ -1,12 +1,21 @@
+//! Tauri boundary for the StellarCode desktop shell.
+//!
+//! Rust owns local settings, project registration, attachment inspection, and the Python
+//! Sidecar process. It forwards JSONL without interpreting Agent semantics so protocol
+//! state remains consistent with the Python Runtime and its durable journal.
+
 mod project_store;
 mod settings_store;
 
 use project_store::{shell_compatible_path, ProjectRecord, ProjectStore, WorkspaceEntry};
 use serde::Serialize;
 use serde_json::Value;
-use settings_store::{validate_lsp_settings, AppSettings, SettingsSnapshot, SettingsStore};
+use settings_store::{
+    validate_lsp_settings, validate_worktree_directory, AppSettings, SettingsSnapshot,
+    SettingsStore,
+};
 use std::fs;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::Mutex;
@@ -26,6 +35,13 @@ struct RuntimeProcess {
     stdin: ChildStdin,
 }
 
+struct RuntimeLauncher {
+    executable: PathBuf,
+    /// Development starts `python -m stellarcode.runtime.sidecar`; the bundled
+    /// release executable already has that module as its entry point.
+    uses_python_module: bool,
+}
+
 #[derive(Default)]
 struct RuntimeState(Mutex<Option<RuntimeProcess>>);
 
@@ -40,6 +56,16 @@ struct RuntimeStartResult {
 struct SkillDirectoryResult {
     scope: String,
     path: String,
+}
+
+#[derive(Serialize)]
+struct WorkspaceFilePreview {
+    relative_path: String,
+    absolute_path: String,
+    file_name: String,
+    content: String,
+    size_bytes: u64,
+    truncated: bool,
 }
 
 fn tag_runtime_message(message: &mut Value, pid: u32) {
@@ -61,6 +87,73 @@ struct AttachmentMetadata {
 const MAX_ATTACHMENTS: usize = 10;
 const MAX_ATTACHMENT_BYTES: u64 = 50 * 1024 * 1024;
 const MAX_PREVIEW_BYTES: u64 = 20 * 1024 * 1024;
+const MAX_WORKSPACE_FILE_PREVIEW_BYTES: u64 = 2 * 1024 * 1024;
+
+const REVIEWABLE_TEXT_EXTENSIONS: &[&str] = &[
+    "c",
+    "cc",
+    "cfg",
+    "conf",
+    "cpp",
+    "css",
+    "csv",
+    "cs",
+    "cxx",
+    "env",
+    "go",
+    "graphql",
+    "gql",
+    "h",
+    "hpp",
+    "htm",
+    "html",
+    "ini",
+    "java",
+    "js",
+    "json",
+    "jsonc",
+    "jsonl",
+    "jsx",
+    "kt",
+    "kts",
+    "less",
+    "lock",
+    "log",
+    "lua",
+    "md",
+    "mjs",
+    "php",
+    "properties",
+    "ps1",
+    "py",
+    "pyi",
+    "rb",
+    "rs",
+    "rst",
+    "sass",
+    "scss",
+    "sh",
+    "sql",
+    "svelte",
+    "swift",
+    "toml",
+    "ts",
+    "tsx",
+    "txt",
+    "vue",
+    "xml",
+    "yaml",
+    "yml",
+];
+const REVIEWABLE_TEXT_FILENAMES: &[&str] = &[
+    ".env",
+    ".gitignore",
+    ".gitattributes",
+    "dockerfile",
+    "license",
+    "makefile",
+    "readme",
+];
 
 #[tauri::command]
 fn project_list(store: State<'_, ProjectStore>) -> Result<Vec<ProjectRecord>, String> {
@@ -104,6 +197,140 @@ fn workspace_list_entries(
     relative_path: String,
 ) -> Result<Vec<WorkspaceEntry>, String> {
     store.list_entries(&project_id, &relative_path)
+}
+
+/// Opens a reviewed source/text file without giving the webview a general
+/// `open_path` capability. Canonicalization prevents symlink or `..` escape;
+/// Windows always uses Notepad so opening a script cannot execute it.
+#[tauri::command]
+fn workspace_file_open(
+    app: AppHandle,
+    store: State<'_, ProjectStore>,
+    project_id: String,
+    relative_path: String,
+) -> Result<String, String> {
+    let resolved = resolve_reviewable_workspace_file(&store, &project_id, &relative_path)?;
+    let display_path = shell_compatible_path(&resolved).display().to_string();
+    #[cfg(target_os = "windows")]
+    app.opener()
+        .open_path(display_path.clone(), Some("notepad.exe"))
+        .map_err(|error| format!("cannot open reviewed file {display_path}: {error}"))?;
+    #[cfg(not(target_os = "windows"))]
+    app.opener()
+        .open_path(display_path.clone(), None::<&str>)
+        .map_err(|error| format!("cannot open reviewed file {display_path}: {error}"))?;
+    Ok(display_path)
+}
+
+/// Reads a bounded, recognized text/source file for the built-in right sidebar.
+/// The same canonical workspace guard used by external opening prevents path and
+/// symlink escape, while the byte cap keeps the Tauri IPC response predictable.
+#[tauri::command]
+fn workspace_file_preview(
+    store: State<'_, ProjectStore>,
+    project_id: String,
+    relative_path: String,
+) -> Result<WorkspaceFilePreview, String> {
+    let resolved = resolve_reviewable_workspace_file(&store, &project_id, &relative_path)?;
+    let metadata = fs::metadata(&resolved)
+        .map_err(|error| format!("cannot inspect reviewed file {relative_path}: {error}"))?;
+    let truncated = metadata.len() > MAX_WORKSPACE_FILE_PREVIEW_BYTES;
+    let mut bytes =
+        Vec::with_capacity(metadata.len().min(MAX_WORKSPACE_FILE_PREVIEW_BYTES + 1) as usize);
+    fs::File::open(&resolved)
+        .map_err(|error| format!("cannot open reviewed file {relative_path}: {error}"))?
+        .take(MAX_WORKSPACE_FILE_PREVIEW_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| format!("cannot read reviewed file {relative_path}: {error}"))?;
+    bytes.truncate(MAX_WORKSPACE_FILE_PREVIEW_BYTES as usize);
+    let content = decode_text_preview(&bytes);
+    Ok(WorkspaceFilePreview {
+        relative_path,
+        absolute_path: shell_compatible_path(&resolved).display().to_string(),
+        file_name: resolved
+            .file_name()
+            .and_then(|value| value.to_str())
+            .unwrap_or("file")
+            .to_string(),
+        content,
+        size_bytes: metadata.len(),
+        truncated,
+    })
+}
+
+fn resolve_reviewable_workspace_file(
+    store: &ProjectStore,
+    project_id: &str,
+    relative_path: &str,
+) -> Result<PathBuf, String> {
+    let project = store.get(project_id)?;
+    let root = fs::canonicalize(&project.canonical_path).map_err(|error| {
+        format!(
+            "cannot resolve workspace {}: {error}",
+            project.canonical_path
+        )
+    })?;
+    let relative = Path::new(relative_path);
+    if relative.as_os_str().is_empty()
+        || relative.is_absolute()
+        || relative.components().any(|component| {
+            !matches!(
+                component,
+                std::path::Component::Normal(_) | std::path::Component::CurDir
+            )
+        })
+    {
+        return Err("reviewed file path must remain inside the project workspace".into());
+    }
+    let resolved = fs::canonicalize(root.join(relative))
+        .map_err(|error| format!("cannot resolve reviewed file {relative_path}: {error}"))?;
+    if !resolved.starts_with(&root) || !resolved.is_file() {
+        return Err("reviewed file is outside the project workspace or is not a file".into());
+    }
+    if !is_reviewable_text_file(&resolved) {
+        return Err("only recognized source, configuration, and text files can be opened in the desktop file viewer".into());
+    }
+    Ok(resolved)
+}
+
+fn decode_text_preview(bytes: &[u8]) -> String {
+    if bytes.starts_with(&[0xff, 0xfe]) {
+        let words = bytes[2..]
+            .chunks_exact(2)
+            .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+            .collect::<Vec<_>>();
+        return String::from_utf16_lossy(&words);
+    }
+    if bytes.starts_with(&[0xfe, 0xff]) {
+        let words = bytes[2..]
+            .chunks_exact(2)
+            .map(|pair| u16::from_be_bytes([pair[0], pair[1]]))
+            .collect::<Vec<_>>();
+        return String::from_utf16_lossy(&words);
+    }
+    let utf8 = bytes.strip_prefix(&[0xef, 0xbb, 0xbf]).unwrap_or(bytes);
+    String::from_utf8_lossy(utf8).into_owned()
+}
+
+fn is_reviewable_text_file(path: &Path) -> bool {
+    let file_name = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    if REVIEWABLE_TEXT_FILENAMES.contains(&file_name.as_str())
+        || REVIEWABLE_TEXT_FILENAMES
+            .iter()
+            .any(|name| file_name.starts_with(&format!("{name}.")))
+    {
+        return true;
+    }
+    path.extension()
+        .and_then(|value| value.to_str())
+        .map(|extension| {
+            REVIEWABLE_TEXT_EXTENSIONS.contains(&extension.to_ascii_lowercase().as_str())
+        })
+        .unwrap_or(false)
 }
 
 #[tauri::command]
@@ -305,6 +532,26 @@ fn project_root() -> PathBuf {
         .to_path_buf()
 }
 
+fn ensure_environment_file(root: &Path) -> std::io::Result<()> {
+    fs::create_dir_all(root)?;
+    let env_path = root.join(".env");
+    if !env_path.exists() {
+        // Never copy a developer `.env`: it may contain real API keys. A release
+        // creates this safe template in the user's application-data directory.
+        fs::write(
+            env_path,
+            "# StellarCode user configuration (API keys are stored locally)\n\
+# Choose one provider and fill in its key.\n\
+# LLM_PROVIDER=glm\n\
+# GLM_API_KEY=\n\
+# DEEPSEEK_API_KEY=\n\
+# AGNES_API_KEY=\n\
+# EMBEDDING_API_KEY=\n",
+        )?;
+    }
+    Ok(())
+}
+
 fn python_executable(root: &Path, configured: &str) -> PathBuf {
     if !configured.trim().is_empty() {
         return PathBuf::from(configured.trim());
@@ -323,6 +570,60 @@ fn python_executable(root: &Path, configured: &str) -> PathBuf {
     }
 }
 
+fn bundled_sidecar_executable(app: &AppHandle) -> Result<PathBuf, String> {
+    let resource_dir = app
+        .path()
+        .resource_dir()
+        .map_err(|error| error.to_string())?;
+    let executable_name = if cfg!(target_os = "windows") {
+        "stellarcode-sidecar.exe"
+    } else {
+        "stellarcode-sidecar"
+    };
+    // Tauri preserves the resource's source path for normal desktop bundles.
+    // The second location handles packagers that strip the leading `resources/`.
+    let candidates = [
+        resource_dir
+            .join("resources")
+            .join("stellarcode-sidecar")
+            .join(executable_name),
+        resource_dir
+            .join("stellarcode-sidecar")
+            .join(executable_name),
+    ];
+    candidates
+        .iter()
+        .find(|path| path.is_file())
+        .cloned()
+        .ok_or_else(|| {
+            format!(
+                "Bundled StellarCode Runtime is missing. Rebuild this installer with desktop/scripts/build-windows-release.ps1. Expected one of: {}",
+                candidates
+                    .iter()
+                    .map(|path| path.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        })
+}
+
+fn runtime_launcher(
+    app: &AppHandle,
+    development_root: &Path,
+    configured_python: &str,
+) -> Result<RuntimeLauncher, String> {
+    if cfg!(debug_assertions) {
+        return Ok(RuntimeLauncher {
+            executable: python_executable(development_root, configured_python),
+            uses_python_module: true,
+        });
+    }
+    Ok(RuntimeLauncher {
+        executable: bundled_sidecar_executable(app)?,
+        uses_python_module: false,
+    })
+}
+
 #[tauri::command]
 fn runtime_start(
     app: AppHandle,
@@ -330,6 +631,8 @@ fn runtime_start(
     settings_store: State<'_, SettingsStore>,
     workspace: Option<String>,
 ) -> Result<RuntimeStartResult, String> {
+    // Start exactly one Sidecar process per desktop instance. Higher-level project/session
+    // concurrency is handled inside Python, not by spawning one process per conversation.
     let mut slot = state.0.lock().map_err(|_| "runtime state is poisoned")?;
     if let Some(process) = slot.as_mut() {
         if process
@@ -343,7 +646,14 @@ fn runtime_start(
         *slot = None;
     }
 
-    let root = project_root();
+    let development_root = project_root();
+    let root = if cfg!(debug_assertions) {
+        development_root.clone()
+    } else {
+        app.path()
+            .app_data_dir()
+            .map_err(|error| error.to_string())?
+    };
     let workspace_path = workspace.map(PathBuf::from).unwrap_or_else(|| root.clone());
     let runtime_data_dir = app
         .path()
@@ -354,17 +664,21 @@ fn runtime_start(
     // Revalidate immediately before spawning the sidecar so deleting or replacing
     // the configured executable after saving cannot bypass the opt-in boundary.
     validate_lsp_settings(&settings.diagnostics)?;
-    let python = python_executable(&root, &settings.diagnostics.python_path);
+    validate_worktree_directory(&settings.general.worktree_directory)?;
+    let launcher = runtime_launcher(&app, &development_root, &settings.diagnostics.python_path)?;
     let inherited_pythonpath = std::env::var_os("PYTHONPATH").unwrap_or_default();
-    let runtime_pythonpath = root.join("src");
-    let mut command = Command::new(&python);
+    let runtime_pythonpath = development_root.join("src");
+    let mut command = Command::new(&launcher.executable);
+    if launcher.uses_python_module {
+        command.arg("-m").arg("stellarcode.runtime.sidecar");
+    }
     command
-        .arg("-m")
-        .arg("stellarcode.runtime.sidecar")
         .arg("--workspace")
         .arg(&workspace_path)
         .arg("--data-dir")
         .arg(&runtime_data_dir)
+        .arg("--worktree-dir")
+        .arg(settings.general.worktree_directory.trim())
         .arg("--max-iterations")
         .arg(settings.agent.max_iterations.to_string())
         .arg("--max-parallel-tools")
@@ -392,15 +706,23 @@ fn runtime_start(
         )
         .arg("--diagnostics-lsp-timeout")
         .arg(settings.diagnostics.lsp_timeout_seconds.to_string())
-        .current_dir(&root)
-        .env("PYTHONPATH", &runtime_pythonpath)
-        .env("STELLARCODE_RUNTIME_PYTHONPATH", &runtime_pythonpath)
-        .env("STELLARCODE_TOOL_PYTHONPATH", inherited_pythonpath)
+        .current_dir(if launcher.uses_python_module {
+            root.as_path()
+        } else {
+            workspace_path.as_path()
+        })
+        .env("STELLARCODE_ENV_FILE", settings_store.environment_path())
         .env("PYTHONUTF8", "1")
         .env("PYTHONIOENCODING", "utf-8")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    if launcher.uses_python_module {
+        command
+            .env("PYTHONPATH", &runtime_pythonpath)
+            .env("STELLARCODE_RUNTIME_PYTHONPATH", &runtime_pythonpath)
+            .env("STELLARCODE_TOOL_PYTHONPATH", inherited_pythonpath);
+    }
     apply_model_settings(&mut command, &settings);
     apply_rag_settings(&mut command, &settings);
     #[cfg(target_os = "windows")]
@@ -408,8 +730,8 @@ fn runtime_start(
 
     let mut child = command.spawn().map_err(|error| {
         format!(
-            "failed to start Python runtime with {}: {error}",
-            python.display()
+            "failed to start StellarCode runtime with {}: {error}",
+            launcher.executable.display()
         )
     })?;
     let pid = child.id();
@@ -419,6 +741,8 @@ fn runtime_start(
 
     let event_app = app.clone();
     std::thread::spawn(move || {
+        // stdout is reserved for one JSON envelope per line. Keep parsing in a
+        // dedicated reader so a slow React render never blocks Python workers.
         for line in BufReader::new(stdout).lines() {
             match line {
                 Ok(line) => match serde_json::from_str::<Value>(&line) {
@@ -452,7 +776,7 @@ fn runtime_start(
     *slot = Some(RuntimeProcess { child, stdin });
     Ok(RuntimeStartResult {
         workspace: workspace_path.display().to_string(),
-        python: python.display().to_string(),
+        python: launcher.executable.display().to_string(),
         pid,
     })
 }
@@ -513,6 +837,8 @@ fn apply_rag_settings(command: &mut Command, settings: &AppSettings) {
 fn runtime_send(state: State<'_, RuntimeState>, message: Value) -> Result<(), String> {
     let mut slot = state.0.lock().map_err(|_| "runtime state is poisoned")?;
     let process = slot.as_mut().ok_or("StellarCode runtime is not running")?;
+    // The same newline-delimited framing is used in both directions; Python
+    // flushes one response/event per line and can process requests incrementally.
     let encoded = serde_json::to_string(&message).map_err(|error| error.to_string())?;
     process
         .stdin
@@ -593,8 +919,19 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .setup(|app| {
             let app_data_dir = app.path().app_data_dir()?;
-            let root = project_root();
-            let development_project = root.join("pyproject.toml").exists().then_some(root.clone());
+            let development_root = project_root();
+            let (root, development_project) = if cfg!(debug_assertions) {
+                let development_project = development_root
+                    .join("pyproject.toml")
+                    .exists()
+                    .then_some(development_root.clone());
+                (development_root, development_project)
+            } else {
+                // A release must not rely on the build machine's source tree.
+                // Keep the user-editable `.env` beside settings in app data.
+                (app_data_dir.clone(), None)
+            };
+            ensure_environment_file(&root)?;
             let store = ProjectStore::load(&app_data_dir, development_project.as_deref())
                 .map_err(std::io::Error::other)?;
             let settings =
@@ -610,6 +947,8 @@ pub fn run() {
             project_remove,
             project_touch,
             workspace_list_entries,
+            workspace_file_open,
+            workspace_file_preview,
             settings_get,
             settings_update,
             settings_reset,
@@ -627,8 +966,8 @@ pub fn run() {
 #[cfg(test)]
 mod attachment_tests {
     use super::{
-        apply_model_settings, apply_rag_settings, attachment_type, encode_base64,
-        tag_runtime_message,
+        apply_model_settings, apply_rag_settings, attachment_type, decode_text_preview,
+        encode_base64, is_reviewable_text_file, tag_runtime_message,
     };
     use crate::settings_store::AppSettings;
     use std::path::Path;
@@ -656,6 +995,24 @@ mod attachment_tests {
         assert_eq!(encode_base64(b"f"), "Zg==");
         assert_eq!(encode_base64(b"fo"), "Zm8=");
         assert_eq!(encode_base64(b"foo"), "Zm9v");
+    }
+
+    #[test]
+    fn only_allows_reviewable_text_files_to_open() {
+        assert!(is_reviewable_text_file(Path::new("src/agent.py")));
+        assert!(is_reviewable_text_file(Path::new("README.md")));
+        assert!(is_reviewable_text_file(Path::new(".env.local")));
+        assert!(is_reviewable_text_file(Path::new("trace/session.jsonl")));
+        assert!(!is_reviewable_text_file(Path::new("build/agent.exe")));
+        assert!(!is_reviewable_text_file(Path::new("assets/archive.zip")));
+    }
+
+    #[test]
+    fn decodes_utf8_and_utf16_workspace_previews() {
+        assert_eq!(decode_text_preview(b"hello"), "hello");
+        assert_eq!(decode_text_preview(&[0xef, 0xbb, 0xbf, b'o', b'k']), "ok");
+        assert_eq!(decode_text_preview(&[0xff, 0xfe, b'h', 0, b'i', 0]), "hi");
+        assert_eq!(decode_text_preview(&[0xfe, 0xff, 0, b'h', 0, b'i']), "hi");
     }
 
     #[test]

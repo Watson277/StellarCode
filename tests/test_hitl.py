@@ -68,6 +68,7 @@ def test_hitl_and_tools_import_in_a_fresh_process_without_cycles():
 
 def test_approval_policy_uses_static_tool_risk_levels():
     assert ApprovalPolicy.requires_approval("write_file")
+    assert ApprovalPolicy.requires_approval("apply_patch")
     assert ApprovalPolicy.requires_approval("delete_file")
     assert ApprovalPolicy.requires_approval("execute_command")
     assert ApprovalPolicy.requires_approval("create_project")
@@ -75,6 +76,8 @@ def test_approval_policy_uses_static_tool_risk_levels():
     assert not ApprovalPolicy.requires_approval("web_fetch")
     assert not ApprovalPolicy.requires_approval("read_file")
     assert not ApprovalPolicy.requires_approval("search_code")
+    assert not ApprovalPolicy.requires_approval("glob_files")
+    assert not ApprovalPolicy.requires_approval("grep_code")
     assert not ApprovalPolicy.requires_approval(
         "mcp__chrome-devtools__navigate_page"
     )
@@ -82,6 +85,7 @@ def test_approval_policy_uses_static_tool_risk_levels():
     assert ApprovalPolicy.danger_level("execute_command") == "high"
     assert ApprovalPolicy.danger_level("delete_file") == "high"
     assert ApprovalPolicy.danger_level("write_file") == "medium"
+    assert ApprovalPolicy.danger_level("apply_patch") == "medium"
     assert ApprovalPolicy.danger_level("web_search") == "safe"
     assert ApprovalPolicy.danger_level("web_fetch") == "safe"
     assert ApprovalPolicy.danger_level("read_file") == "safe"
@@ -402,6 +406,28 @@ def test_hitl_registry_executes_modified_arguments(tmp_path: Path):
 
     assert not (tmp_path / "original.txt").exists()
     assert (tmp_path / "changed.txt").read_text(encoding="utf-8") == "updated"
+
+
+def test_hitl_registry_previews_and_executes_apply_patch(tmp_path: Path):
+    target = tmp_path / "module.py"
+    target.write_text("answer = 1\n", encoding="utf-8")
+    handler = StubHitlHandler(ApprovalResult.approved())
+    registry = build_default_registry(tmp_path, hitl_handler=handler)
+
+    result = registry.execute(
+        "apply_patch",
+        {
+            "path": "module.py",
+            "edits": [{"old_text": "answer = 1", "new_text": "answer = 2"}],
+        },
+    )
+
+    assert "Patched module.py" in result
+    assert target.read_text(encoding="utf-8") == "answer = 2\n"
+    assert handler.requests[0].tool_name == "apply_patch"
+    assert handler.requests[0].change_preview is not None
+    assert "-answer = 1" in handler.requests[0].change_preview["diff"]
+    assert "+answer = 2" in handler.requests[0].change_preview["diff"]
 
 
 def test_disabled_hitl_registry_has_zero_approval_prompts(tmp_path: Path):

@@ -1,3 +1,5 @@
+"""Small lock-protected accounting helper for memory/context token budgets."""
+
 from __future__ import annotations
 
 import threading

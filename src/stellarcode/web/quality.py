@@ -1,3 +1,5 @@
+"""Search-result quality scoring and duplicate suppression before LLM context use."""
+
 from __future__ import annotations
 
 import logging

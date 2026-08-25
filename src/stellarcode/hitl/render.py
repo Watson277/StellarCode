@@ -1,3 +1,5 @@
+"""Rich terminal rendering for human-in-the-loop approval prompts."""
+
 from __future__ import annotations
 
 from rich import box

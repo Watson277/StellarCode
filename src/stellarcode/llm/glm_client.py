@@ -1,3 +1,5 @@
+"""GLM provider adapter for chat, streaming deltas, and tool-call responses."""
+
 from __future__ import annotations
 
 import copy

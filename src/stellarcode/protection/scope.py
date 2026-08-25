@@ -1,3 +1,5 @@
+"""Defines which workspace paths are safe to snapshot, diff, and roll back."""
+
 from __future__ import annotations
 
 from pathlib import Path

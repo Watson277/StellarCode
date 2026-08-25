@@ -1,3 +1,10 @@
+"""Task-scoped Git snapshots, isolated worktrees, safe merge, and rollback.
+
+The service owns a private Side-Git repository rather than the user's repository.  Its
+central invariant is that a task patch is merged or rolled back only after validating
+the live workspace has not changed since that task's recorded baseline.
+"""
+
 from __future__ import annotations
 
 import hashlib
@@ -20,6 +27,7 @@ from stellarcode.protection.scope import snapshot_relative_exclusion_reason
 
 MAX_DIFF_REQUEST_CHARS = 200_000
 MAX_TASK_RECORDS = 100
+TERMINAL_TASK_STATUSES = frozenset({"completed", "failed", "cancelled", "rejected"})
 
 
 class WorkspaceProtectionError(RuntimeError):
@@ -105,18 +113,46 @@ class _ProjectStorageLock:
 class WorkspaceProtectionService:
     """Task-scoped Side-Git snapshots that never touch the user's Git index or refs."""
 
-    def __init__(self, workspace: str | Path, storage_dir: str | Path) -> None:
+    def __init__(
+        self,
+        workspace: str | Path,
+        storage_dir: str | Path,
+        *,
+        worktree_root: str | Path | None = None,
+    ) -> None:
         self.workspace = Path(workspace).resolve()
         self.storage_dir = Path(storage_dir).resolve()
         self.repository_dir = self.storage_dir / "objects.git"
         self.index_file = self.storage_dir / "snapshot.index"
         self.records_dir = self.storage_dir / "tasks"
+        self.default_worktrees_dir = self.storage_dir / "w"
+        self.worktrees_dir = (
+            Path(worktree_root).resolve()
+            if worktree_root is not None
+            else self.default_worktrees_dir
+        )
+        self.task_repositories_dir = self.storage_dir / "r"
+        self.legacy_worktrees_dir = self.storage_dir / "worktrees"
+        self.legacy_task_repositories_dir = self.storage_dir / "task-repositories"
+        self.patches_dir = self.storage_dir / "patches"
+        self.disabled_hooks_dir = self.storage_dir / "disabled-hooks"
+        if _path_is_within(self.worktrees_dir, self.workspace) or _path_is_within(
+            self.workspace,
+            self.worktrees_dir,
+        ):
+            raise WorkspaceProtectionError(
+                "Custom worktree storage must be separate from the project workspace."
+            )
         self.git = shutil.which("git")
         self._lock = threading.RLock()
         self._storage_lock: _ProjectStorageLock | None = None
         self._unavailable_reason = ""
         self.storage_dir.mkdir(parents=True, exist_ok=True)
         self.records_dir.mkdir(parents=True, exist_ok=True)
+        self.worktrees_dir.mkdir(parents=True, exist_ok=True)
+        self.task_repositories_dir.mkdir(parents=True, exist_ok=True)
+        self.patches_dir.mkdir(parents=True, exist_ok=True)
+        self.disabled_hooks_dir.mkdir(parents=True, exist_ok=True)
         try:
             self._storage_lock = _ProjectStorageLock(
                 self.storage_dir / "workspace-protection.lock"
@@ -130,6 +166,8 @@ class WorkspaceProtectionService:
             return
         try:
             self._initialize_repository()
+            self._cleanup_orphaned_task_storage()
+            self._retry_completed_worktree_cleanup()
             self._reconcile_incomplete_rollbacks()
             self._prune_records()
         except WorkspaceProtectionError as exc:
@@ -161,7 +199,13 @@ class WorkspaceProtectionService:
             # and file handles may already be partially finalized.
             pass
 
-    def begin_task(self, task_id: str, session_id: str) -> dict[str, Any]:
+    def begin_task(
+        self,
+        task_id: str,
+        session_id: str,
+        *,
+        isolated: bool = False,
+    ) -> dict[str, Any]:
         with self._lock:
             existing = self._load_record(task_id)
             if existing is not None:
@@ -176,7 +220,9 @@ class WorkspaceProtectionService:
                 f"StellarCode task baseline {task_id}",
                 f"refs/stellarcode/tasks/{token}/before",
             )
-            overlapping = self._active_records(exclude_task_id=task_id)
+            overlapping = (
+                [] if isolated else self._active_records(exclude_task_id=task_id)
+            )
             overlapping_task_ids = sorted(
                 str(item.get("task_id") or "")
                 for item in overlapping
@@ -209,10 +255,43 @@ class WorkspaceProtectionService:
                     else ""
                 ),
                 "rolled_back": False,
+                "worktree_isolated": isolated,
+                "worktree_path": "",
+                "worktree_repository_path": "",
+                "merge_state": "pending" if isolated else "not_isolated",
+                "merge_error": "",
                 "created_at": _timestamp(),
                 "updated_at": _timestamp(),
             }
             self._write_record(record)
+            if isolated:
+                try:
+                    task_workspace, task_repository = self._create_task_worktree(
+                        task_id,
+                        before,
+                    )
+                except Exception:
+                    self._discard_partial_task_worktree(task_id)
+                    try:
+                        self._run_git(
+                            "update-ref",
+                            "-d",
+                            f"refs/stellarcode/tasks/{token}/before",
+                        )
+                    except WorkspaceProtectionError:
+                        pass
+                    try:
+                        self._record_path(task_id).unlink()
+                    except FileNotFoundError:
+                        pass
+                    raise
+                record.update(
+                    worktree_path=str(task_workspace),
+                    worktree_repository_path=str(task_repository),
+                    merge_state="active",
+                    updated_at=_timestamp(),
+                )
+                self._write_record(record)
             for active in overlapping:
                 peers = {
                     str(value)
@@ -241,6 +320,8 @@ class WorkspaceProtectionService:
                 return self._unprotected(task_id, "", "Task baseline snapshot is unavailable.")
             if not record.get("protected"):
                 return self._public_record(record)
+            if record.get("worktree_isolated"):
+                return self._finalize_isolated_task(record, outcome)
             if record.get("status") != "active" and record.get("after_revision"):
                 return self._public_record(record)
 
@@ -272,6 +353,244 @@ class WorkspaceProtectionService:
             self._write_record(record)
             self._prune_records()
             return self._public_record(record)
+
+    def task_workspace(self, task_id: str, session_id: str | None = None) -> Path | None:
+        with self._lock:
+            record = self._load_record(task_id)
+            if record is None or not record.get("worktree_isolated"):
+                return None
+            if session_id and str(record.get("session_id") or "") != session_id:
+                raise WorkspaceProtectionError(
+                    "Task worktree belongs to another conversation."
+                )
+            path_value = str(record.get("worktree_path") or "")
+            if not path_value:
+                raise WorkspaceProtectionError("Task worktree path is unavailable.")
+            path = Path(path_value).resolve()
+            self._assert_managed_worktree_path(path)
+            if not path.is_dir() or not (path / ".git").is_file():
+                raise WorkspaceProtectionError(
+                    "Task worktree is missing; the interrupted task cannot resume safely."
+                )
+            self._task_worktree_git_environment(record, path)
+            return path
+
+    def _finalize_isolated_task(
+        self,
+        record: dict[str, Any],
+        outcome: str,
+    ) -> dict[str, Any]:
+        task_id = str(record.get("task_id") or "")
+        if record.get("merge_state") == "conflict":
+            return self._public_record(record)
+        if record.get("status") != "active" and record.get("after_revision"):
+            if record.get("worktree_path"):
+                self._remove_task_worktree(record)
+            return self._public_record(record)
+        try:
+            task_workspace = self.task_workspace(
+                task_id,
+                str(record.get("session_id") or ""),
+            )
+            if task_workspace is None:
+                raise WorkspaceProtectionError("Task worktree is unavailable.")
+            task_git_environment = self._task_worktree_git_environment(
+                record,
+                task_workspace,
+            )
+        except WorkspaceProtectionError as exc:
+            retained_path = str(record.get("worktree_path") or "")
+            record.update(
+                status="failed",
+                outcome="failed",
+                merge_state="conflict",
+                merge_error=(
+                    "The isolated task Git metadata is unavailable or untrusted: "
+                    f"{exc}. Worktree retained at {retained_path}."
+                ),
+                rollback_available=False,
+                rollback_block_reason=(
+                    "The isolated task Git metadata changed; automatic merge was stopped."
+                ),
+                completed_at=_timestamp(),
+                updated_at=_timestamp(),
+            )
+            self._write_record(record)
+            return self._public_record(record)
+        baseline = str(record.get("isolation_base_revision") or record["before_revision"])
+        patch_path = self._task_patch_path(task_id)
+        merge_state = str(record.get("merge_state") or "active")
+
+        if merge_state in {"active", "prepared"}:
+            # Freeze the task worktree as a patch before touching the canonical
+            # workspace.  Concurrent conversations can therefore finish safely
+            # unless their patches modify the same lines.
+            try:
+                self._stage_task_worktree(
+                    task_workspace,
+                    baseline,
+                    task_git_environment,
+                )
+                patch = self._task_worktree_patch(
+                    task_workspace,
+                    baseline,
+                    task_git_environment,
+                )
+            except WorkspaceProtectionError as exc:
+                record.update(
+                    status="failed",
+                    outcome="failed",
+                    merge_state="conflict",
+                    merge_error=(
+                        "The isolated task Git repository could not produce a safe patch: "
+                        f"{exc}. Worktree retained at {task_workspace}."
+                    ),
+                    rollback_available=False,
+                    rollback_block_reason=(
+                        "The task Git metadata was changed or became unavailable; automatic "
+                        "merge was stopped."
+                    ),
+                    completed_at=_timestamp(),
+                    updated_at=_timestamp(),
+                )
+                self._write_record(record)
+                return self._public_record(record)
+            self._write_patch(patch_path, patch)
+            merge_before = self._capture_commit(
+                f"StellarCode pre-merge baseline {task_id}",
+                f"refs/stellarcode/tasks/{_task_token(task_id)}/before-merge",
+            )
+            record.update(
+                isolation_base_revision=baseline,
+                before_revision=merge_before,
+                concurrent_task_ids=[],
+                change_attribution="isolated_worktree",
+                rollback_block_reason="",
+                merge_state="applying" if patch else "applied",
+                merge_patch_path=str(patch_path),
+                updated_at=_timestamp(),
+            )
+            self._write_record(record)
+            merge_state = str(record["merge_state"])
+
+        if merge_state == "applying":
+            # ``applying`` is intentionally durable.  After a crash we can tell
+            # whether the patch is already applied, still applicable, or now
+            # conflicts; blindly applying it again would duplicate edits.
+            patch = patch_path.read_bytes() if patch_path.is_file() else b""
+            if not patch:
+                record.update(merge_state="applied", updated_at=_timestamp())
+                self._write_record(record)
+            else:
+                after_ref = f"refs/stellarcode/tasks/{_task_token(task_id)}/after"
+                try:
+                    self._existing_snapshot_ref(after_ref) or self._capture_patch_commit(
+                        str(record["before_revision"]),
+                        patch_path,
+                        f"StellarCode task result {task_id}",
+                        after_ref,
+                    )
+                except WorkspaceProtectionError as exc:
+                    record.update(
+                        status="failed",
+                        outcome="failed",
+                        merge_state="conflict",
+                        merge_error=(
+                            "The isolated task patch could not be applied to the merge "
+                            f"baseline: {exc}. Worktree retained at {task_workspace}."
+                        ),
+                        rollback_available=False,
+                        rollback_block_reason=(
+                            "The isolated task patch conflicts with newer project changes. "
+                            "Its worktree was retained for manual review."
+                        ),
+                        completed_at=_timestamp(),
+                        updated_at=_timestamp(),
+                    )
+                    self._write_record(record)
+                    return self._public_record(record)
+                if self._patch_applies(patch_path, reverse=True):
+                    # The process stopped after `git apply` but before the record update.
+                    record["merge_state"] = "applied"
+                elif self._patch_applies(patch_path):
+                    try:
+                        self._apply_task_patch(patch_path)
+                    except WorkspaceProtectionError as exc:
+                        record.update(
+                            status="failed",
+                            outcome="failed",
+                            merge_state="conflict",
+                            merge_error=(
+                                f"{exc} Isolated worktree retained at {task_workspace}."
+                            ),
+                            rollback_available=False,
+                            rollback_block_reason=(
+                                "The isolated task patch could not be merged because the "
+                                "project changed on the same lines. Its worktree was retained."
+                            ),
+                            completed_at=_timestamp(),
+                            updated_at=_timestamp(),
+                        )
+                        self._write_record(record)
+                        return self._public_record(record)
+                    # Keep the durable state at `applying` until the POST snapshot ref is
+                    # committed. A crash cannot otherwise absorb a later editor change.
+                    record["merge_state"] = "applied"
+                else:
+                    record.update(
+                        status="failed",
+                        outcome="failed",
+                        merge_state="conflict",
+                        merge_error=(
+                            "The project changed on lines touched by this task; automatic "
+                            "merge was stopped before modifying the project workspace. "
+                            f"Isolated worktree retained at {task_workspace}."
+                        ),
+                        rollback_available=False,
+                        rollback_block_reason=(
+                            "The isolated task patch conflicts with newer project changes. "
+                            "Its worktree was retained for manual review."
+                        ),
+                        completed_at=_timestamp(),
+                        updated_at=_timestamp(),
+                    )
+                    self._write_record(record)
+                    return self._public_record(record)
+
+        token = _task_token(task_id)
+        after_ref = f"refs/stellarcode/tasks/{token}/after"
+        before = str(record["before_revision"])
+        after = self._existing_snapshot_ref(after_ref)
+        if after is None:
+            patch = patch_path.read_bytes() if patch_path.is_file() else b""
+            if patch:
+                after = self._capture_patch_commit(
+                    before,
+                    patch_path,
+                    f"StellarCode task result {task_id}",
+                    after_ref,
+                )
+            else:
+                self._run_git("update-ref", after_ref, before)
+                after = before
+        details = self._diff_details(before, after)
+        record.update(
+            status=outcome,
+            outcome=outcome,
+            after_revision=after,
+            changed_files=details["changed_files"],
+            additions=details["additions"],
+            deletions=details["deletions"],
+            has_changes=bool(details["changed_files"]),
+            rollback_available=bool(details["changed_files"]),
+            merge_state="merged",
+            completed_at=_timestamp(),
+            updated_at=_timestamp(),
+        )
+        self._write_record(record)
+        self._remove_task_worktree(record)
+        self._prune_records()
+        return self._public_record(record)
 
     def rollback_task(
         self,
@@ -315,6 +634,9 @@ class WorkspaceProtectionService:
                 raise WorkspaceProtectionError("This task did not change protected workspace files.")
 
             token = _task_token(task_id)
+            # Rollback never resets the whole workspace.  Compare the current
+            # tree with this task's POST snapshot first, so a later user/task
+            # edit to the same path becomes a conflict rather than data loss.
             current = self._capture_commit(
                 f"StellarCode pre-rollback safety {task_id}",
                 f"refs/stellarcode/tasks/{token}/rollback-safety",
@@ -561,6 +883,8 @@ class WorkspaceProtectionService:
             # corruption may have removed the underlying Git object.  Verify it before
             # any recovered agent/tool code is allowed to run.
             self._run_git("cat-file", "-e", f"{before_revision}^{{tree}}")
+            if record.get("worktree_isolated"):
+                self.task_workspace(task_id, session_id)
             return self._public_record(record)
 
     def task_diff(
@@ -617,6 +941,556 @@ class WorkspaceProtectionService:
         self._run_git("config", "core.autocrlf", "false")
         self._run_git("config", "core.safecrlf", "false")
         self._run_git("config", "core.filemode", "true")
+        if os.name == "nt":
+            self._run_git("config", "core.longpaths", "true")
+
+    def _create_task_worktree(self, task_id: str, revision: str) -> tuple[Path, Path]:
+        storage_token = _task_storage_token(task_id)
+        worktree = (self.worktrees_dir / storage_token).resolve()
+        task_repository = (
+            self.task_repositories_dir / f"{storage_token}.git"
+        ).resolve()
+        self._assert_managed_worktree_path(worktree)
+        self._assert_managed_task_repository_path(task_repository)
+        if worktree.exists() or task_repository.exists():
+            raise WorkspaceProtectionError(
+                "A stale task worktree or repository already exists: "
+                f"{worktree}"
+            )
+        environment = self._plain_git_environment()
+        self._run_process(
+            ("init", "--bare", str(task_repository)),
+            environment=environment,
+        )
+        task_environment = self._task_repository_environment(task_repository)
+        self._run_process(
+            ("config", "core.autocrlf", "false"),
+            environment=task_environment,
+        )
+        self._run_process(
+            ("config", "core.safecrlf", "false"),
+            environment=task_environment,
+        )
+        self._run_process(
+            ("config", "core.hooksPath", str(self.disabled_hooks_dir)),
+            environment=task_environment,
+        )
+        if os.name == "nt":
+            self._run_process(
+                ("config", "core.longpaths", "true"),
+                environment=task_environment,
+            )
+        baseline_ref = f"refs/stellarcode/tasks/{_task_token(task_id)}/before"
+        self._run_process(
+            (
+                "-c",
+                "protocol.file.allow=always",
+                "fetch",
+                "--no-tags",
+                str(self.repository_dir),
+                f"{baseline_ref}:refs/heads/stellarcode-baseline",
+            ),
+            environment=task_environment,
+        )
+        fetched = self._run_process(
+            ("rev-parse", "refs/heads/stellarcode-baseline"),
+            environment=task_environment,
+        ).decode("ascii", errors="strict").strip()
+        if fetched != revision:
+            raise WorkspaceProtectionError("Task worktree fetched the wrong baseline revision.")
+        self._run_process(
+            (
+                "worktree",
+                "add",
+                "--detach",
+                "--force",
+                str(worktree),
+                revision,
+            ),
+            environment=task_environment,
+        )
+        if not (worktree / ".git").is_file():
+            raise WorkspaceProtectionError("Git did not create a valid task worktree.")
+        return worktree, task_repository
+
+    def _stage_task_worktree(
+        self,
+        worktree: Path,
+        baseline: str,
+        environment: dict[str, str],
+    ) -> None:
+        self._run_process(
+            ("-C", str(worktree), "add", "-A", "--", "."),
+            environment=environment,
+        )
+        changed = self._worktree_changed_paths(worktree, baseline, environment)
+        excluded = [
+            path
+            for path in changed
+            if snapshot_relative_exclusion_reason(Path(path)) is not None
+        ]
+        for path in excluded:
+            self._run_process(
+                ("-C", str(worktree), "reset", "--quiet", baseline, "--", path),
+                environment=environment,
+            )
+
+    def _worktree_changed_paths(
+        self,
+        worktree: Path,
+        baseline: str,
+        environment: dict[str, str],
+    ) -> list[str]:
+        output = self._run_process(
+            (
+                "-C",
+                str(worktree),
+                "diff",
+                "--cached",
+                "--name-only",
+                "-z",
+                "--no-renames",
+                baseline,
+                "--",
+            ),
+            environment=environment,
+        )
+        return [
+            value.decode("utf-8", errors="surrogateescape").replace("\\", "/")
+            for value in output.split(b"\0")
+            if value
+        ]
+
+    def _task_worktree_patch(
+        self,
+        worktree: Path,
+        baseline: str,
+        environment: dict[str, str],
+    ) -> bytes:
+        return self._run_process(
+            (
+                "-C",
+                str(worktree),
+                "diff",
+                "--cached",
+                "--binary",
+                "--full-index",
+                "--no-ext-diff",
+                "--no-renames",
+                baseline,
+                "--",
+            ),
+            environment=environment,
+        )
+
+    def _patch_applies(self, patch_path: Path, *, reverse: bool = False) -> bool:
+        arguments = [
+            "-C",
+            str(self.workspace),
+            "apply",
+            "--check",
+            "--binary",
+            "--whitespace=nowarn",
+        ]
+        if reverse:
+            arguments.append("--reverse")
+        arguments.append(str(patch_path))
+        try:
+            self._run_process(
+                tuple(arguments),
+                environment=self._plain_git_environment(),
+                timeout_seconds=30,
+            )
+            return True
+        except WorkspaceProtectionError:
+            return False
+
+    def _apply_task_patch(self, patch_path: Path) -> None:
+        self._run_process(
+            (
+                "-C",
+                str(self.workspace),
+                "apply",
+                "--binary",
+                "--whitespace=nowarn",
+                str(patch_path),
+            ),
+            environment=self._plain_git_environment(),
+            timeout_seconds=30,
+        )
+
+    def _write_patch(self, path: Path, content: bytes) -> None:
+        temporary = path.with_suffix(path.suffix + ".tmp")
+        with temporary.open("wb") as stream:
+            stream.write(content)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+
+    def _capture_patch_commit(
+        self,
+        base_revision: str,
+        patch_path: Path,
+        message: str,
+        ref: str,
+    ) -> str:
+        """Create an exact POST tree from PRE_MERGE + patch, not a live rescan.
+
+        The user or another task may edit unrelated project files while a task
+        is finalizing.  Building the task's POST revision in a temporary index
+        prevents those later edits from being attributed to this task or added
+        to its rollback set.
+        """
+
+        descriptor, index_name = tempfile.mkstemp(
+            prefix="patch-index-",
+            dir=self.storage_dir,
+        )
+        os.close(descriptor)
+        index_path = Path(index_name)
+        try:
+            index_path.unlink()
+            environment = self._git_environment()
+            environment["GIT_INDEX_FILE"] = str(index_path)
+            self._run_process(
+                ("read-tree", base_revision),
+                environment=environment,
+                timeout_seconds=30,
+            )
+            self._run_process(
+                (
+                    "apply",
+                    "--cached",
+                    "--binary",
+                    "--whitespace=nowarn",
+                    str(patch_path),
+                ),
+                environment=environment,
+                timeout_seconds=30,
+            )
+            tree = self._run_process(
+                ("write-tree",),
+                environment=environment,
+                timeout_seconds=30,
+            ).decode("ascii", errors="strict").strip()
+            commit = self._run_process(
+                ("commit-tree", tree),
+                environment=environment,
+                input_bytes=(message + "\n").encode("utf-8"),
+                timeout_seconds=30,
+            ).decode("ascii", errors="strict").strip()
+            self._run_git("update-ref", ref, commit)
+            return commit
+        except (OSError, UnicodeError) as exc:
+            raise WorkspaceProtectionError(
+                f"Could not create the isolated task POST snapshot: {exc}"
+            ) from exc
+        finally:
+            for candidate in (index_path, Path(f"{index_path}.lock")):
+                try:
+                    candidate.unlink()
+                except FileNotFoundError:
+                    pass
+
+    def _remove_task_worktree(self, record: dict[str, Any]) -> None:
+        value = str(record.get("worktree_path") or "")
+        if not value:
+            return
+        worktree = Path(value).resolve()
+        self._assert_managed_worktree_path(worktree)
+        repository_value = str(record.get("worktree_repository_path") or "")
+        if not repository_value:
+            record["worktree_cleanup_error"] = "Task worktree repository path is unavailable."
+            self._write_record(record)
+            return
+        task_repository = Path(repository_value).resolve()
+        self._assert_managed_task_repository_path(task_repository)
+        try:
+            self._run_process(
+                ("worktree", "remove", "--force", str(worktree)),
+                environment=self._task_repository_environment(task_repository),
+                timeout_seconds=30,
+            )
+            self._remove_task_repository(task_repository)
+            record.update(
+                worktree_path="",
+                worktree_repository_path="",
+                worktree_cleanup_error="",
+            )
+            try:
+                self._task_patch_path(str(record.get("task_id") or "")).unlink()
+            except FileNotFoundError:
+                pass
+        except WorkspaceProtectionError as exc:
+            record["worktree_cleanup_error"] = str(exc)
+        record["updated_at"] = _timestamp()
+        self._write_record(record)
+
+    def _discard_partial_task_worktree(self, task_id: str) -> None:
+        storage_token = _task_storage_token(task_id)
+        worktree = (self.worktrees_dir / storage_token).resolve()
+        task_repository = (
+            self.task_repositories_dir / f"{storage_token}.git"
+        ).resolve()
+        self._assert_managed_worktree_path(worktree)
+        self._assert_managed_task_repository_path(task_repository)
+        if not task_repository.is_dir():
+            return
+        if worktree.exists():
+            try:
+                self._run_process(
+                    ("worktree", "remove", "--force", str(worktree)),
+                    environment=self._task_repository_environment(task_repository),
+                    timeout_seconds=15,
+                )
+            except WorkspaceProtectionError:
+                return
+        try:
+            self._remove_task_repository(task_repository)
+        except WorkspaceProtectionError:
+            pass
+
+    def _task_patch_path(self, task_id: str) -> Path:
+        return self.patches_dir / f"{_task_token(task_id)}.patch"
+
+    def _assert_managed_worktree_path(self, path: Path) -> None:
+        roots = (
+            self.worktrees_dir,
+            self.default_worktrees_dir,
+            self.legacy_worktrees_dir,
+        )
+        for root in dict.fromkeys(root.resolve() for root in roots):
+            try:
+                relative = path.resolve().relative_to(root.resolve())
+            except ValueError:
+                continue
+            if len(relative.parts) == 1:
+                return
+        raise WorkspaceProtectionError(
+            "Task worktree path escaped its managed storage directory."
+        )
+
+    def _assert_managed_task_repository_path(self, path: Path) -> None:
+        for root in (self.task_repositories_dir, self.legacy_task_repositories_dir):
+            try:
+                relative = path.resolve().relative_to(root.resolve())
+            except ValueError:
+                continue
+            if len(relative.parts) == 1 and path.suffix == ".git":
+                return
+        raise WorkspaceProtectionError("Task Git repository path is invalid.")
+
+    def _remove_task_repository(self, path: Path) -> None:
+        self._assert_managed_task_repository_path(path)
+        if path.is_symlink() or _path_is_reparse_point(path):
+            raise WorkspaceProtectionError(
+                "Refusing to remove a task repository that became a filesystem alias."
+            )
+        if path.exists():
+            # Rename first so descendants of an older long task-id repository
+            # fall back below Win32 MAX_PATH before recursive deletion.
+            deletion_path = (
+                path.parent / f"delete-{uuid.uuid4().hex[:8]}.git"
+            ).resolve()
+            self._assert_managed_task_repository_path(deletion_path)
+            try:
+                os.replace(path, deletion_path)
+            except OSError as exc:
+                raise WorkspaceProtectionError(
+                    f"Could not quarantine completed task Git repository: {exc}"
+                ) from exc
+
+            def make_writable_and_retry(
+                operation: Any,
+                target: str,
+                _error: tuple[type[BaseException], BaseException, Any],
+            ) -> None:
+                os.chmod(target, stat.S_IWRITE)
+                operation(target)
+
+            try:
+                shutil.rmtree(deletion_path, onerror=make_writable_and_retry)
+            except OSError as exc:
+                raise WorkspaceProtectionError(
+                    f"Could not remove completed task Git repository: {exc}"
+                ) from exc
+
+    def _cleanup_orphaned_task_storage(self) -> None:
+        """Remove unacknowledged worktree remnants left by a creation crash."""
+
+        referenced_worktrees: set[Path] = set()
+        referenced_repositories: set[Path] = set()
+        try:
+            for record_path in self.records_dir.glob("*.json"):
+                record = json.loads(record_path.read_text(encoding="utf-8"))
+                if not isinstance(record, dict):
+                    raise ValueError("task record must be an object")
+                worktree_value = str(record.get("worktree_path") or "")
+                repository_value = str(record.get("worktree_repository_path") or "")
+                if worktree_value:
+                    referenced_worktrees.add(Path(worktree_value).resolve())
+                if repository_value:
+                    referenced_repositories.add(Path(repository_value).resolve())
+        except (OSError, UnicodeError, ValueError, json.JSONDecodeError):
+            # A damaged record needs manual recovery. Do not guess which task
+            # storage is safe to delete while its ownership data is unreadable.
+            return
+
+        storage_pairs = [
+            (self.worktrees_dir, self.task_repositories_dir),
+            (self.default_worktrees_dir, self.task_repositories_dir),
+            (self.legacy_worktrees_dir, self.legacy_task_repositories_dir),
+        ]
+        seen_pairs: set[tuple[Path, Path]] = set()
+        for worktree_root, repository_root in storage_pairs:
+            pair = (worktree_root.resolve(), repository_root.resolve())
+            if pair in seen_pairs:
+                continue
+            seen_pairs.add(pair)
+            if worktree_root.is_dir():
+                for candidate in worktree_root.iterdir():
+                    resolved = candidate.resolve()
+                    if resolved in referenced_worktrees:
+                        continue
+                    self._assert_managed_worktree_path(resolved)
+                    if candidate.is_symlink() or _path_is_reparse_point(candidate):
+                        continue
+                    repository = repository_root / f"{candidate.name}.git"
+                    if repository.is_dir():
+                        try:
+                            self._run_process(
+                                ("worktree", "remove", "--force", str(candidate)),
+                                environment=self._task_repository_environment(
+                                    repository.resolve()
+                                ),
+                                timeout_seconds=15,
+                            )
+                        except WorkspaceProtectionError:
+                            continue
+                    elif candidate.is_dir():
+                        try:
+                            shutil.rmtree(candidate)
+                        except OSError:
+                            continue
+
+            if not repository_root.is_dir():
+                continue
+            for candidate in repository_root.iterdir():
+                resolved = candidate.resolve()
+                if resolved in referenced_repositories:
+                    continue
+                if (
+                    not candidate.is_dir()
+                    or candidate.is_symlink()
+                    or _path_is_reparse_point(candidate)
+                ):
+                    continue
+                try:
+                    self._remove_task_repository(resolved)
+                except WorkspaceProtectionError:
+                    continue
+
+    def _retry_completed_worktree_cleanup(self) -> None:
+        """Retry terminal worktree cleanup that a live child process previously blocked."""
+
+        for record_path in self.records_dir.glob("*.json"):
+            try:
+                record = json.loads(record_path.read_text(encoding="utf-8"))
+            except (OSError, UnicodeError, ValueError, json.JSONDecodeError):
+                continue
+            if not isinstance(record, dict):
+                continue
+            if str(record.get("status") or "") not in TERMINAL_TASK_STATUSES:
+                continue
+            if str(record.get("merge_state") or "") != "merged":
+                continue
+            if not str(record.get("worktree_path") or ""):
+                continue
+            try:
+                self._remove_task_worktree(record)
+            except WorkspaceProtectionError:
+                # Keep the forensic path in the record and retry on a later startup.
+                continue
+
+    def _task_repository_environment(self, repository: Path) -> dict[str, str]:
+        self._assert_managed_task_repository_path(repository)
+        environment = self._plain_git_environment()
+        environment.update(GIT_DIR=str(repository), GIT_OPTIONAL_LOCKS="0")
+        return environment
+
+    def _task_worktree_git_environment(
+        self,
+        record: dict[str, Any],
+        worktree: Path,
+    ) -> dict[str, str]:
+        """Return a pinned Git environment after validating worktree metadata.
+
+        Agent commands are allowed to use Git inside an isolated worktree.  The
+        terminal merge must therefore never follow a rewritten `.git` pointer:
+        doing so could stage into the shared Side-Git repository or a user's
+        repository.  Pin both GIT_DIR and GIT_WORK_TREE to the task-owned paths
+        after validating the pointer file.
+        """
+
+        repository_value = str(record.get("worktree_repository_path") or "")
+        if not repository_value:
+            raise WorkspaceProtectionError("Task Git repository path is unavailable.")
+        repository = Path(repository_value).resolve()
+        self._assert_managed_task_repository_path(repository)
+        if (
+            not repository.is_dir()
+            or repository.is_symlink()
+            or _path_is_reparse_point(repository)
+        ):
+            raise WorkspaceProtectionError("Task Git repository is missing or unsafe.")
+
+        pointer = worktree / ".git"
+        if (
+            not pointer.is_file()
+            or pointer.is_symlink()
+            or _path_is_reparse_point(pointer)
+        ):
+            raise WorkspaceProtectionError("Task worktree .git pointer is missing or unsafe.")
+        try:
+            raw_pointer = pointer.read_text(encoding="utf-8", errors="strict")
+        except (OSError, UnicodeError) as exc:
+            raise WorkspaceProtectionError(
+                "Task worktree .git pointer could not be read."
+            ) from exc
+        if len(raw_pointer) > 8192 or not raw_pointer.startswith("gitdir: "):
+            raise WorkspaceProtectionError("Task worktree .git pointer is invalid.")
+        git_dir_value = raw_pointer[8:].strip()
+        if not git_dir_value or "\n" in git_dir_value or "\r" in git_dir_value:
+            raise WorkspaceProtectionError("Task worktree .git pointer is invalid.")
+        raw_git_dir = Path(git_dir_value)
+        git_dir = (
+            raw_git_dir.resolve()
+            if raw_git_dir.is_absolute()
+            else (worktree / raw_git_dir).resolve()
+        )
+        try:
+            relative = git_dir.relative_to(repository)
+        except ValueError as exc:
+            raise WorkspaceProtectionError(
+                "Task worktree .git pointer escaped its task repository."
+            ) from exc
+        if (
+            len(relative.parts) != 2
+            or relative.parts[0] != "worktrees"
+            or not git_dir.is_dir()
+            or git_dir.is_symlink()
+            or _path_is_reparse_point(git_dir)
+        ):
+            raise WorkspaceProtectionError(
+                "Task worktree Git administrative directory is invalid."
+            )
+        environment = self._plain_git_environment()
+        environment.update(
+            GIT_DIR=str(git_dir),
+            GIT_WORK_TREE=str(worktree),
+            GIT_OPTIONAL_LOCKS="0",
+        )
+        return environment
 
     def _require_available(self) -> None:
         if not self.available:
@@ -1489,7 +2363,16 @@ class WorkspaceProtectionService:
             "rollback_recovery_event_pending": bool(
                 record.get("rollback_recovery_event_pending")
             ),
-            "error": str(record.get("error") or record.get("rollback_error") or ""),
+            "worktree_isolated": bool(record.get("worktree_isolated")),
+            "worktree_path": str(record.get("worktree_path") or ""),
+            "merge_state": str(record.get("merge_state") or "not_isolated"),
+            "merge_conflict": record.get("merge_state") == "conflict",
+            "error": str(
+                record.get("error")
+                or record.get("merge_error")
+                or record.get("rollback_error")
+                or ""
+            ),
             "created_at": record.get("created_at"),
             "completed_at": record.get("completed_at"),
             "rolled_back_at": record.get("rolled_back_at"),
@@ -1515,6 +2398,10 @@ class WorkspaceProtectionService:
             "diff_available": False,
             "rollback_available": False,
             "rolled_back": False,
+            "worktree_isolated": False,
+            "worktree_path": "",
+            "merge_state": "unavailable",
+            "merge_conflict": False,
             "error": reason or self._unavailable_reason or "Workspace protection is unavailable.",
         }
 
@@ -1570,6 +2457,7 @@ class WorkspaceProtectionService:
             token = _task_token(str(record.get("task_id") or path.stem))
             for suffix in (
                 "before",
+                "before-merge",
                 "after",
                 "rollback-safety",
                 "rollback-result",
@@ -1581,6 +2469,12 @@ class WorkspaceProtectionService:
                     self._run_git("update-ref", "-d", f"refs/stellarcode/tasks/{token}/{suffix}")
                 except WorkspaceProtectionError:
                     pass
+            if record.get("worktree_path"):
+                self._remove_task_worktree(record)
+            try:
+                self._task_patch_path(str(record.get("task_id") or path.stem)).unlink()
+            except FileNotFoundError:
+                pass
             try:
                 path.unlink()
                 pruned = True
@@ -1738,6 +2632,20 @@ def _task_token(task_id: str) -> str:
     normalized = re.sub(r"[^A-Za-z0-9._-]+", "-", task_id).strip("-.")
     digest = hashlib.sha256(task_id.encode("utf-8")).hexdigest()[:12]
     return f"{normalized[:48] or 'task'}-{digest}"
+
+
+def _task_storage_token(task_id: str) -> str:
+    """Short, collision-resistant directory name for Windows Git internals."""
+
+    return hashlib.sha256(task_id.encode("utf-8")).hexdigest()[:16]
+
+
+def _path_is_within(path: Path, root: Path) -> bool:
+    try:
+        path.resolve().relative_to(root.resolve())
+        return True
+    except ValueError:
+        return False
 
 
 def _git_blob_sha1(content: bytes) -> str:

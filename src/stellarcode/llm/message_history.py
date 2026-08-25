@@ -1,3 +1,5 @@
+"""Repair persisted OpenAI tool-call sequences before replaying them to a provider."""
+
 from __future__ import annotations
 
 from typing import Any

@@ -1,6 +1,9 @@
+"""Validated DAG model used by planning, dependency scheduling, and recovery."""
+
 from __future__ import annotations
 
 import time
+from collections import deque
 from dataclasses import dataclass, field
 from enum import Enum
 
@@ -42,30 +45,98 @@ class ExecutionPlan:
             raise PlanValidationError(f"Unknown task id: {task_id}") from exc
 
     def compute_execution_order(self) -> list[str]:
-        batches = self.execution_batches()
-        self.execution_order = [task.id for batch in batches for task in batch]
-        return self.execution_order
+        """Return a deterministic linear topological order for this plan's DAG.
+
+        The order is primarily for prompt context, UI display, and result output.
+        Actual execution still uses :meth:`execution_batches` so independent tasks
+        can run in parallel.
+        """
+
+        self.execution_order = self.topological_sort()
+        return list(self.execution_order)
+
+    def topological_sort(self) -> list[str]:
+        """Linearise the dependency DAG with Java-compatible DFS post-order.
+
+        ``visiting`` is the recursion stack (the Java ``visiting`` set), while
+        ``visited`` records nodes whose dependencies were already emitted. This
+        yields the same deterministic dependency-first order as PaiCLI's original
+        ``ExecutionPlan.topologicalSort`` implementation.
+        """
+
+        self._validate_dependencies_exist()
+        visited: set[str] = set()
+        visiting: set[str] = set()
+        order: list[str] = []
+
+        def visit(task_id: str) -> None:
+            if task_id in visiting:
+                raise PlanValidationError(f"Dependency cycle detected at task: {task_id}")
+            if task_id in visited:
+                return
+
+            visiting.add(task_id)
+            for dependency_id in self.tasks[task_id].dependencies:
+                visit(dependency_id)
+            visiting.remove(task_id)
+            visited.add(task_id)
+            # Post-order append guarantees every dependency appears before its
+            # dependent, exactly matching the Java reference implementation.
+            order.append(task_id)
+
+        for task_id in self.tasks:
+            visit(task_id)
+        return order
 
     def execution_batches(self) -> list[list[Task]]:
+        """Return parallel-safe topological layers without changing DFS order."""
+
+        # Keep the historical side effect of this public method: callers that
+        # request batches can still read ``execution_order`` afterwards. The
+        # linear view itself remains DFS-compatible, not a flattened batch order.
+        self.execution_order = self.topological_sort()
+        batches = self._topological_batches()
+        return [[self.tasks[task_id] for task_id in batch] for batch in batches]
+
+    def _topological_batches(self) -> list[list[str]]:
         self._validate_dependencies_exist()
-        remaining = dict(self.tasks)
-        completed: set[str] = set()
-        batches: list[list[Task]] = []
+        # ``dependencies`` is user/model supplied JSON. Treat duplicate ids as one
+        # edge, otherwise a duplicate dependency would keep an artificial indegree.
+        normalized_dependencies = {
+            task_id: tuple(dict.fromkeys(task.dependencies))
+            for task_id, task in self.tasks.items()
+        }
+        indegree = {
+            task_id: len(dependencies)
+            for task_id, dependencies in normalized_dependencies.items()
+        }
+        dependents: dict[str, list[str]] = {task_id: [] for task_id in self.tasks}
+        for task_id, dependencies in normalized_dependencies.items():
+            for dependency_id in dependencies:
+                dependents[dependency_id].append(task_id)
 
-        while remaining:
-            batch = [
-                task
-                for task in remaining.values()
-                if all(dependency in completed for dependency in task.dependencies)
-            ]
-            if not batch:
-                cycle_at = next(iter(remaining))
-                raise PlanValidationError(f"Dependency cycle detected at task: {cycle_at}")
-            batches.append(batch)
-            for task in batch:
-                remaining.pop(task.id)
-                completed.add(task.id)
+        # Snapshot each ready frontier before reducing its outgoing edges. This
+        # preserves the parallel execution boundary while also producing a valid
+        # linear topological order when the frontiers are flattened.
+        ready = deque(task_id for task_id, degree in indegree.items() if degree == 0)
+        batches: list[list[str]] = []
+        visited = 0
+        while ready:
+            current_batch = list(ready)
+            ready.clear()
+            batches.append(current_batch)
+            visited += len(current_batch)
+            for task_id in current_batch:
+                for dependent_id in dependents[task_id]:
+                    indegree[dependent_id] -= 1
+                    if indegree[dependent_id] == 0:
+                        ready.append(dependent_id)
 
+        if visited != len(self.tasks):
+            cycle_at = next(
+                task_id for task_id, degree in indegree.items() if degree > 0
+            )
+            raise PlanValidationError(f"Dependency cycle detected at task: {cycle_at}")
         return batches
 
     def executable_tasks(self) -> list[Task]:
