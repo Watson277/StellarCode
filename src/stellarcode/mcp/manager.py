@@ -390,22 +390,21 @@ class McpServerManager:
                 tools = client.list_tools()
                 self._validate_tool_names(server.name, tools)
                 for descriptor in tools:
-                    self.tool_registry.register(
-                        ToolDefinition(
-                            name=descriptor.namespaced_name,
-                            description=(
-                                f"MCP server '{server.name}' tool '{descriptor.name}'. "
-                                f"{descriptor.description}"
-                            ).strip(),
-                            parameters=descriptor.input_schema,
-                            handler=self._tool_handler(client, descriptor),
-                        )
-                    )
+                    self.tool_registry.register(self._tool_definition(client, descriptor))
                     registered_names.append(descriptor.namespaced_name)
                 server.client = client
                 server.tools = tools
                 server.started_at = time.monotonic()
                 server.status = McpServerStatus.READY
+                client.on_notification(
+                    lambda message, active_server=server, active_client=client: (
+                        self._handle_server_notification(
+                            active_server,
+                            active_client,
+                            message,
+                        )
+                    )
+                )
             except Exception as exc:
                 for name in registered_names:
                     self.tool_registry.unregister(name)
@@ -417,6 +416,60 @@ class McpServerManager:
                 server.error_message = f"{type(exc).__name__}: {exc}"
                 server.status = McpServerStatus.ERROR
             self._notify(server)
+
+    def _handle_server_notification(
+        self,
+        server: McpServer,
+        client: McpClient,
+        message: dict[str, Any],
+    ) -> None:
+        """Handle server notifications outside the transport reader thread."""
+
+        method = str(message.get("method") or "")
+        if method != "notifications/tools/list_changed":
+            return
+        try:
+            with server.lock:
+                if server.client is not client or server.status != McpServerStatus.READY:
+                    return
+                refreshed = client.list_tools()
+                self._validate_tool_names(server.name, refreshed)
+                definitions = [
+                    self._tool_definition(client, descriptor)
+                    for descriptor in refreshed
+                ]
+                self.tool_registry.replace_tools(
+                    [descriptor.namespaced_name for descriptor in server.tools],
+                    definitions,
+                )
+                server.tools = refreshed
+                server.error_message = ""
+        except Exception as exc:
+            with server.lock:
+                if server.client is not client:
+                    return
+                # Keep the previous, known-good registrations available. A later
+                # list_changed notification can retry the refresh.
+                server.error_message = (
+                    "MCP tools/list_changed refresh failed: "
+                    f"{type(exc).__name__}: {exc}"
+                )
+        self._notify(server)
+
+    def _tool_definition(
+        self,
+        client: McpClient,
+        descriptor: McpToolDescriptor,
+    ) -> ToolDefinition:
+        return ToolDefinition(
+            name=descriptor.namespaced_name,
+            description=(
+                f"MCP server '{descriptor.server_name}' tool '{descriptor.name}'. "
+                f"{descriptor.description}"
+            ).strip(),
+            parameters=descriptor.input_schema,
+            handler=self._tool_handler(client, descriptor),
+        )
 
     def _notify(self, server: McpServer) -> None:
         if self.status_callback is None:

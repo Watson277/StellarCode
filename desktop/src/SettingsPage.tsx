@@ -1382,7 +1382,7 @@ function DiagnosticsSettingsForm({ draft, setDraft, snapshot, diagnosticsSnapsho
     ...current,
     diagnostics: { ...current.diagnostics, ...patch },
   }));
-  return <SettingsSectionView title={t("Data & Diagnostics")} description={t("Runtime executable and local data locations. Full access remains session-only and is never made a default here.")}>
+  return <SettingsSectionView title={t("Data & Diagnostics")} description={t("Runtime executable and local data locations. Non-default access modes remain session-only and are never made a default here.")}>
     <div className="management-summary diagnostics-summary">
       <div><span>{t("Status")}</span><strong>{t(diagnosticsSnapshot.status)}</strong></div>
       <div><span>{t("Errors")}</span><strong>{diagnosticsSnapshot.error_count}</strong></div>

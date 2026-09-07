@@ -24,7 +24,14 @@ from stellarcode.tools.registry import (
 
 
 class HitlToolRegistry(ToolRegistry):
-    """Intercepts dangerous tools while preserving the ToolRegistry interface."""
+    """Approval decorator placed in front of the real ``ToolRegistry``.
+
+    ``delegate`` remains the single owner of tool definitions, schemas, execution
+    workers, timeouts, and concrete handlers.  This wrapper only adds the HITL
+    decision boundary before forwarding an approved invocation to that registry.
+    Keeping this distinction explicit prevents approval/UI concerns from leaking
+    into the source ``ToolRegistry`` implementation.
+    """
 
     def __init__(self, delegate: ToolRegistry, hitl_handler: HitlHandler) -> None:
         super().__init__(
@@ -32,14 +39,29 @@ class HitlToolRegistry(ToolRegistry):
             batch_timeout_seconds=delegate.batch_timeout_seconds,
             trace_recorder=delegate.trace_recorder,
         )
+        # The inherited registry state exists only for ToolRegistry-compatible typing.
+        # All real registrations and executions are owned by this delegate.
         self.delegate = delegate
+        # The handler supplies the decision channel: terminal input or Runtime events.
         self.hitl_handler = hitl_handler
 
+    # -------------------------------------------------------------------------
+    # ToolRegistry compatibility forwarding
+    # -------------------------------------------------------------------------
+    # These methods deliberately do not use the inherited ToolRegistry storage.
+    # Dynamic built-in/MCP tools must have one authoritative registry: delegate.
     def register(self, tool: ToolDefinition) -> None:
         self.delegate.register(tool)
 
     def unregister(self, name: str) -> None:
         self.delegate.unregister(name)
+
+    def replace_tools(
+        self,
+        remove_names: list[str],
+        tools: list[ToolDefinition],
+    ) -> None:
+        self.delegate.replace_tools(remove_names, tools)
 
     def list_tools(self) -> list[ToolDefinition]:
         return self.delegate.list_tools()
@@ -73,15 +95,24 @@ class HitlToolRegistry(ToolRegistry):
         )
 
     def execute(self, name: str, arguments: str | dict[str, Any] | None) -> str:
+        # Full-access mode disables only the approval boundary.  The original
+        # ToolRegistry and its concrete handler validation still execute normally.
         if not self.hitl_handler.is_enabled():
             return self.delegate.execute(name, arguments)
+
+        # Non-approvable restricted-mode policy failures are final.  They are not
+        # presented as approvals because user consent must not override policy.
         policy_result = _restricted_policy_result(name, arguments)
         if policy_result is not None:
             self._record_intercepted(name, arguments, policy_result)
             return policy_result
+
+        # Safe/read-only tools bypass HITL and retain the source registry's behavior.
         if not ApprovalPolicy.requires_approval(name, arguments):
             return self.delegate.execute(name, arguments)
 
+        # HITL starts here.  Build a read-only preview before asking for a decision;
+        # no tool handler with side effects has run at this point.
         original_arguments = _serialize_arguments(arguments)
         change_preview = self.delegate.preview(name, arguments)
         request = ApprovalRequest.create(
@@ -92,6 +123,8 @@ class HitlToolRegistry(ToolRegistry):
         )
         result = self.hitl_handler.request_approval(request)
 
+        # A rejection/skip is converted to a normal tool result so the Agent can
+        # observe the decision and re-plan instead of treating it as a Runtime crash.
         if result.is_rejected:
             reason = result.reason or "The user rejected this operation."
             message = f"[HITL] Operation rejected: {reason}"
@@ -101,6 +134,10 @@ class HitlToolRegistry(ToolRegistry):
             message = "[HITL] Operation skipped by the user."
             self._record_intercepted(name, arguments, message)
             return message
+
+        # Modified approval arguments replace the model-proposed arguments.  File
+        # changes receive a hidden path/hash guard that is verified by the original
+        # handler immediately before mutation (approval-to-write TOCTOU protection).
         effective_arguments = result.effective_arguments(original_arguments)
         effective_preview = (
             self.delegate.preview(name, effective_arguments)
@@ -122,6 +159,8 @@ class HitlToolRegistry(ToolRegistry):
         timeout_seconds: float | None = None,
         cancellation_event: threading.Event | None = None,
     ) -> list[ToolExecutionResult]:
+        # Batch execution follows the same decorator rule as execute(): when approval
+        # is disabled, delegate owns the complete operation without extra HITL work.
         if not self.hitl_handler.is_enabled():
             return self.delegate.execute_tools(
                 invocations,
@@ -129,6 +168,9 @@ class HitlToolRegistry(ToolRegistry):
                 cancellation_event,
             )
 
+        # Phase 1: classify every invocation without executing side effects.
+        # ``prepared`` contains safe tools now and approved tools later; ``immediate``
+        # contains policy/rejection results; approval candidates wait for the user.
         prepared: list[tuple[int, ToolInvocation]] = []
         immediate: dict[int, ToolExecutionResult] = {}
         approval_candidates: list[
@@ -177,10 +219,9 @@ class HitlToolRegistry(ToolRegistry):
 
         approvals: dict[int, Any] = {}
         if approval_candidates:
-            # Desktop approvals are independent asynchronous decisions. Start every
-            # request in the batch before waiting for any one of them so the UI can
-            # display the complete approval queue at once. TerminalHitlHandler still
-            # serializes its stdin prompt internally, preserving CLI behaviour.
+            # Phase 2: publish the complete approval batch before waiting. Desktop
+            # decisions are independent, while TerminalHitlHandler serializes stdin
+            # internally so concurrent workers cannot consume each other's answers.
             with ThreadPoolExecutor(
                 max_workers=len(approval_candidates),
                 thread_name_prefix="stellarcode-approval",
@@ -197,6 +238,8 @@ class HitlToolRegistry(ToolRegistry):
                 for index, *_rest in approval_candidates:
                     approvals[index] = futures[index].result()
 
+        # Phase 3: turn decisions into either immediate rejection results or guarded
+        # invocations ready for the original ToolRegistry.
         for index, invocation, original_arguments, change_preview, _request in approval_candidates:
             approval = approvals[index]
             if approval.is_rejected:
@@ -243,6 +286,8 @@ class HitlToolRegistry(ToolRegistry):
                 )
             )
 
+        # Phase 4: only the source ToolRegistry performs actual tool execution,
+        # including its existing parallelism, timeout, cancellation, and tracing.
         executed = self.delegate.execute_tools(
             [invocation for _, invocation in prepared],
             timeout_seconds,
@@ -250,6 +295,8 @@ class HitlToolRegistry(ToolRegistry):
         )
         for (index, _), result in zip(prepared, executed):
             immediate[index] = result
+        # Phase 5: restore model call order even when approvals and tools completed
+        # concurrently.  This keeps tool_call/tool_result correlation deterministic.
         return [immediate[index] for index in range(len(invocations))]
 
     def _record_intercepted(

@@ -4247,8 +4247,9 @@ function App() {
               <button className="text-button" type="button" onClick={() => void chooseAttachments()} disabled={runtimeMutationBusy || !sessionId}>+ {t("Attach")}{attachments.length ? ` (${attachments.length})` : ""}</button>
               <button className={`trace-toggle ${traceEnabled ? "active" : ""}`} type="button" onClick={() => void toggleTrace()} disabled={runtimeMutationBusy || !sessionId || Boolean(traceModeRequest.current)} title={tracePath || t("Record complete LLM, tool, approval, and Runtime event logs for this conversation")}>{t(traceEnabled ? "Trace On" : "Trace Off")}</button>
               <div className="access-switch" aria-label={t("Access mode")}>
-                <button className={accessMode === "restricted" ? "active" : ""} type="button" onClick={() => void changeAccessMode("restricted")} disabled={runtimeMutationBusy || !sessionId}>{t("Normal")}</button>
-                <button className={accessMode === "full-access" ? "active dangerous" : ""} type="button" onClick={() => void changeAccessMode("full-access")} disabled={runtimeMutationBusy || !sessionId}>{t("Full access")}</button>
+                <button className={accessMode === "restricted" ? "active" : ""} type="button" onClick={() => void changeAccessMode("restricted")} disabled={runtimeMutationBusy || !sessionId} title={t("Medium- and high-risk operations require approval")}>{t("Normal")}</button>
+                <button className={accessMode === "balanced" ? "active balanced" : ""} type="button" onClick={() => void changeAccessMode("balanced")} disabled={runtimeMutationBusy || !sessionId} title={t("Medium-risk operations are approved automatically; high-risk operations still require approval")}>{t("Balanced")}</button>
+                <button className={accessMode === "full-access" ? "active dangerous" : ""} type="button" onClick={() => void changeAccessMode("full-access")} disabled={runtimeMutationBusy || !sessionId} title={t("All approval prompts are bypassed")}>{t("Full access")}</button>
               </div>
               <span className="composer-hint">{activeTaskFinalizing ? t("Finalizing workspace protection") : busy ? t("Agent is running") : ragIndexing ? t("RAG index is building") : sessionId ? t(appSettings.general.send_shortcut === "enter" ? "Enter to send - Shift+Enter for newline" : "Ctrl+Enter to send") : connectionLabel}</span>
               <button className="secondary-button" type="button" onClick={() => void cancelTask()} disabled={!busy || !activeTaskId || cancelling || activeTaskFinalizing}>{t(activeTaskFinalizing ? "Finalizing..." : cancelling ? "Stopping..." : "Stop")}</button>
@@ -4332,7 +4333,7 @@ function App() {
           >
           <PanelSection title={t("Run context")}>
             <DefinitionRow label={t("Model")} value={t(model)} /><DefinitionRow label={t("Mode")} value={mode === "react" ? "ReAct" : t(mode === "plan" ? "Plan" : "Team")} />
-            <DefinitionRow label={t("Access")} value={t(accessMode === "restricted" ? "normal" : "full access")} emphasis={accessMode === "full-access"} /><DefinitionRow label={t("Workspace")} value={activeProject?.name ?? t("none")} />
+            <DefinitionRow label={t("Access")} value={t(accessMode === "restricted" ? "normal" : accessMode === "balanced" ? "balanced" : "full access")} emphasis={accessMode === "full-access"} /><DefinitionRow label={t("Workspace")} value={activeProject?.name ?? t("none")} />
           </PanelSection>
           <PanelSection title={t("Project")}>
             <DefinitionRow label={t("Projects")} value={`${projects.length}`} /><DefinitionRow label={t("Conversations")} value={`${conversations.length}`} />

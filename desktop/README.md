@@ -144,8 +144,8 @@ client, while borders preserve the table structure.
 Non-secret settings are validated and stored in the Tauri application-data directory as
 `settings.json`. Model, Agent, RAG, and Python changes are passed to the next Python Sidecar and
 can be applied immediately with `Save & Restart Runtime`; General and Appearance settings do
-not restart an active task. Full access is deliberately excluded from persistent defaults
-and still resets to Normal after an app or project restart.
+not restart an active task. Non-default access modes are deliberately excluded from persistent
+defaults and reset to Normal after an app or project restart.
 
 The composer Attach button accepts up to 10 local files. Files can also be dragged from the
 desktop into the app window, and a copied image or screenshot can be pasted directly into
@@ -220,12 +220,14 @@ Workspace commands run with stdin closed so they cannot consume the Sidecar JSON
 They also receive the user's original `PYTHONPATH`, not the temporary Runtime import path
 that Tauri uses to launch `stellarcode.runtime.sidecar`.
 
-The composer includes two Runtime access modes:
+The composer includes three Runtime access modes:
 
 - `Normal` is the default and requests approval for risky operations.
+- `Balanced` automatically approves medium-risk operations while still requesting approval
+  for high-risk commands and file deletion. Restricted-mode hard policy checks remain active.
 - `Full access` bypasses Runtime approvals and permits operations outside the active project,
   subject to Windows permissions. Enabling it requires confirmation and it resets to
-  `Normal` after an app restart or project switch.
+  `Normal` after an app restart or project switch. `Balanced` resets the same way.
 
 The development build expects the repository layout to remain intact. A future distributable
 installer must bundle a frozen Python sidecar executable and its runtime assets.

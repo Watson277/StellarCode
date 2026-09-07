@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import re
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Callable
 
 from stellarcode import __version__
 from stellarcode.image import ImageProcessor
@@ -69,6 +69,9 @@ class McpClient:
                 )
             )
         return descriptors
+
+    def on_notification(self, listener: Callable[[dict[str, Any]], None]) -> None:
+        self.rpc.on_notification(listener)
 
     def call_tool(self, tool_name: str, arguments: dict[str, Any]) -> str:
         return self.call_tool_output(tool_name, arguments).text

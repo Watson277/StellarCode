@@ -1,4 +1,6 @@
 # StellarCode
+<img src="https://picui.ogmua.cn/s1/2026/08/25/6a8d63cfc9d12.webp" alt="stellar.png" title="stellar.png" />
+
 
 StellarCode 是一个本地运行的 Code Agent，当前默认分支为 `desktop-client`。项目保留了
 Python CLI，同时提供基于 **Tauri 2 + React + TypeScript** 的桌面客户端。
@@ -23,7 +25,8 @@ Python Runtime Sidecar
 
 开发时，Tauri 会自动启动仓库根目录 `.venv` 中的 Python Runtime。发行构建则使用
 PyInstaller 将 Runtime 打包进安装程序，最终用户不需要单独安装 Python、Node.js 或 Rust。
-
+## Windows客户端安装
+/desktop/src-tauri/target/release/bundle/msi/StellarCode_0.1.0_x64_en-US.msi
 ## 1. 环境要求
 
 推荐在 Windows 10/11 x64 上开发。
@@ -226,6 +229,24 @@ stellarcode --workspace .
 
 Sidecar 启动后会等待 JSONL 协议输入，因此没有普通 CLI 提示符是正常现象；使用
 `Ctrl+C` 退出。
+
+### SWE-bench 非交互适配器
+
+`swebench-agent` 用于在外部 runner 已准备好的干净仓库中执行单道 SWE-bench 任务。
+它允许仓库内代码读写和有限时长的命令执行，但不加载 Web、MCP 或 Memory 工具；题目
+文件与结果文件必须位于仓库工作区之外，防止混入最终 Git patch。
+
+```powershell
+.\.venv\Scripts\python.exe -m stellarcode.cli swebench-agent `
+  --workspace E:\path\to\clean-repository `
+  --prompt-file E:\path\outside-repository\prompt.md `
+  --result-file E:\path\outside-repository\agent-result.json `
+  --max-iterations 40 `
+  --temperature 0.2
+```
+
+完整的数据脱敏、仓库 worktree 隔离和 `predictions.jsonl` 收集流程位于同级
+`SWE-bench` 评测目录。
 
 ## 8. 测试和构建检查
 

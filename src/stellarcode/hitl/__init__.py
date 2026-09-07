@@ -2,10 +2,11 @@
 
 from stellarcode.hitl.handler import HitlHandler, TerminalHitlHandler
 from stellarcode.hitl.model import ApprovalRequest, ApprovalResult, Decision
-from stellarcode.hitl.policy import ApprovalPolicy
+from stellarcode.hitl.policy import ACCESS_MODES, ApprovalPolicy
 
 __all__ = [
     "ApprovalPolicy",
+    "ACCESS_MODES",
     "ApprovalRequest",
     "ApprovalResult",
     "Decision",

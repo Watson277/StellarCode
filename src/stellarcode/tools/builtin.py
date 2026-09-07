@@ -809,6 +809,8 @@ def _execute_command(
     root: Path,
     command: str | list[str],
     timeout_seconds: int = 30,
+    *,
+    environment: dict[str, str] | None = None,
 ) -> ToolOutput:
     if task_workspace_active(root):
         _reject_detached_task_command(command)
@@ -829,7 +831,7 @@ def _execute_command(
         process = subprocess.Popen(
             argv,
             cwd=subprocess_safe_path(root),
-            env=_tool_process_environment(),
+            env=environment if environment is not None else _tool_process_environment(),
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,

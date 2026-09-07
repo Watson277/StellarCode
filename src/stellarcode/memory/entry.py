@@ -11,7 +11,7 @@ from typing import Any
 
 class MemoryType(str, Enum):
     CONVERSATION = "CONVERSATION"
-    FACT = "FACT"
+    FACT = "FACT" 
     SUMMARY = "SUMMARY"
     TOOL_RESULT = "TOOL_RESULT"
 

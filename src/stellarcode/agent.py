@@ -103,12 +103,16 @@ class Agent:
         delta_event_data: dict[str, Any] | None = None,
         prompt_mode: PromptMode = PromptMode.REACT,
         prompt_assembler: PromptAssembler | None = None,
+        temperature: float = 0.2,
     ) -> None:
         if max_web_search_calls < 1:
             raise ValueError("max_web_search_calls must be at least 1.")
+        if not 0.0 <= temperature <= 2.0:
+            raise ValueError("temperature must be between 0 and 2.")
         self.llm_client = llm_client
         self.tool_registry = tool_registry
         self.max_iterations = max_iterations
+        self.temperature = temperature
         self.base_system_prompt = system_prompt
         self.memory_manager = memory_manager
         self.progress_callback = progress_callback
@@ -268,6 +272,12 @@ class Agent:
                 )
 
         return self._finish_after_iteration_limit(execution_trace, cancellation_event)
+
+    
+    """
+    负责处理模型这一轮返回的全部 tool_calls。它会生成 UI 的 tool.started 事件、
+    做 web_search 次数限制、调用批量执行、再把每个结果转换成role=tool 消息回填给模型。  
+    """
 
     def _execute_tool_calls(
         self,
@@ -702,7 +712,7 @@ class Agent:
                         self.llm_client,
                         provider_messages,
                         tools=tools,
-                        temperature=0.2,
+                        temperature=self.temperature,
                         on_delta=delta_callback,
                     ),
                     cancellation_event,

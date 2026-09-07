@@ -29,6 +29,7 @@ from stellarcode.browser import (
     register_browser_tools,
 )
 from stellarcode.diagnostics import DiagnosticsService, LspConfig
+from stellarcode.hitl import ACCESS_MODES
 from stellarcode.llm import TokenUsage, UsageLedger, create_chat_client
 from stellarcode.llm.types import current_llm_scope, llm_runtime_scope
 from stellarcode.llm.message_history import repair_tool_message_history
@@ -197,7 +198,7 @@ class RuntimeSession:
         self.browser_guard = BrowserGuard(self.browser_session)
         self.hitl_handler = RuntimeHitlHandler(
             lambda event_type, data: self._emit_event(event_type, data),
-            enabled=settings.access_mode == "restricted",
+            access_mode=settings.access_mode,
             is_task_cancelled=self._is_task_cancelled,
         )
         self.registry = build_default_registry(
@@ -1528,14 +1529,14 @@ class RuntimeSession:
         return self._get_conversation(conversation_id).mode
 
     def set_access_mode(self, mode: str) -> None:
-        if mode not in {"restricted", "full-access"}:
+        if mode not in ACCESS_MODES:
             raise ValueError(f"unsupported access mode: {mode}")
         self.hitl_handler.clear_approved_all()
-        self.hitl_handler.set_enabled(mode == "restricted")
+        self.hitl_handler.set_access_mode(mode)
         self.access_mode = mode
 
     def set_conversation_access_mode(self, conversation_id: str, mode: str) -> dict[str, Any]:
-        if mode not in {"restricted", "full-access"}:
+        if mode not in ACCESS_MODES:
             raise ValueError(f"unsupported access mode: {mode}")
         conversation = self._get_conversation(conversation_id)
         if self.active_task_for_conversation(conversation_id):
@@ -1606,6 +1607,7 @@ class RuntimeSession:
         event_floor_sequence: int = 0,
         agent_messages: list[dict[str, Any]] | None = None,
         history: dict[str, Any] | None = None,
+        short_term_memory: dict[str, Any] | None = None,
         usage: dict[str, Any] | None = None,
         access_mode: str | None = None,
     ) -> ConversationRuntime:
@@ -1613,13 +1615,26 @@ class RuntimeSession:
             llm_client=self.llm_client,
         )
         skill_context_buffer = SkillContextBuffer()
-        for item in transcript:
-            role = item.get("role")
-            content = str(item.get("content") or "")
-            if role == "user":
-                memory_manager.add_user_message(content)
-            elif role == "assistant":
-                memory_manager.add_assistant_message(content)
+        restored_short_term = False
+        if short_term_memory is not None:
+            try:
+                memory_manager.restore_short_term(short_term_memory)
+                restored_short_term = True
+            except (KeyError, TypeError, ValueError) as exc:
+                self._progress(
+                    f"Short-term memory restore failed for conversation {identifier}; "
+                    f"rebuilding from transcript: {exc}"
+                )
+        if not restored_short_term:
+            # Compatibility path for schema-v2 and older conversations. This can invoke
+            # compression; new snapshots restore directly and never repeat LLM work.
+            for item in transcript:
+                role = item.get("role")
+                content = str(item.get("content") or "")
+                if role == "user":
+                    memory_manager.add_user_message(content)
+                elif role == "assistant":
+                    memory_manager.add_assistant_message(content)
 
         def event_callback(event_type: str, data: dict[str, Any]) -> None:
             self._emit_event(event_type, data)
@@ -1679,7 +1694,7 @@ class RuntimeSession:
             mode=mode,
             access_mode=(
                 access_mode
-                if access_mode in {"restricted", "full-access"}
+                if access_mode in ACCESS_MODES
                 else getattr(self, "access_mode", "restricted")
             ),
             created_at=created_at,
@@ -1722,17 +1737,24 @@ class RuntimeSession:
                     history=(
                         payload.get("history") if isinstance(payload.get("history"), dict) else None
                     ),
+                    short_term_memory=(
+                        payload.get("short_term_memory")
+                        if isinstance(payload.get("short_term_memory"), dict)
+                        else None
+                    ),
                     usage=(
                         payload.get("usage") if isinstance(payload.get("usage"), dict) else None
                     ),
                     access_mode=getattr(self, "access_mode", "restricted"),
                 )
                 self.conversations[identifier] = conversation
+                needs_schema_upgrade = _nonnegative_int(payload.get("schema_version")) < 3
                 if repair_count:
                     self._progress(
                         f"Repaired {repair_count} interrupted tool message(s) "
                         f"in conversation {identifier}."
                     )
+                if repair_count or needs_schema_upgrade:
                     self._save_conversation(conversation)
             except (KeyError, OSError, TypeError, ValueError, json.JSONDecodeError) as exc:
                 self._progress(f"Conversation load failed for {path.name}: {exc}")
@@ -1740,7 +1762,7 @@ class RuntimeSession:
     def _save_conversation(self, conversation: ConversationRuntime) -> None:
         persisted_messages, _ = repair_tool_message_history(conversation.agent.messages)
         payload = {
-            "schema_version": 2,
+            "schema_version": 3,
             "id": conversation.id,
             "project_id": self.project_id,
             "title": conversation.title,
@@ -1754,6 +1776,7 @@ class RuntimeSession:
             "transcript": conversation.transcript,
             "agent_messages": persisted_messages,
             "history": conversation.agent.history_snapshot(),
+            "short_term_memory": conversation.memory_manager.short_term_snapshot(),
             "usage": conversation.usage_ledger.snapshot(),
         }
         with self._persistence_lock:

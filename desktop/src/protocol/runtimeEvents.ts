@@ -7,7 +7,7 @@
 export const RUNTIME_PROTOCOL_VERSION = 1 as const;
 
 export type AgentMode = "react" | "plan" | "team";
-export type AccessMode = "restricted" | "full-access";
+export type AccessMode = "restricted" | "balanced" | "full-access";
 export type TaskTerminalStatus = "completed" | "failed" | "cancelled";
 export type ApprovalDecision = "approve" | "reject" | "skip" | "modify";
 export type McpServerState = "disabled" | "starting" | "ready" | "error";
@@ -419,6 +419,7 @@ export interface ConversationSummary {
   id: string;
   title: string;
   mode: AgentMode;
+  access_mode?: AccessMode;
   created_at: string;
   updated_at: string;
   message_count: number;

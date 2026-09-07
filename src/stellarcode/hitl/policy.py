@@ -8,6 +8,9 @@ from typing import Any
 from stellarcode.command_policy import is_safe_read_only_command
 
 
+ACCESS_MODES = ("restricted", "balanced", "full-access")
+
+
 class ApprovalPolicy:
     """Static, deterministic risk policy for tool execution."""
 
@@ -40,6 +43,35 @@ class ApprovalPolicy:
         "apply_patch": "将修改现有文件内容。",
         "create_project": "将在磁盘上创建文件和目录。",
     }
+
+    @classmethod
+    def validate_access_mode(cls, access_mode: str) -> str:
+        """Return a supported access mode or fail closed for unknown values."""
+
+        if access_mode not in ACCESS_MODES:
+            raise ValueError(f"unsupported access mode: {access_mode}")
+        return access_mode
+
+    @classmethod
+    def approval_boundary_enabled(cls, access_mode: str) -> bool:
+        """Whether calls still pass through restricted-mode policy and HITL."""
+
+        return cls.validate_access_mode(access_mode) != "full-access"
+
+    @classmethod
+    def requires_user_decision(cls, access_mode: str, danger_level: str) -> bool:
+        """Apply the access-mode threshold to an already classified request."""
+
+        mode = cls.validate_access_mode(access_mode)
+        if mode == "full-access":
+            return False
+        if mode == "balanced":
+            # Only an explicitly classified medium-risk request is automatic.
+            # Unknown classifications fail closed and still require a person.
+            return danger_level != "medium"
+        # Requests normally reach the handler only after the registry has already
+        # bypassed safe tools. If another caller invokes it directly, fail closed.
+        return True
 
     @classmethod
     def requires_approval(

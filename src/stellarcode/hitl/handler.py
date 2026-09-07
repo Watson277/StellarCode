@@ -8,6 +8,7 @@ from collections.abc import Callable
 from typing import Protocol
 
 from stellarcode.hitl.model import ApprovalRequest, ApprovalResult
+from stellarcode.hitl.policy import ApprovalPolicy
 from stellarcode.trace import TraceRecorder
 
 
@@ -16,6 +17,9 @@ class HitlHandler(Protocol):
         ...
 
     def set_enabled(self, enabled: bool) -> None:
+        ...
+
+    def set_access_mode(self, access_mode: str) -> None:
         ...
 
     def clear_approved_all(self) -> None:
@@ -31,12 +35,15 @@ class TerminalHitlHandler:
     def __init__(
         self,
         enabled: bool = False,
+        access_mode: str | None = None,
         input_func: Callable[[str], str] = input,
         output_func: Callable[[str], None] = print,
         render_func: Callable[[ApprovalRequest], None] | None = None,
         trace_recorder: TraceRecorder | None = None,
     ) -> None:
-        self._enabled = enabled
+        self._access_mode = ApprovalPolicy.validate_access_mode(
+            access_mode or ("restricted" if enabled else "full-access")
+        )
         self._input = input_func
         self._output = output_func
         self._render = render_func or (lambda request: self._output(request.to_display_text()))
@@ -47,11 +54,17 @@ class TerminalHitlHandler:
 
     def is_enabled(self) -> bool:
         with self._lock:
-            return self._enabled
+            return ApprovalPolicy.approval_boundary_enabled(self._access_mode)
 
     def set_enabled(self, enabled: bool) -> None:
+        """Compatibility bridge for callers that still use the old boolean API."""
+
+        self.set_access_mode("restricted" if enabled else "full-access")
+
+    def set_access_mode(self, access_mode: str) -> None:
+        mode = ApprovalPolicy.validate_access_mode(access_mode)
         with self._lock:
-            self._enabled = enabled
+            self._access_mode = mode
 
     def clear_approved_all(self) -> None:
         with self._lock:
@@ -83,6 +96,13 @@ class TerminalHitlHandler:
                     danger_level=request.danger_level,
                     risk=request.risk_description,
                 )
+            if not ApprovalPolicy.requires_user_decision(
+                self._access_mode,
+                request.danger_level,
+            ):
+                result = ApprovalResult.approved()
+                self._record_decision(request, result, automatic=True)
+                return result
             server_name = _mcp_server_name(request.tool_name)
             if request.tool_name in self._approved_all_tools or (
                 server_name is not None and server_name in self._approved_all_servers

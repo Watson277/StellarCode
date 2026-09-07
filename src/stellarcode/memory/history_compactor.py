@@ -14,6 +14,7 @@ from typing import Any
 
 from stellarcode.cancellation import TaskCancelledError, cancellable_call
 from stellarcode.llm.types import estimate_request_tokens, llm_operation, normalize_chat_result
+from stellarcode.memory.token_budget import COMPRESSION_THRESHOLD_RATIO
 from stellarcode.prompt.context_messages import (
     ContextKind,
     strip_internal_context_metadata,
@@ -45,21 +46,19 @@ class ConversationHistoryCompactor:
         self,
         *,
         context_window: int = 200_000,
-        retain_recent_turns: int = 2,
-        response_reserve: int | None = None,
-        safety_margin: int | None = None,
+        retain_recent_turns: int = 3,
+        compression_threshold_ratio: float = COMPRESSION_THRESHOLD_RATIO,
         summary: str = "",
         compaction_count: int = 0,
         last_compacted_at: str | None = None,
     ) -> None:
         if context_window < 16_000:
             raise ValueError("context_window must be at least 16000")
+        if not 0 < compression_threshold_ratio < 1:
+            raise ValueError("compression_threshold_ratio must be between 0 and 1")
         self.context_window = context_window
         self.retain_recent_turns = max(1, retain_recent_turns)
-        self.response_reserve = response_reserve or min(
-            20_000, max(4_096, int(context_window * 0.10))
-        )
-        self.safety_margin = safety_margin or min(13_000, max(2_048, int(context_window * 0.065)))
+        self.compression_threshold_ratio = compression_threshold_ratio
         self.summary = summary
         self.compaction_count = max(0, compaction_count)
         self.last_compacted_at = last_compacted_at
@@ -68,10 +67,7 @@ class ConversationHistoryCompactor:
 
     @property
     def trigger_tokens(self) -> int:
-        return max(
-            int(self.context_window * 0.55),
-            self.context_window - self.response_reserve - self.safety_margin,
-        )
+        return max(1, int(self.context_window * self.compression_threshold_ratio))
 
     def estimated_tokens(
         self,
@@ -192,6 +188,8 @@ class ConversationHistoryCompactor:
         if after >= self.trigger_tokens:
             candidate = _truncate_old_tool_results(
                 candidate,
+                # This is the number of recent tool-result messages protected from
+                # truncation, not the number of conversation turns retained above.
                 keep_recent=2,
                 max_chars=2_000,
             )
@@ -242,6 +240,8 @@ class ConversationHistoryCompactor:
                 "compaction_count": self.compaction_count,
                 "last_compacted_at": self.last_compacted_at,
                 "context_window": self.context_window,
+                "compression_threshold_ratio": self.compression_threshold_ratio,
+                "trigger_tokens": self.trigger_tokens,
             }
 
     def _summarize(

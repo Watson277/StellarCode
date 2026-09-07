@@ -27,7 +27,7 @@ class ProjectMemoryService:
     def create_conversation_manager(
         self,
         *,
-        short_term_tokens: int = 8192,
+        short_term_tokens: int | None = None,
         llm_client: Any | None = None,
     ) -> MemoryManager:
         return MemoryManager(

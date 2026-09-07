@@ -16,8 +16,14 @@ _NOISE_PATTERN = re.compile(
 
 
 class HtmlExtractor:
+    """Extract readable Markdown using lxml's tolerant HTML parser."""
+
+    PARSER = "lxml"
+
     def extract(self, html: str) -> str:
-        soup = BeautifulSoup(html, "html.parser")
+        # BeautifulSoup keeps the existing traversal API while lxml supplies a
+        # faster, more fault-tolerant parser for malformed real-world documents.
+        soup = BeautifulSoup(html, self.PARSER)
         for tag in soup(
             [
                 "script",

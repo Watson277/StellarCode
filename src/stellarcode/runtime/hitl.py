@@ -11,13 +11,13 @@ from contextvars import ContextVar
 from dataclasses import dataclass, field
 from typing import Any, Iterator
 
-from stellarcode.hitl import ApprovalRequest, ApprovalResult
+from stellarcode.hitl import ApprovalPolicy, ApprovalRequest, ApprovalResult
 from stellarcode.llm.types import current_llm_scope
 from stellarcode.tools.registry import ToolRegistry
 
 
-_TASK_APPROVAL_ENABLED: ContextVar[bool | None] = ContextVar(
-    "stellarcode_task_approval_enabled",
+_TASK_ACCESS_MODE: ContextVar[str | None] = ContextVar(
+    "stellarcode_task_access_mode",
     default=None,
 )
 
@@ -26,13 +26,12 @@ _TASK_APPROVAL_ENABLED: ContextVar[bool | None] = ContextVar(
 def task_approval_scope(access_mode: str) -> Iterator[None]:
     """Freeze one task's approval policy across copied worker contexts."""
 
-    if access_mode not in {"restricted", "full-access"}:
-        raise ValueError(f"unsupported access mode: {access_mode}")
-    token = _TASK_APPROVAL_ENABLED.set(access_mode == "restricted")
+    mode = ApprovalPolicy.validate_access_mode(access_mode)
+    token = _TASK_ACCESS_MODE.set(mode)
     try:
         yield
     finally:
-        _TASK_APPROVAL_ENABLED.reset(token)
+        _TASK_ACCESS_MODE.reset(token)
 
 
 @dataclass
@@ -57,24 +56,36 @@ class RuntimeHitlHandler:
         emit: Callable[[str, dict[str, Any]], None],
         *,
         enabled: bool = True,
+        access_mode: str | None = None,
         is_task_cancelled: Callable[[str], bool] | None = None,
     ) -> None:
         self._emit = emit
-        self._enabled = enabled
+        self._access_mode = ApprovalPolicy.validate_access_mode(
+            access_mode or ("restricted" if enabled else "full-access")
+        )
         self._is_task_cancelled = is_task_cancelled or (lambda _task_id: False)
         self._pending: dict[str, _PendingApproval] = {}
         self._lock = threading.RLock()
 
     def is_enabled(self) -> bool:
-        task_override = _TASK_APPROVAL_ENABLED.get()
+        return ApprovalPolicy.approval_boundary_enabled(self._current_access_mode())
+
+    def _current_access_mode(self) -> str:
+        task_override = _TASK_ACCESS_MODE.get()
         if task_override is not None:
             return task_override
         with self._lock:
-            return self._enabled
+            return self._access_mode
 
     def set_enabled(self, enabled: bool) -> None:
+        """Compatibility bridge for callers that still use the old boolean API."""
+
+        self.set_access_mode("restricted" if enabled else "full-access")
+
+    def set_access_mode(self, access_mode: str) -> None:
+        mode = ApprovalPolicy.validate_access_mode(access_mode)
         with self._lock:
-            self._enabled = enabled
+            self._access_mode = mode
 
     def clear_approved_all(self) -> None:
         # Session-wide approval is intentionally not persisted by the v1 desktop protocol.
@@ -85,6 +96,11 @@ class RuntimeHitlHandler:
         session_id, task_id = current_llm_scope()
         if task_id and self._is_task_cancelled(task_id):
             return ApprovalResult.rejected("Task cancelled by user.")
+        if not ApprovalPolicy.requires_user_decision(
+            self._current_access_mode(),
+            request.danger_level,
+        ):
+            return ApprovalResult.approved()
         pending = _PendingApproval(
             tool_name=request.tool_name,
             session_id=session_id,

@@ -18,7 +18,7 @@ from stellarcode.browser import (
     BrowserSession,
     register_browser_tools,
 )
-from stellarcode.hitl import ApprovalRequest, TerminalHitlHandler
+from stellarcode.hitl import ACCESS_MODES, ApprovalRequest, TerminalHitlHandler
 from stellarcode.llm import create_chat_client
 from stellarcode.memory import MemoryManager
 from stellarcode.mcp import McpConfigError, McpConfigLoader, McpServerManager, McpServerStatus
@@ -37,9 +37,6 @@ from stellarcode.skill import (
 )
 from stellarcode.tools import build_default_registry
 from stellarcode.trace import TraceRecorder, TracingChatClient
-
-
-ACCESS_MODES = ("restricted", "full-access")
 
 
 class _PlainConsole:
@@ -113,13 +110,22 @@ def create_parser() -> argparse.ArgumentParser:
         default="restricted",
         help=(
             "Access mode: restricted requires approval for risky tools; "
+            "balanced auto-approves medium-risk tools but still requires approval for high-risk tools; "
             "full-access executes all tools without approval."
         ),
     )
     parser.add_argument("--max-iterations", type=int, default=8)
     parser.add_argument("--memory-dir", default=None, help="Directory for long-term memory JSON.")
     parser.add_argument("--rag-dir", default=None, help="Directory for the SQLite code index.")
-    parser.add_argument("--short-memory-tokens", type=int, default=8192)
+    parser.add_argument(
+        "--short-memory-tokens",
+        type=_positive_int,
+        default=None,
+        help=(
+            "Override the short-term semantic-memory capacity. By default it is 50%% "
+            "of the configured model context window."
+        ),
+    )
     parser.add_argument("--team-workers", type=int, default=2)
     parser.add_argument("--team-retries", type=int, default=2)
     parser.add_argument(
@@ -188,7 +194,7 @@ def switch_access_mode(
     confirmation_func: Callable[[str], str] = input,
 ) -> tuple[str, str]:
     if target_mode not in ACCESS_MODES:
-        return current_mode, "usage: /mode restricted | /mode full-access"
+        return current_mode, "usage: /mode restricted | /mode balanced | /mode full-access"
     if target_mode == current_mode:
         return current_mode, f"access mode is already {current_mode}"
 
@@ -201,10 +207,10 @@ def switch_access_mode(
         except (EOFError, KeyboardInterrupt):
             confirmation = ""
         if confirmation != "FULL ACCESS":
-            return current_mode, "mode switch cancelled; access mode remains restricted"
+            return current_mode, f"mode switch cancelled; access mode remains {current_mode}"
 
     hitl_handler.clear_approved_all()
-    hitl_handler.set_enabled(target_mode == "restricted")
+    hitl_handler.set_access_mode(target_mode)
     return target_mode, f"switched to {target_mode} mode"
 
 
@@ -255,6 +261,10 @@ def handle_browser_command(command: str, controller: BrowserController) -> str:
 
 
 def main() -> None:
+    if len(sys.argv) > 1 and sys.argv[1] == "swebench-agent":
+        from stellarcode.swebench_adapter import main as swebench_main
+
+        raise SystemExit(swebench_main(sys.argv[2:]))
     if len(sys.argv) > 1 and sys.argv[1] == "benchmark-agent":
         from stellarcode.benchmark import main as benchmark_main
 
@@ -286,7 +296,7 @@ def main() -> None:
     browser_session = BrowserSession()
     browser_guard = BrowserGuard(browser_session)
     hitl_handler = TerminalHitlHandler(
-        enabled=access_mode == "restricted",
+        access_mode=access_mode,
         output_func=lambda message: console.print(message, markup=False),
         render_func=lambda request: _render_approval(console, request),
         trace_recorder=trace_recorder,
@@ -388,6 +398,10 @@ def main() -> None:
     )
     if access_mode == "restricted":
         console.print("Access mode: restricted (risky operations require approval)")
+    elif access_mode == "balanced":
+        console.print(
+            "Access mode: balanced (medium-risk operations are automatic; high-risk operations require approval)"
+        )
     else:
         console.print(
             "Access mode: full-access (no StellarCode path, network, or approval restrictions)",
@@ -409,7 +423,9 @@ def main() -> None:
     skill_warnings = format_skill_warnings(skill_registry, skill_state_store)
     if skill_warnings:
         console.print(skill_warnings, markup=False)
-    console.print("Type /mode to inspect or /mode <restricted|full-access> to switch access.")
+    console.print(
+        "Type /mode to inspect or /mode <restricted|balanced|full-access> to switch access."
+    )
     console.print("Type /trace on to record complete execution details; /trace shows status.")
     if trace_recorder.enabled:
         console.print(
@@ -466,7 +482,7 @@ def main() -> None:
             continue
         if user_input == "/hitl" or user_input.startswith("/hitl "):
             console.print(
-                "HITL is controlled by access mode; use /mode restricted or /mode full-access"
+                "HITL is controlled by access mode; use /mode restricted, balanced, or full-access"
             )
             continue
         if user_input == "/memory":

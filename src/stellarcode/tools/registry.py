@@ -146,6 +146,26 @@ class ToolRegistry:
         with self._tools_lock:
             self._tools.pop(name, None)
 
+    def replace_tools(
+        self,
+        remove_names: list[str],
+        tools: list[ToolDefinition],
+    ) -> None:
+        """Atomically replace one dynamic provider's registered tool set."""
+
+        names = [tool.name for tool in tools]
+        if len(names) != len(set(names)):
+            raise ValueError("Replacement tool names must be unique.")
+        with self._tools_lock:
+            updated = dict(self._tools)
+            for name in remove_names:
+                updated.pop(name, None)
+            for tool in tools:
+                if tool.name in updated:
+                    raise ValueError(f"Tool already registered: {tool.name}")
+                updated[tool.name] = tool
+            self._tools = updated
+
     def list_tools(self) -> list[ToolDefinition]:
         with self._tools_lock:
             return list(self._tools.values())
@@ -217,6 +237,7 @@ class ToolRegistry:
             return {"value": str(arguments or "")[:2_000]}
         safe = {key: value for key, value in parsed.items() if not key.startswith("__")}
         return _sanitize_file_mutation_arguments(name, safe)
+
 
     def execute(self, name: str, arguments: str | dict[str, Any] | None) -> str:
         started_at = time.monotonic()
@@ -315,6 +336,11 @@ class ToolRegistry:
                     return False
                 self._executions_condition.wait(remaining)
             return True
+
+    """
+    负责“批量调度”。输入是多个 ToolInvocation，
+    它决定单个执行还是多线程并行执行、等待超时、响应 Stop 取消、按原始顺序整理结果。
+    """
 
     def execute_tools(
         self,
@@ -471,6 +497,11 @@ class ToolRegistry:
             completed_results.append(timeout_result)
         return completed_results
 
+    """
+    负责“真正执行一个工具调用”。它会根据工具名从注册表找到 ToolDefinition，
+    检查参数、进入权限/HITL 和策略检查，调用该工具的 handler，捕获异常、统计耗时，
+    最后生成一个标准的 ToolExecutionResult。
+    """
     def _execute_invocation(
         self,
         invocation: ToolInvocation,

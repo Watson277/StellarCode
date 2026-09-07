@@ -540,9 +540,10 @@ button { border: 0; }
 .trace-toggle.active { border-color: #41684f; background: #1d3326; color: var(--text); }
 .trace-toggle:disabled { cursor: default; opacity: .45; }
 .access-switch { display: flex; gap: 2px; padding: 2px; border: 1px solid var(--border); border-radius: 5px; background: var(--surface-input); }
-.access-switch button { padding: 3px 7px; border-radius: 3px; background: transparent; color: var(--text-faint); cursor: pointer; font-size: 10px; }
+.access-switch button { padding: 3px 7px; border-radius: 3px; background: transparent; color: var(--text-faint); cursor: pointer; font-size: 10px; white-space: nowrap; }
 .access-switch button:hover:not(:disabled) { color: var(--text); }
 .access-switch button.active { background: #253044; color: var(--text); }
+.access-switch button.active.balanced { background: #493c20; color: var(--text); }
 .access-switch button.active.dangerous { background: #4a2924; color: var(--text); }
 .access-switch button:disabled { cursor: default; opacity: .45; }
 .composer-hint { color: var(--text-faint); font-size: 10px; margin-left: auto; }
@@ -956,6 +957,10 @@ button { border: 0; }
 }
 .theme-light .access-switch button.active {
   background: color-mix(in srgb, var(--panel) 78%, black);
+  color: var(--text);
+}
+.theme-light .access-switch button.active.balanced {
+  background: #f4e7c8;
   color: var(--text);
 }
 .theme-light .access-switch button.active.dangerous {

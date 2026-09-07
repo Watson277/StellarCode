@@ -53,6 +53,10 @@ $PyInstallerArguments = @(
     # pulls in typer, while StellarCode only embeds MCP client transports.
     "--collect-submodules", "mcp.client",
     "--collect-all", "jieba",
+    # BeautifulSoup selects this builder dynamically by name, so make both the
+    # Python adapter and lxml's compiled Windows extensions explicit in releases.
+    "--hidden-import", "bs4.builder._lxml",
+    "--collect-all", "lxml",
     "--collect-all", "PIL",
     "--copy-metadata", "mcp",
     $EntryPoint
