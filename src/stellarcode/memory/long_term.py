@@ -1,4 +1,4 @@
-"""Atomic JSON persistence for project-level, user-auditable long-term facts."""
+"""Atomic JSON persistence for the minimal V1 long-term memory schema."""
 
 from __future__ import annotations
 
@@ -8,33 +8,94 @@ import threading
 import uuid
 from pathlib import Path
 
-from stellarcode.memory.entry import MemoryEntry
+from stellarcode.memory.entry import LongTermMemoryEntry, estimate_tokens, utc_timestamp
 
 
 class LongTermMemory:
+    """Project-level type-free memories stored as independent JSON records."""
+
     def __init__(self, storage_dir: str | Path | None = None) -> None:
         env_dir = os.getenv("STELLARCODE_MEMORY_DIR")
         default_dir = Path.home() / ".stellarcode" / "memory"
         self.storage_dir = Path(storage_dir or env_dir or default_dir).resolve()
         self.storage_file = self.storage_dir / "long_term_memory.json"
-        self.entries: dict[str, MemoryEntry] = {}
+        self.entries: dict[str, LongTermMemoryEntry] = {}
         self._lock = threading.RLock()
         self._warnings: list[str] = []
         self._writes_blocked = False
         self.load()
 
-    def store(self, entry: MemoryEntry) -> bool:
+    def store(self, entry: LongTermMemoryEntry) -> bool:
+        """Add one record, ignoring only an exact duplicate among active memories."""
+
+        if not isinstance(entry, LongTermMemoryEntry):
+            raise TypeError("long-term memory requires LongTermMemoryEntry")
         with self._lock:
             self._ensure_writable_locked()
-            if any(existing.content == entry.content for existing in self.entries.values()):
+            duplicate = self._active_by_content_locked(entry.content)
+            if duplicate is not None:
                 return False
             self.entries[entry.id] = entry
             self._save_locked()
             return True
 
-    def all(self) -> list[MemoryEntry]:
+    def active(self) -> list[LongTermMemoryEntry]:
+        with self._lock:
+            return [entry for entry in self.entries.values() if entry.status == "active"]
+
+    def all(self) -> list[LongTermMemoryEntry]:
         with self._lock:
             return list(self.entries.values())
+
+    def set_embedding(self, entry_id: str, embedding: list[float]) -> bool:
+        """Persist a missing/rebuilt vector without changing the memory content."""
+
+        with self._lock:
+            self._ensure_writable_locked()
+            entry = self.entries.get(entry_id)
+            if entry is None:
+                return False
+            entry.embedding = [float(value) for value in embedding]
+            entry.updated_at = utc_timestamp()
+            self._save_locked()
+            return True
+
+    def apply_decision(
+        self,
+        action: str,
+        *,
+        content: str,
+        embedding: list[float],
+        memory_ids: list[str],
+    ) -> tuple[LongTermMemoryEntry | None, bool]:
+        """Apply one validated LLM decision in a single atomic JSON replacement."""
+
+        normalized_action = action.strip().upper()
+        with self._lock:
+            self._ensure_writable_locked()
+            targets = [self.entries.get(entry_id) for entry_id in memory_ids]
+            if any(entry is None or entry.status != "active" for entry in targets):
+                raise ValueError("memory decision references a non-active memory")
+
+            if normalized_action == "IGNORE":
+                return (targets[0] if targets else None), False
+            if normalized_action not in {"ADD", "UPDATE", "MERGE"}:
+                raise ValueError(f"unsupported memory action: {action}")
+
+            duplicate = self._active_by_content_locked(content)
+            if duplicate is not None and duplicate.id not in memory_ids:
+                return duplicate, False
+
+            now = utc_timestamp()
+            for target in targets:
+                assert target is not None
+                target.status = "superseded"
+                target.updated_at = now
+
+            entry = LongTermMemoryEntry.create(content, embedding)
+            self.entries[entry.id] = entry
+            self._save_locked()
+            return entry, True
 
     def clear(self) -> None:
         with self._lock:
@@ -63,9 +124,17 @@ class LongTermMemory:
                     raise ValueError("memory entries must be a list")
                 self.entries = {
                     entry.id: entry
-                    for entry in (MemoryEntry.from_dict(item) for item in raw_entries)
+                    for entry in (
+                        LongTermMemoryEntry.from_dict(item) for item in raw_entries
+                    )
                 }
                 self._writes_blocked = False
+                # Loading the previous MemoryEntry shape is also the migration. The next
+                # successful write serializes only the six V1 fields.
+                if any(
+                    isinstance(item, dict) and "type" in item for item in raw_entries
+                ):
+                    self._save_locked()
             except (OSError, json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
                 self.entries = {}
                 self._quarantine_corrupt_file_locked(exc)
@@ -74,6 +143,15 @@ class LongTermMemory:
         with self._lock:
             self._ensure_writable_locked()
             self._save_locked()
+
+    def ensure_storage_file(self) -> Path:
+        """Materialize an empty store so desktop file reveal can resolve the path."""
+
+        with self._lock:
+            self._ensure_writable_locked()
+            if not self.storage_file.exists():
+                self._save_locked()
+            return self.storage_file
 
     def warnings(self) -> tuple[str, ...]:
         with self._lock:
@@ -85,7 +163,18 @@ class LongTermMemory:
 
     def token_count(self) -> int:
         with self._lock:
-            return sum(entry.token_count for entry in self.entries.values())
+            return sum(estimate_tokens(entry.content) for entry in self.entries.values())
+
+    def _active_by_content_locked(self, content: str) -> LongTermMemoryEntry | None:
+        normalized = content.strip().casefold()
+        return next(
+            (
+                entry
+                for entry in self.entries.values()
+                if entry.status == "active" and entry.content.casefold() == normalized
+            ),
+            None,
+        )
 
     def _save_locked(self) -> None:
         self._ensure_writable_locked()
@@ -129,4 +218,3 @@ class LongTermMemory:
     def _warn_locked(self, message: str) -> None:
         if message not in self._warnings:
             self._warnings.append(message)
-

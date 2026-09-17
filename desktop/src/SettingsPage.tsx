@@ -199,10 +199,10 @@ export interface SettingsPageProps {
   onRagRemoveSource: (path: string) => Promise<RagSnapshot>;
   onRagIndex: () => Promise<RagSnapshot>;
   onRagClear: (confirmed: boolean) => Promise<RagSnapshot>;
-  onMemoryRefresh: () => Promise<MemorySnapshot>;
-  onMemorySave: (content: string) => Promise<MemorySnapshot>;
-  onMemoryDelete: (id: string) => Promise<MemorySnapshot>;
-  onMemoryClear: (confirmed: boolean) => Promise<MemorySnapshot>;
+  onMemoryRefresh: (scope: MemorySnapshot["scope"]) => Promise<MemorySnapshot>;
+  onMemorySave: (content: string, scope: MemorySnapshot["scope"]) => Promise<MemorySnapshot>;
+  onMemoryDelete: (id: string, scope: MemorySnapshot["scope"]) => Promise<MemorySnapshot>;
+  onMemoryClear: (confirmed: boolean, scope: MemorySnapshot["scope"]) => Promise<MemorySnapshot>;
   onPromptRefresh: (includeMemory: boolean) => Promise<PromptSnapshot>;
   onSkillRefresh: () => Promise<SkillSnapshot>;
   onSkillDiff: (name: string) => Promise<SkillDiff>;
@@ -926,10 +926,10 @@ export interface MemoryManagementFormProps {
   snapshot: MemorySnapshot;
   runtimeOnline: boolean;
   busy: boolean;
-  onRefresh: () => Promise<MemorySnapshot>;
-  onSave: (content: string) => Promise<MemorySnapshot>;
-  onDelete: (id: string) => Promise<MemorySnapshot>;
-  onClear: (confirmed: boolean) => Promise<MemorySnapshot>;
+  onRefresh: (scope: MemorySnapshot["scope"]) => Promise<MemorySnapshot>;
+  onSave: (content: string, scope: MemorySnapshot["scope"]) => Promise<MemorySnapshot>;
+  onDelete: (id: string, scope: MemorySnapshot["scope"]) => Promise<MemorySnapshot>;
+  onClear: (confirmed: boolean, scope: MemorySnapshot["scope"]) => Promise<MemorySnapshot>;
 }
 
 export function MemoryManagementForm({ language, snapshot, runtimeOnline, busy, onRefresh, onSave, onDelete, onClear }: MemoryManagementFormProps) {
@@ -939,12 +939,14 @@ export function MemoryManagementForm({ language, snapshot, runtimeOnline, busy, 
   const [working, setWorking] = useState("");
   const [notice, setNotice] = useState("");
   const [noticeIsError, setNoticeIsError] = useState(false);
+  const [scope, setScope] = useState<MemorySnapshot["scope"]>(snapshot.scope);
+  useEffect(() => setScope(snapshot.scope), [snapshot.scope]);
   const controlsDisabled = busy || Boolean(working) || !runtimeOnline;
   const normalizedFilter = filter.trim().toLocaleLowerCase(language);
   const entries = normalizedFilter
     ? snapshot.entries.filter((entry) => (
       entry.content.toLocaleLowerCase(language).includes(normalizedFilter)
-      || entry.type.toLocaleLowerCase(language).includes(normalizedFilter)
+      || entry.status.toLocaleLowerCase(language).includes(normalizedFilter)
     ))
     : snapshot.entries;
 
@@ -968,37 +970,48 @@ export function MemoryManagementForm({ language, snapshot, runtimeOnline, busy, 
     const content = fact.trim();
     if (!content || controlsDisabled) return;
     await run("Save memory", async () => {
-      await onSave(content);
+      await onSave(content, scope);
       setFact("");
     });
   }
 
   async function deleteMemory(id: string, content: string) {
     if (!await confirmDialog(
-      t("Delete this project memory?\n\n{content}", { content: abbreviateText(content, 180) }),
+      t("Delete this memory from the selected scope?\n\n{content}", { content: abbreviateText(content, 180) }),
       { title: t("Delete memory"), kind: "warning" },
     )) return;
-    await run("Delete memory", () => onDelete(id));
+    await run("Delete memory", () => onDelete(id, scope));
   }
 
   async function clearMemory() {
     if (!await confirmDialog(
-      t("Clear all long-term memory for this project? This cannot be undone."),
-      { title: t("Clear project memory"), kind: "warning" },
+      t("Clear all long-term memory in the selected scope? This cannot be undone."),
+      { title: t("Clear memory"), kind: "warning" },
     )) return;
-    await run("Clear memory", () => onClear(true));
+    await run("Clear memory", () => onClear(true, scope));
   }
 
-  return <SettingsSectionView title={t("Memory")} description={t("Review and manage the active project's shared long-term facts. Conversation history and compressed context are managed separately per conversation.")}>
+  async function changeScope(nextScope: MemorySnapshot["scope"]) {
+    setScope(nextScope);
+    setFilter("");
+    await run("Refresh memory", () => onRefresh(nextScope));
+  }
+
+  return <SettingsSectionView title={t("Memory")} description={t("Manage user memories shared across every conversation and memories isolated to the current conversation.")}>
     <div className="management-summary">
-      <div><span>{t("Scope")}</span><strong>{t("Project")}</strong></div>
+      <div><span>{t("Scope")}</span><strong>{t(scope === "user" ? "User" : "Conversation")}</strong></div>
       <div><span>{t("Saved facts")}</span><strong>{snapshot.count}</strong></div>
       <div><span>{t("Estimated tokens")}</span><strong>{snapshot.token_count.toLocaleString(language)}</strong></div>
-      <button className="secondary-button" onClick={() => void run("Refresh memory", onRefresh)} disabled={controlsDisabled}>{t(working === "Refresh memory" ? "Refreshing..." : "Refresh")}</button>
+      <button className="secondary-button" onClick={() => void run("Refresh memory", () => onRefresh(scope))} disabled={controlsDisabled}>{t(working === "Refresh memory" ? "Refreshing..." : "Refresh")}</button>
+    </div>
+
+    <div className="settings-segmented" role="group" aria-label={t("Memory scope")}>
+      <button className={scope === "user" ? "active" : ""} onClick={() => void changeScope("user")} disabled={controlsDisabled}>{t("User memory")}</button>
+      <button className={scope === "conversation" ? "active" : ""} onClick={() => void changeScope("conversation")} disabled={controlsDisabled}>{t("Conversation memory")}</button>
     </div>
 
     <section className="management-composer">
-      <header><div><h3>{t("Save a long-term fact")}</h3><p>{t("Only save stable information that should remain available across conversations in this project.")}</p></div></header>
+      <header><div><h3>{t("Save a long-term fact")}</h3><p>{t(scope === "user" ? "User memories are injected into every conversation without retrieval." : "Conversation memories are isolated and retrieved only when relevant.")}</p></div></header>
       <textarea value={fact} onChange={(event) => setFact(event.target.value)} placeholder={t("For example: Tests run with pytest and require Python 3.10.")} rows={3} disabled={controlsDisabled} />
       <footer><small>{t("Duplicate facts are ignored by the Runtime.")}</small><button className="primary-button" onClick={() => void saveFact()} disabled={controlsDisabled || !fact.trim()}>{t(working === "Save memory" ? "Saving..." : "Save memory")}</button></footer>
     </section>
@@ -1009,11 +1022,10 @@ export function MemoryManagementForm({ language, snapshot, runtimeOnline, busy, 
       <button className="secondary-button danger-button" onClick={() => void clearMemory()} disabled={controlsDisabled || snapshot.count === 0}>{t("Clear all")}</button>
     </div>
     <div className="management-card-list memory-list">
-      {entries.length === 0 && <div className="management-empty">{t(normalizedFilter ? "No memory matches this filter." : "No long-term facts are saved for this project.")}</div>}
+      {entries.length === 0 && <div className="management-empty">{t(normalizedFilter ? "No memory matches this filter." : "No long-term facts are saved in this scope.")}</div>}
       {entries.map((entry) => <article className="management-card memory-card" key={entry.id}>
-        <header><div><strong>{t(entry.type.toLowerCase())}</strong><small>{formatMemoryTimestamp(entry.timestamp, language)}</small></div><span>{t("{count} tokens", { count: entry.token_count })}</span></header>
+        <header><div><strong>{t(entry.status)}</strong><small>{formatMemoryTimestamp(entry.updated_at, language)}</small></div><span>{t("{count} dimensions", { count: entry.embedding.length })}</span></header>
         <p>{entry.content}</p>
-        {Object.keys(entry.metadata).length > 0 && <small>{Object.entries(entry.metadata).map(([key, value]) => `${key}: ${value}`).join(" · ")}</small>}
         <footer><code>{entry.id}</code><button className="secondary-button danger-button" onClick={() => void deleteMemory(entry.id, entry.content)} disabled={controlsDisabled}>{t("Delete")}</button></footer>
       </article>)}
     </div>
@@ -1021,8 +1033,8 @@ export function MemoryManagementForm({ language, snapshot, runtimeOnline, busy, 
       <summary>{t("View {count} memory storage warnings", { count: snapshot.warnings.length })}</summary>
       <pre>{snapshot.warnings.join("\n")}</pre>
     </details>}
-    <PathRow label={t("Project memory file")} path={snapshot.storage_path} t={t} />
-    <p className={`mcp-notice ${noticeIsError ? "error" : ""}`}>{notice || t(!runtimeOnline ? "Python Runtime must be online to manage memory." : "Memory changes apply immediately to every loaded conversation in this project.")}</p>
+    <PathRow label={t(scope === "user" ? "User memory file" : "Conversation memory file")} path={snapshot.storage_path} t={t} />
+    <p className={`mcp-notice ${noticeIsError ? "error" : ""}`}>{notice || t(!runtimeOnline ? "Python Runtime must be online to manage memory." : scope === "user" ? "User memory changes apply immediately across loaded projects and conversations." : "Conversation memory changes only apply to the current conversation.")}</p>
   </SettingsSectionView>;
 }
 
@@ -1430,7 +1442,27 @@ function NumberSetting({ label, description, value, min, max, suffix, onChange }
   };
   return <SettingsRow label={label} description={description}><label className="number-control"><input type="number" min={min} max={max} step={1} value={value} onInput={(event) => updateValue(event.currentTarget)} onChange={(event) => updateValue(event.currentTarget)} />{suffix && <span>{suffix}</span>}</label></SettingsRow>;
 }
-function PathRow({ label, path, t }: { label: string; path: string; t: ReturnType<typeof translator> }) { return <SettingsRow label={label} description={path || t("Not available until a project is open.")}><button className="secondary-button" onClick={() => void revealItemInDir(path)} disabled={!path}>{t("Reveal")}</button></SettingsRow>; }
+function PathRow({ label, path, t }: { label: string; path: string; t: ReturnType<typeof translator> }) {
+  const [revealing, setRevealing] = useState(false);
+  const [revealError, setRevealError] = useState("");
+
+  async function revealPath() {
+    if (!path || revealing) return;
+    setRevealing(true);
+    setRevealError("");
+    try {
+      await revealItemInDir(path);
+    } catch (error) {
+      setRevealError(t("Reveal failed: {error}", { error: String(error) }));
+    } finally {
+      setRevealing(false);
+    }
+  }
+
+  return <SettingsRow label={label} description={revealError || path || t("Not available until a project is open.")}>
+    <button className="secondary-button" onClick={() => void revealPath()} disabled={!path || revealing}>{t(revealing ? "Opening..." : "Reveal")}</button>
+  </SettingsRow>;
+}
 function settingsIcon(section: SettingsSection) { return { general: "◎", appearance: "◐", models: "◇", agent: "✦", prompt: "P", memory: "M", skills: "S", mcp: "⌘", browser: "B", rag: "⌕", diagnostics: "⚙" }[section]; }
 function settingsSectionLabel(section: SettingsSection) { return { general: "General", appearance: "Appearance", models: "Models", agent: "Agent", prompt: "Prompt", memory: "Memory", skills: "Skills", mcp: "MCP Servers", browser: "Browser", rag: "Code RAG", diagnostics: "Data & Diagnostics" }[section]; }
 function abbreviateText(value: string, limit: number) { return value.length <= limit ? value : `${value.slice(0, limit)}...`; }
@@ -1449,9 +1481,10 @@ function skillUpgradeDescription(state: NonNullable<SkillSnapshot["skills"][numb
     error: "StellarCode could not verify this built-in Skill's upgrade state.",
   }[state];
 }
-function formatMemoryTimestamp(timestamp: number, language: AppSettings["general"]["language"]) {
-  const milliseconds = timestamp > 10_000_000_000 ? timestamp : timestamp * 1000;
-  const date = new Date(milliseconds);
+function formatMemoryTimestamp(timestamp: string | number, language: AppSettings["general"]["language"]) {
+  const date = typeof timestamp === "number"
+    ? new Date(timestamp > 10_000_000_000 ? timestamp : timestamp * 1000)
+    : new Date(timestamp);
   return Number.isNaN(date.getTime()) ? "" : date.toLocaleString(language);
 }
 function translateActionLabel(label: string, t: ReturnType<typeof translator>) {

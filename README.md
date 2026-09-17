@@ -235,6 +235,7 @@ Sidecar 启动后会等待 JSONL 协议输入，因此没有普通 CLI 提示符
 `swebench-agent` 用于在外部 runner 已准备好的干净仓库中执行单道 SWE-bench 任务。
 它允许仓库内代码读写和有限时长的命令执行，但不加载 Web、MCP 或 Memory 工具；题目
 文件与结果文件必须位于仓库工作区之外，防止混入最终 Git patch。
+模型调用使用流式响应，SWE-bench 专用读取超时为 180 秒。
 
 ```powershell
 .\.venv\Scripts\python.exe -m stellarcode.cli swebench-agent `

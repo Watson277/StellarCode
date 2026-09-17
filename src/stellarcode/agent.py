@@ -43,6 +43,7 @@ from stellarcode.prompt import (
     runtime_context,
     strip_internal_context_metadata,
     untrusted_context_message,
+    without_context_messages,
 )
 from stellarcode.skill import (
     SkillContextBuffer,
@@ -451,6 +452,10 @@ class Agent:
             publish_prompt_snapshot(self.llm_client, self._last_prompt_snapshot)
 
         if include_memory_context:
+            self.messages = without_context_messages(
+                self.messages,
+                [ContextKind.RETRIEVED_MEMORY],
+            )
             self.messages.extend(assembly.context_messages)
 
     def prompt_snapshot(self, *, include_sensitive: bool = False) -> dict[str, Any]:

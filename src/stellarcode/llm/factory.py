@@ -9,12 +9,16 @@ from stellarcode.llm.environment import first_env
 from stellarcode.llm.vision_router import VisionRoutingClient
 
 
-def create_chat_client() -> OpenAICompatibleClient | VisionRoutingClient:
+def create_chat_client(
+    *,
+    timeout_seconds: float = 120.0,
+) -> OpenAICompatibleClient | VisionRoutingClient:
     text = _text_configuration()
     primary = OpenAICompatibleClient(
         api_key=text["api_key"],
         base_url=text["base_url"],
         model=text["model"],
+        timeout_seconds=timeout_seconds,
         role_name="llm",
     )
     vision = _vision_configuration()
@@ -29,6 +33,7 @@ def create_chat_client() -> OpenAICompatibleClient | VisionRoutingClient:
         base_url=vision["base_url"],
         model=vision["model"],
         supports_images=True,
+        timeout_seconds=timeout_seconds,
         role_name="vision",
     )
     return VisionRoutingClient(primary, vision_client)

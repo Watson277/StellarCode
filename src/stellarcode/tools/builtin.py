@@ -6,6 +6,8 @@ model cannot bypass modification protection by choosing a different built-in too
 
 from __future__ import annotations
 
+import json
+import locale
 import os
 import re
 import signal
@@ -835,10 +837,7 @@ def _execute_command(
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            text=True,
             shell=False,
-            encoding="utf-8",
-            errors="replace",
             creationflags=creation_flags,
             **popen_options,
         )
@@ -851,7 +850,9 @@ def _execute_command(
         remaining = deadline - time.monotonic()
         if cancelled or remaining <= 0:
             _terminate_process_tree(process)
-            stdout, stderr = _collect_terminated_process(process)
+            stdout_bytes, stderr_bytes = _collect_terminated_process(process)
+            stdout = _decode_command_output(stdout_bytes)
+            stderr = _decode_command_output(stderr_bytes)
             detail = _partial_command_output(stdout, stderr)
             if cancelled:
                 if tool_cancellation_reason() == "task":
@@ -864,7 +865,9 @@ def _execute_command(
                 message += f" Partial output:\n{detail}"
             raise ToolExecutionError(message)
         try:
-            stdout, stderr = process.communicate(timeout=min(0.1, remaining))
+            stdout_bytes, stderr_bytes = process.communicate(timeout=min(0.1, remaining))
+            stdout = _decode_command_output(stdout_bytes)
+            stderr = _decode_command_output(stderr_bytes)
             break
         except subprocess.TimeoutExpired:
             continue
@@ -917,7 +920,7 @@ def _tool_process_environment() -> dict[str, str]:
     return environment
 
 
-def _terminate_process_tree(process: subprocess.Popen[str]) -> None:
+def _terminate_process_tree(process: subprocess.Popen[bytes]) -> None:
     if process.poll() is not None:
         return
     if os.name == "nt":
@@ -947,8 +950,8 @@ def _terminate_process_tree(process: subprocess.Popen[str]) -> None:
 
 
 def _collect_terminated_process(
-    process: subprocess.Popen[str],
-) -> tuple[str, str]:
+    process: subprocess.Popen[bytes],
+) -> tuple[bytes | str, bytes | str]:
     try:
         return process.communicate(timeout=5)
     except subprocess.TimeoutExpired:
@@ -981,9 +984,42 @@ def _normalize_command(command: str | list[str]) -> list[str]:
     command = command.strip()
     if not command:
         return []
+    if command.startswith("["):
+        try:
+            parsed = json.loads(command)
+        except json.JSONDecodeError:
+            parsed = None
+        if isinstance(parsed, list) and parsed and all(isinstance(part, str) for part in parsed):
+            return parsed
     if os.name == "nt":
         return ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", command]
     return ["/bin/sh", "-lc", command]
+
+
+def _decode_command_output(output: bytes | str | None) -> str:
+    if output is None:
+        return ""
+    if isinstance(output, str):
+        return output
+    if not output:
+        return ""
+    if output.startswith((b"\xff\xfe", b"\xfe\xff")):
+        return output.decode("utf-16", errors="replace")
+
+    encodings = ["utf-8", locale.getpreferredencoding(False)]
+    if os.name == "nt":
+        encodings.extend(["mbcs", "gb18030"])
+    seen: set[str] = set()
+    for encoding in encodings:
+        normalized = encoding.lower()
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        try:
+            return output.decode(encoding, errors="strict")
+        except (LookupError, UnicodeDecodeError):
+            continue
+    return output.decode("utf-8", errors="replace")
 
 
 def _truncate_command_output(output: str) -> str:

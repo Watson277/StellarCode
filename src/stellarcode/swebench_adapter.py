@@ -8,6 +8,7 @@ tools to one Agent invocation and never receives gold patches or test metadata.
 from __future__ import annotations
 
 import argparse
+import ctypes
 import json
 import os
 import re
@@ -41,6 +42,7 @@ ALLOWED_TOOL_NAMES = frozenset(
     }
 )
 PATH_TOOL_NAMES = ALLOWED_TOOL_NAMES - {"execute_command"}
+SWEBENCH_LLM_TIMEOUT_SECONDS = 180.0
 SWEBENCH_SYSTEM_PROMPT = """You are StellarCode running a SWE-bench evaluation.
 
 Resolve the supplied software issue in the current repository. Inspect the code, make the
@@ -105,7 +107,7 @@ class SweBenchAgentOptions:
 def run_swebench_agent(
     options: SweBenchAgentOptions,
     *,
-    client_factory: Callable[[], Any] = create_chat_client,
+    client_factory: Callable[[], Any] | None = None,
 ) -> dict[str, Any]:
     started_at = datetime.now(timezone.utc)
     started_monotonic = time.monotonic()
@@ -115,7 +117,11 @@ def run_swebench_agent(
         prompt = options.prompt_file.read_text(encoding="utf-8")
         if not prompt.strip():
             raise ValueError(f"prompt file is empty: {options.prompt_file}")
-        client = client_factory()
+        client = (
+            client_factory()
+            if client_factory is not None
+            else create_chat_client(timeout_seconds=SWEBENCH_LLM_TIMEOUT_SECONDS)
+        )
         model_name = str(getattr(client, "model", "unknown"))
         agent = Agent(
             llm_client=client,
@@ -124,7 +130,7 @@ def run_swebench_agent(
             max_iterations=options.max_iterations,
             temperature=options.temperature,
             workspace=options.workspace,
-            stream_output=False,
+            stream_output=True,
             progress_callback=lambda _message: None,
             event_callback=lambda event, data: events.append({"event": event, "data": data}),
         )
@@ -250,6 +256,18 @@ def _benchmark_command_environment() -> dict[str, str]:
     return environment
 
 
+def _protect_process_secrets() -> None:
+    """Prevent repository commands from reading the Agent's model key via procfs."""
+
+    if not sys.platform.startswith("linux"):
+        return
+    pr_set_dumpable = 4
+    libc = ctypes.CDLL(None, use_errno=True)
+    if libc.prctl(pr_set_dumpable, 0, 0, 0, 0) != 0:
+        error_number = ctypes.get_errno()
+        raise OSError(error_number, os.strerror(error_number))
+
+
 def _positive_int(value: str) -> int:
     parsed = int(value)
     if parsed < 1:
@@ -276,6 +294,7 @@ def _write_json_atomically(path: Path, payload: dict[str, Any]) -> None:
 
 def main(argv: list[str] | None = None) -> int:
     load_dotenv()
+    _protect_process_secrets()
     try:
         options = SweBenchAgentOptions.parse(sys.argv[1:] if argv is None else argv)
     except SystemExit as exc:

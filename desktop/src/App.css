@@ -535,6 +535,19 @@ button { border: 0; }
 .composer textarea::selection { background: color-mix(in srgb, var(--accent) 35%, transparent); }
 .composer-input-layer:has(textarea:disabled) .composer-input-highlight { opacity: .55; }
 .composer-footer { display: flex; align-items: center; gap: 8px; min-height: 37px; padding: 3px 6px 6px 10px; }
+.memory-extract-button.active { color: var(--accent); }
+.memory-extraction-status { display: flex; align-items: center; gap: 9px; margin: 7px 8px 2px; padding: 8px 10px; border: 1px solid var(--border); border-radius: 6px; background: color-mix(in srgb, var(--panel) 86%, var(--accent) 14%); color: var(--text); }
+.memory-extraction-status > div { min-width: 0; display: grid; gap: 2px; }
+.memory-extraction-status strong { font-size: 10px; font-weight: 650; }
+.memory-extraction-status small { color: var(--text-soft); font-size: 9px; overflow-wrap: anywhere; }
+.memory-extraction-status.failed { border-color: color-mix(in srgb, var(--danger) 52%, var(--border)); }
+.memory-extraction-status.failed strong { color: var(--danger); }
+.memory-extraction-status > button { margin-left: auto; border: 0; background: transparent; color: var(--text-faint); cursor: pointer; font-size: 14px; line-height: 1; }
+.memory-extraction-dot { width: 7px; height: 7px; flex: 0 0 auto; border-radius: 50%; background: var(--good); }
+.memory-extraction-status.starting .memory-extraction-dot,
+.memory-extraction-status.extracting .memory-extraction-dot { background: var(--accent); box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 18%, transparent); animation: memory-pulse 1.3s ease-in-out infinite; }
+.memory-extraction-status.failed .memory-extraction-dot { background: var(--danger); }
+@keyframes memory-pulse { 0%, 100% { opacity: .45; } 50% { opacity: 1; } }
 .trace-toggle { padding: 4px 8px; border: 1px solid var(--border); border-radius: 4px; background: var(--surface-input); color: var(--text-faint); cursor: pointer; font-size: 10px; }
 .trace-toggle:hover:not(:disabled) { color: var(--text); border-color: var(--accent); }
 .trace-toggle.active { border-color: #41684f; background: #1d3326; color: var(--text); }
@@ -750,6 +763,11 @@ button { border: 0; }
 .management-summary > div > strong { overflow: hidden; color: var(--text); font-size: 10px; text-overflow: ellipsis; white-space: nowrap; }
 .management-summary > button { align-self: center; }
 .management-summary .management-summary-actions { display: flex; align-items: center; gap: 6px; padding: 0; border: 0; background: transparent; }
+.settings-segmented { display: inline-flex; width: fit-content; gap: 2px; padding: 3px; border: 1px solid var(--border); border-radius: 7px; background: var(--surface-input); }
+.settings-segmented button { min-height: 28px; padding: 0 12px; border-radius: 5px; background: transparent; color: var(--text-faint); cursor: pointer; font-size: 10px; }
+.settings-segmented button:hover:not(:disabled) { color: var(--text); }
+.settings-segmented button.active { background: var(--accent-soft); color: var(--text-heading); box-shadow: inset 0 0 0 1px var(--accent); }
+.settings-segmented button:disabled { cursor: default; opacity: .55; }
 .management-composer, .management-callout { margin: 13px 0; overflow: hidden; border: 1px solid var(--border); border-radius: 7px; background: var(--surface-input); }
 .management-composer > header, .management-callout { padding: 12px 13px; }
 .management-composer h3, .management-callout strong { margin: 0 0 4px; color: var(--text); font-size: 11px; }

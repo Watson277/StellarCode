@@ -410,7 +410,8 @@ def main() -> None:
     console.print("Type /plan for Plan-and-Execute or /team for one Multi-Agent task.")
     console.print("Type /react to return to ReAct, /clear to reset the current context.")
     console.print(
-        "Type /memory for memory status, /save <fact> to persist, /recall <query> to search."
+        "Type /memory for memory status, /save --user <fact> or "
+        "/save --conversation <fact> to persist, /recall <query> to search."
     )
     console.print("Type /index, /search <query>, or /graph <name> for code RAG.")
     ready_mcp = sum(server.status == McpServerStatus.READY for server in mcp_manager.servers())
@@ -508,9 +509,18 @@ def main() -> None:
             )
             continue
         if user_input.startswith("/save "):
-            fact = user_input.removeprefix("/save ").strip()
-            entry = memory_manager.save_fact(fact)
-            console.print(f"saved to long-term memory: {entry.content}")
+            value = user_input.removeprefix("/save ").strip()
+            if value.startswith("--user "):
+                scope = "user"
+                fact = value.removeprefix("--user ").strip()
+            elif value.startswith("--conversation "):
+                scope = "conversation"
+                fact = value.removeprefix("--conversation ").strip()
+            else:
+                scope = "conversation"
+                fact = value
+            entry = memory_manager.save_fact(fact, scope=scope)
+            console.print(f"saved to {scope} long-term memory: {entry.content}")
             continue
         if user_input.startswith("/recall "):
             query = user_input.removeprefix("/recall ").strip()
@@ -520,7 +530,10 @@ def main() -> None:
             else:
                 console.print(
                     "\n".join(
-                        f"- {entry.id} [{entry.type.value}] {entry.content}" for entry in results
+                        f"- {entry.id} "
+                        f"[{getattr(getattr(entry, 'type', None), 'value', 'LONG_TERM')}] "
+                        f"{entry.content}"
+                        for entry in results
                     )
                 )
             continue

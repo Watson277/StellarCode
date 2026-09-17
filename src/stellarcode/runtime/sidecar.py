@@ -20,6 +20,7 @@ from typing import Any
 from stellarcode import __version__
 from stellarcode.cancellation import TaskCancelledError
 from stellarcode.mcp import McpServerConfig
+from stellarcode.memory import LongTermMemory
 from stellarcode.rag.index import is_indexable_file
 from stellarcode.protection import WorkspaceProtectionError, WorkspaceRollbackConflict
 from stellarcode.runtime.attachments import PreparedAttachments
@@ -74,6 +75,7 @@ class SidecarServer:
         self.project_active_sessions: dict[str, str] = {}
         self.rag_jobs: dict[str, str] = {}
         self.diagnostics_jobs: dict[str, str] = {}
+        self.memory_extraction_jobs: dict[tuple[str, str], str] = {}
         self.diagnostics_cancel_events: dict[str, threading.Event] = {}
         self.active_task_id: str | None = None
         self.active_session_id: str | None = None
@@ -82,6 +84,11 @@ class SidecarServer:
         self._diagnostics_cancel_event: threading.Event | None = None
         self._rag_lock = threading.RLock()
         self._diagnostics_lock = threading.RLock()
+        self._memory_extraction_lock = threading.RLock()
+        root_data_dir = self.data_dir or (Path.home() / ".stellarcode" / "desktop-runtime")
+        # One process-wide object owns the user memory file. All project runtimes receive
+        # this same instance, so loaded conversations never keep divergent user copies.
+        self.user_memory = LongTermMemory(root_data_dir / "memory" / "user")
         self.runtime_options = {
             "max_iterations": max_iterations,
             "max_parallel_tools": max_parallel_tools,
@@ -128,6 +135,7 @@ class SidecarServer:
                     "rag_management",
                     "rag_multi_source_index",
                     "memory_management",
+                    "explicit_memory_extraction",
                     "skill_management",
                     "browser_management",
                     "workspace_diagnostics",
@@ -221,6 +229,8 @@ class SidecarServer:
                 self._delete_memory(request_id, params)
             elif method == "memory.clear":
                 self._clear_memory(request_id, params)
+            elif method == "memory.extract":
+                self._start_memory_extraction(request_id, params)
             elif method == "skill.list":
                 self._list_skills(request_id, params)
             elif method == "skill.get":
@@ -334,6 +344,7 @@ class SidecarServer:
                 ),
                 emit_runtime_event,
                 event_journal=event_journal,
+                user_memory=self.user_memory,
             )
             runtime_holder["runtime"] = runtime
             self.runtimes[project_id] = runtime
@@ -438,9 +449,15 @@ class SidecarServer:
     def _close_workspace(self, request_id: str, params: dict[str, Any]) -> None:
         runtime = self._require_runtime(params)
         project_id = self._runtime_project_id(runtime)
-        if self._project_has_active_tasks(project_id) or self.rag_jobs.get(project_id) or self.diagnostics_jobs.get(project_id):
+        if (
+            self._project_has_active_tasks(project_id)
+            or self.rag_jobs.get(project_id)
+            or self.diagnostics_jobs.get(project_id)
+            or self._project_has_memory_extraction(project_id)
+        ):
             raise RuntimeError(
-                "cannot close workspace while a task, RAG index, or diagnostics run is active"
+                "cannot close workspace while a task, RAG index, diagnostics run, or "
+                "memory extraction is active"
             )
         emitter = self.project_emitters.get(project_id) or self.events
         was_current = self.runtime is runtime
@@ -618,6 +635,14 @@ class SidecarServer:
             if session_id in self.session_tasks:
                 self._error(request_id, "task_busy", "this conversation already has a running task")
                 return
+            with self._memory_extraction_lock:
+                if any(key[1] == session_id for key in self.memory_extraction_jobs):
+                    self._error(
+                        request_id,
+                        "task_busy",
+                        "wait for this conversation's memory extraction to finish",
+                    )
+                    return
             if self.rag_jobs.get(runtime.project_id):
                 self._error(request_id, "task_busy", "the project RAG index is being rebuilt")
                 return
@@ -1079,30 +1104,149 @@ class SidecarServer:
 
     def _list_memory(self, request_id: str, params: dict[str, Any]) -> None:
         runtime = self._require_runtime(params)
+        scope = _memory_scope(params.get("scope"))
+        session_id = _memory_session_id(params.get("session_id"), scope)
         query = _optional_bounded_string(params.get("query"), "query", 2_048)
         limit = _bounded_int(params.get("limit", 200), "limit", 1, 500)
         self.writer(
-            response(request_id, result=runtime.memory_snapshot(query=query, limit=limit))
+            response(
+                request_id,
+                result=runtime.memory_snapshot(
+                    session_id,
+                    scope=scope,
+                    query=query,
+                    limit=limit,
+                ),
+            )
         )
 
     def _save_memory(self, request_id: str, params: dict[str, Any]) -> None:
         runtime = self._require_runtime(params)
         self._assert_idle(runtime)
+        scope = _memory_scope(params.get("scope"))
+        session_id = _memory_session_id(params.get("session_id"), scope)
         content = _bounded_string(params.get("content"), "content", 10_000)
-        self.writer(response(request_id, result=runtime.save_memory(content)))
+        self.writer(
+            response(
+                request_id,
+                result=runtime.save_memory(session_id, content, scope=scope),
+            )
+        )
 
     def _delete_memory(self, request_id: str, params: dict[str, Any]) -> None:
         runtime = self._require_runtime(params)
         self._assert_idle(runtime)
+        scope = _memory_scope(params.get("scope"))
+        session_id = _memory_session_id(params.get("session_id"), scope)
         entry_id = _bounded_string(params.get("id"), "id", 128)
-        self.writer(response(request_id, result=runtime.delete_memory(entry_id)))
+        self.writer(
+            response(
+                request_id,
+                result=runtime.delete_memory(session_id, entry_id, scope=scope),
+            )
+        )
 
     def _clear_memory(self, request_id: str, params: dict[str, Any]) -> None:
         runtime = self._require_runtime(params)
         self._assert_idle(runtime)
         if params.get("confirmed") is not True:
-            raise ValueError("confirmed=true is required before clearing project memory")
-        self.writer(response(request_id, result=runtime.clear_memory()))
+            raise ValueError("confirmed=true is required before clearing memory")
+        scope = _memory_scope(params.get("scope"))
+        session_id = _memory_session_id(params.get("session_id"), scope)
+        self.writer(
+            response(
+                request_id,
+                result=runtime.clear_memory(session_id, scope=scope),
+            )
+        )
+
+    def _start_memory_extraction(
+        self,
+        request_id: str,
+        params: dict[str, Any],
+    ) -> None:
+        runtime = self._require_runtime(params)
+        session_id = _bounded_string(params.get("session_id"), "session_id", 256)
+        project_id = self._runtime_project_id(runtime)
+        key = (project_id, session_id)
+        already_running = False
+        # Register under the same task->memory lock order used by task.submit. This
+        # closes the race where a task and an extraction could both pass separate idle
+        # checks and begin concurrently for the same conversation.
+        with self._task_lock:
+            if session_id in self.session_tasks:
+                raise RuntimeError("wait for this conversation task to finish")
+            with self._memory_extraction_lock:
+                if key in self.memory_extraction_jobs:
+                    job_id = self.memory_extraction_jobs[key]
+                    already_running = True
+                else:
+                    job_id = f"memory-{uuid.uuid4().hex}"
+                    self.memory_extraction_jobs[key] = job_id
+                pending_count = runtime.pending_memory_extraction_count(session_id)
+        self.writer(
+            response(
+                request_id,
+                result={
+                    "job_id": job_id,
+                    "status": "extracting",
+                    "pending_message_count": pending_count,
+                },
+            )
+        )
+        if already_running:
+            return
+        threading.Thread(
+            target=self._run_memory_extraction,
+            args=(runtime, session_id, job_id),
+            name="stellarcode-memory-extraction",
+            daemon=True,
+        ).start()
+
+    def _run_memory_extraction(
+        self,
+        runtime: RuntimeSession,
+        session_id: str,
+        job_id: str,
+    ) -> None:
+        project_id = self._runtime_project_id(runtime)
+        pending_count = runtime.pending_memory_extraction_count(session_id)
+        self._emit_event(
+            "memory.extraction.started",
+            {"job_id": job_id, "pending_message_count": pending_count},
+            session_id=session_id,
+        )
+        try:
+            result = runtime.extract_conversation_memory(session_id)
+            # Candidate facts and entry ids remain in the local memory stores. Only
+            # bounded counters enter the durable event journal.
+            event_result = {
+                key: value for key, value in result.items() if key != "results"
+            }
+            self._finish_memory_extraction(project_id, session_id, job_id)
+            self._emit_event(
+                "memory.extraction.completed",
+                {"job_id": job_id, **event_result},
+                session_id=session_id,
+            )
+        except Exception as exc:
+            self._finish_memory_extraction(project_id, session_id, job_id)
+            self._emit_event(
+                "memory.extraction.failed",
+                {"job_id": job_id, "message": f"{type(exc).__name__}: {exc}"},
+                session_id=session_id,
+            )
+
+    def _finish_memory_extraction(
+        self,
+        project_id: str,
+        session_id: str,
+        job_id: str,
+    ) -> None:
+        key = (project_id, session_id)
+        with self._memory_extraction_lock:
+            if self.memory_extraction_jobs.get(key) == job_id:
+                self.memory_extraction_jobs.pop(key, None)
 
     def _list_skills(self, request_id: str, params: dict[str, Any]) -> None:
         runtime = self._require_runtime(params)
@@ -1776,18 +1920,29 @@ class SidecarServer:
             self._project_has_active_tasks(project_id)
             or self.rag_jobs.get(project_id)
             or self.diagnostics_jobs.get(project_id)
+            or self._project_has_memory_extraction(project_id)
         ):
             raise RuntimeError(
-                "wait for the active task, RAG index, or diagnostics run to finish"
+                "wait for the active task, RAG index, diagnostics run, or memory "
+                "extraction to finish"
             )
 
     def _assert_session_idle(self, session_id: str) -> None:
         with self._task_lock:
             if session_id in self.session_tasks:
                 raise RuntimeError("wait for this conversation task to finish")
+            with self._memory_extraction_lock:
+                if any(key[1] == session_id for key in self.memory_extraction_jobs):
+                    raise RuntimeError(
+                        "wait for this conversation's memory extraction to finish"
+                    )
 
     def _project_has_active_tasks(self, project_id: str) -> bool:
         return self.task_state.has_project_tasks(project_id)
+
+    def _project_has_memory_extraction(self, project_id: str) -> bool:
+        with self._memory_extraction_lock:
+            return any(key[0] == project_id for key in self.memory_extraction_jobs)
 
     def _runtime_project_id(self, runtime: RuntimeSession) -> str:
         """Return a stable project id for full and legacy embedded runtimes."""
@@ -2054,6 +2209,20 @@ def _optional_bounded_string(value: object, field: str, maximum: int) -> str:
     if len(result) > maximum:
         raise ValueError(f"{field} must not exceed {maximum} characters")
     return result
+
+
+def _memory_scope(value: object) -> str:
+    scope = str(value or "user").strip().lower()
+    if scope not in {"user", "conversation"}:
+        raise ValueError("scope must be user or conversation")
+    return scope
+
+
+def _memory_session_id(value: object, scope: str) -> str:
+    session_id = _optional_bounded_string(value, "session_id", 200)
+    if scope == "conversation" and not session_id:
+        raise ValueError("session_id is required for conversation memory")
+    return session_id or "default"
 
 
 def _bounded_string_list(

@@ -18,20 +18,35 @@ export type DiagnosticSeverity = "error" | "warning" | "information" | "hint";
 export interface MemoryEntryInfo {
   id: string;
   content: string;
-  type: string;
-  timestamp: number;
-  metadata: Record<string, string>;
-  token_count: number;
+  embedding: number[];
+  status: "active" | "superseded";
+  created_at: string;
+  updated_at: string;
 }
 
 export interface MemorySnapshot {
-  scope: "project";
+  scope: "user" | "conversation";
   entries: MemoryEntryInfo[];
   count: number;
   token_count: number;
   storage_path: string;
   warnings: string[];
   query?: string;
+}
+
+export interface MemoryExtractionResult {
+  processed_message_count: number;
+  fact_count: number;
+  saved_count: number;
+  ignored_count: number;
+  user_memory_count: number;
+  conversation_memory_count: number;
+}
+
+export interface MemoryExtractionAccepted {
+  job_id: string;
+  status: "extracting";
+  pending_message_count: number;
 }
 
 export interface SkillInfo {
@@ -643,6 +658,17 @@ export interface RuntimeEventDataMap {
     job_id: string;
     message: string;
   };
+  "memory.extraction.started": {
+    job_id: string;
+    pending_message_count: number;
+  };
+  "memory.extraction.completed": MemoryExtractionResult & {
+    job_id: string;
+  };
+  "memory.extraction.failed": {
+    job_id: string;
+    message: string;
+  };
   "diagnostics.started": {
     run_id: string;
     profile: "safe" | "build";
@@ -818,10 +844,30 @@ export interface RuntimeRequestDataMap {
   "rag.remove_source": ProjectScoped<{ path: string }>;
   "rag.index": ProjectRequestContext;
   "rag.clear": ProjectScoped<{ confirmed: boolean }>;
-  "memory.list": ProjectScoped<{ query?: string; limit?: number }>;
-  "memory.save": ProjectScoped<{ content: string }>;
-  "memory.delete": ProjectScoped<{ id: string }>;
-  "memory.clear": ProjectScoped<{ confirmed: boolean }>;
+  "memory.list": ProjectScoped<{
+    session_id: string;
+    scope: MemorySnapshot["scope"];
+    query?: string;
+    limit?: number;
+  }>;
+  "memory.save": ProjectScoped<{
+    session_id: string;
+    scope: MemorySnapshot["scope"];
+    content: string;
+  }>;
+  "memory.delete": ProjectScoped<{
+    session_id: string;
+    scope: MemorySnapshot["scope"];
+    id: string;
+  }>;
+  "memory.clear": ProjectScoped<{
+    session_id: string;
+    scope: MemorySnapshot["scope"];
+    confirmed: boolean;
+  }>;
+  "memory.extract": ProjectScoped<{
+    session_id: string;
+  }>;
   "skill.list": ProjectRequestContext;
   "skill.get": ProjectScoped<{ name: string }>;
   "skill.diff": ProjectScoped<{ name: string; max_chars?: number }>;
@@ -983,6 +1029,7 @@ export interface RuntimeResponseDataMap {
   "memory.save": MemorySnapshot;
   "memory.delete": MemorySnapshot;
   "memory.clear": MemorySnapshot;
+  "memory.extract": MemoryExtractionAccepted;
   "skill.list": SkillSnapshot;
   "skill.get": SkillDetail;
   "skill.diff": SkillDiff;

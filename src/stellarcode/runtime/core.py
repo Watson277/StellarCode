@@ -33,7 +33,7 @@ from stellarcode.hitl import ACCESS_MODES
 from stellarcode.llm import TokenUsage, UsageLedger, create_chat_client
 from stellarcode.llm.types import current_llm_scope, llm_runtime_scope
 from stellarcode.llm.message_history import repair_tool_message_history
-from stellarcode.memory import MemoryManager, ProjectMemoryService
+from stellarcode.memory import LongTermMemory, MemoryManager, ProjectMemoryService
 from stellarcode.mcp import (
     McpConfigError,
     McpConfigLoader,
@@ -143,6 +143,7 @@ class RuntimeSession:
         settings: RuntimeSettings,
         emit: Any,
         event_journal: EventJournal | None = None,
+        user_memory: LongTermMemory | None = None,
     ) -> None:
         self.settings = settings
         self.workspace = subprocess_safe_path(settings.workspace)
@@ -161,9 +162,13 @@ class RuntimeSession:
         self.project_data_dir = root_data_dir.resolve() / "projects" / self.project_id
         self.conversation_dir = self.project_data_dir / "conversations"
         self.conversation_dir.mkdir(parents=True, exist_ok=True)
+        self.user_memory = user_memory or LongTermMemory(
+            root_data_dir.resolve() / "memory" / "user"
+        )
         self.project_memory = ProjectMemoryService(
             self.project_data_dir / "memory",
             context_window=settings.context_window,
+            user_long_term=self.user_memory,
         )
         self.diagnostics_service = DiagnosticsService(
             self.workspace,
@@ -257,6 +262,9 @@ class RuntimeSession:
             self.trace_recorder,
             usage_callback=self._record_usage,
         )
+        self.project_memory.migrate_legacy_project_memory(
+            [path.stem for path in self.conversation_dir.glob("*.json")]
+        )
         self._load_conversations()
 
     @property
@@ -283,8 +291,20 @@ class RuntimeSession:
     def mcp_snapshot(self) -> dict[str, Any]:
         return self.mcp_manager.snapshot()
 
-    def memory_snapshot(self, query: str = "", limit: int = 200) -> dict[str, Any]:
-        return self.project_memory.snapshot(query, limit)
+    def memory_snapshot(
+        self,
+        conversation_id: str,
+        *,
+        scope: str = "user",
+        query: str = "",
+        limit: int = 200,
+    ) -> dict[str, Any]:
+        return self.project_memory.snapshot(
+            conversation_id,
+            scope=scope,
+            query=query,
+            limit=limit,
+        )
 
     def prompt_snapshot(
         self,
@@ -325,22 +345,66 @@ class RuntimeSession:
             "requested_mode": conversation.mode,
         }
 
-    def save_memory(self, content: str) -> dict[str, Any]:
-        entry, created = self.project_memory.save(content)
+    def save_memory(
+        self,
+        conversation_id: str,
+        content: str,
+        *,
+        scope: str = "user",
+    ) -> dict[str, Any]:
+        entry, created = self.project_memory.save(
+            content,
+            conversation_id=conversation_id,
+            scope=scope,
+        )
         return {
-            **self.memory_snapshot(),
+            **self.memory_snapshot(conversation_id, scope=scope),
             "entry": entry.to_dict(),
             "created": created,
         }
 
-    def delete_memory(self, entry_id: str) -> dict[str, Any]:
-        if not self.project_memory.delete(entry_id):
-            raise ValueError(f"Memory entry not found: {entry_id}")
-        return {**self.memory_snapshot(), "deleted_id": entry_id}
+    def pending_memory_extraction_count(self, conversation_id: str) -> int:
+        conversation = self._get_conversation(conversation_id)
+        return conversation.memory_manager.pending_user_message_count()
 
-    def clear_memory(self) -> dict[str, Any]:
-        self.project_memory.clear()
-        return self.memory_snapshot()
+    def extract_conversation_memory(self, conversation_id: str) -> dict[str, Any]:
+        """Explicitly extract durable memory without waiting for compression."""
+
+        conversation = self._get_conversation(conversation_id)
+        # Attribute model usage to the correct conversation even if the user switches
+        # projects while this background management job is running.
+        with llm_runtime_scope(conversation_id, ""):
+            result = conversation.memory_manager.extract_current_user_memories()
+        conversation.updated_at = _timestamp()
+        self._save_conversation(conversation)
+        return result
+
+    def delete_memory(
+        self,
+        conversation_id: str,
+        entry_id: str,
+        *,
+        scope: str = "user",
+    ) -> dict[str, Any]:
+        if not self.project_memory.delete(
+            entry_id,
+            conversation_id=conversation_id,
+            scope=scope,
+        ):
+            raise ValueError(f"Memory entry not found: {entry_id}")
+        return {
+            **self.memory_snapshot(conversation_id, scope=scope),
+            "deleted_id": entry_id,
+        }
+
+    def clear_memory(
+        self,
+        conversation_id: str,
+        *,
+        scope: str = "user",
+    ) -> dict[str, Any]:
+        self.project_memory.clear(conversation_id=conversation_id, scope=scope)
+        return self.memory_snapshot(conversation_id, scope=scope)
 
     def skill_snapshot(self) -> dict[str, Any]:
         disabled = self.skill_state_store.disabled()
@@ -693,6 +757,7 @@ class RuntimeSession:
         identifier = conversation_id or f"session-{uuid.uuid4().hex}"
         if identifier in self.conversations:
             raise ValueError(f"conversation already exists: {identifier}")
+        self.project_memory.migrate_legacy_project_memory([identifier])
         now = _timestamp()
         conversation = self._new_conversation(
             identifier,
@@ -1612,6 +1677,7 @@ class RuntimeSession:
         access_mode: str | None = None,
     ) -> ConversationRuntime:
         memory_manager = self.project_memory.create_conversation_manager(
+            identifier,
             llm_client=self.llm_client,
         )
         skill_context_buffer = SkillContextBuffer()

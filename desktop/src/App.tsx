@@ -327,6 +327,19 @@ type UsageView = UsageSnapshot & {
   task_priced_llm_calls: number;
 };
 
+type MemoryExtractionView = {
+  jobId: string;
+  status: "starting" | "extracting" | "completed" | "failed";
+  pendingMessageCount: number;
+  processedMessageCount: number;
+  factCount: number;
+  savedCount: number;
+  ignoredCount: number;
+  userMemoryCount: number;
+  conversationMemoryCount: number;
+  error?: string;
+};
+
 type ManagementRequestType = Extract<
   RuntimeRequestType,
   | `mcp.${string}`
@@ -415,7 +428,7 @@ const EMPTY_RAG_SNAPSHOT: RagSnapshot = {
 };
 
 const EMPTY_MEMORY_SNAPSHOT: MemorySnapshot = {
-  scope: "project",
+  scope: "user",
   entries: [],
   count: 0,
   token_count: 0,
@@ -469,6 +482,9 @@ const RESTORABLE_EXECUTION_EVENT_TYPES: RuntimeEvent["type"][] = [
   "team.agent.tool.completed",
   "history.compaction.started",
   "history.compaction.finished",
+  "memory.extraction.started",
+  "memory.extraction.completed",
+  "memory.extraction.failed",
   "plan.created",
   "plan.step.started",
   "plan.step.completed",
@@ -491,6 +507,20 @@ const RESTORABLE_EXECUTION_EVENT_TYPES: RuntimeEvent["type"][] = [
 
 function requestId(prefix: string) {
   return `${prefix}-${crypto.randomUUID()}`;
+}
+
+function emptyMemoryExtractionView(): MemoryExtractionView {
+  return {
+    jobId: "",
+    status: "starting",
+    pendingMessageCount: 0,
+    processedMessageCount: 0,
+    factCount: 0,
+    savedCount: 0,
+    ignoredCount: 0,
+    userMemoryCount: 0,
+    conversationMemoryCount: 0,
+  };
 }
 
 /** Coordinates project/session UI, Runtime RPC, replay barriers, and transient overlays. */
@@ -544,6 +574,7 @@ function App() {
   const [mcpSnapshot, setMcpSnapshot] = useState<McpSnapshot>(EMPTY_MCP_SNAPSHOT);
   const [ragSnapshot, setRagSnapshot] = useState<RagSnapshot>(EMPTY_RAG_SNAPSHOT);
   const [memorySnapshot, setMemorySnapshot] = useState<MemorySnapshot>(EMPTY_MEMORY_SNAPSHOT);
+  const [memoryExtractions, setMemoryExtractions] = useState<Record<string, MemoryExtractionView>>({});
   const [skillSnapshot, setSkillSnapshot] = useState<SkillSnapshot>(EMPTY_SKILL_SNAPSHOT);
   const [browserSnapshot, setBrowserSnapshot] = useState<BrowserSnapshot>(EMPTY_BROWSER_SNAPSHOT);
   const [diagnosticsSnapshot, setDiagnosticsSnapshot] = useState<DiagnosticsSnapshot>(EMPTY_DIAGNOSTICS_SNAPSHOT);
@@ -585,6 +616,9 @@ function App() {
   );
   const cancelling = selectActiveTaskCancelling(runtimeControl);
   const replayingConversation = selectConversationReplaying(runtimeControl);
+  const activeMemoryExtraction = sessionId ? memoryExtractions[sessionId] : undefined;
+  const memoryExtracting = activeMemoryExtraction?.status === "starting"
+    || activeMemoryExtraction?.status === "extracting";
 
   function tx(message: string, values?: TranslationValues) {
     return translate(languageRef.current, message, values);
@@ -1486,6 +1520,54 @@ function App() {
       if (workspaceEventProject && workspaceEventProject !== projectIdRef.current) return;
       const isConversationEvent = message.session_id !== "runtime" && !workspaceEventProject;
       const isActiveConversationEvent = message.session_id === activeConversationIdRef.current;
+      // Memory extraction is a conversation-scoped background management job. Project
+      // it before the inactive-conversation early return so switching chats never loses
+      // its completion/failure state.
+      if (message.type === "memory.extraction.started") {
+        setMemoryExtractions((current) => ({
+          ...current,
+          [message.session_id]: {
+            jobId: message.data.job_id,
+            status: replaying ? "failed" : "extracting",
+            pendingMessageCount: message.data.pending_message_count,
+            processedMessageCount: 0,
+            factCount: 0,
+            savedCount: 0,
+            ignoredCount: 0,
+            userMemoryCount: 0,
+            conversationMemoryCount: 0,
+            error: replaying
+              ? tx("Memory extraction was interrupted before completion. Retry it.")
+              : undefined,
+          },
+        }));
+      } else if (message.type === "memory.extraction.completed") {
+        setMemoryExtractions((current) => ({
+          ...current,
+          [message.session_id]: {
+            jobId: message.data.job_id,
+            status: "completed",
+            pendingMessageCount: current[message.session_id]?.pendingMessageCount
+              ?? message.data.processed_message_count,
+            processedMessageCount: message.data.processed_message_count,
+            factCount: message.data.fact_count,
+            savedCount: message.data.saved_count,
+            ignoredCount: message.data.ignored_count,
+            userMemoryCount: message.data.user_memory_count,
+            conversationMemoryCount: message.data.conversation_memory_count,
+          },
+        }));
+      } else if (message.type === "memory.extraction.failed") {
+        setMemoryExtractions((current) => ({
+          ...current,
+          [message.session_id]: {
+            ...(current[message.session_id] ?? emptyMemoryExtractionView()),
+            jobId: message.data.job_id,
+            status: "failed",
+            error: message.data.message,
+          },
+        }));
+      }
       if (isConversationEvent && !isActiveConversationEvent && !replaying) {
         // Background conversations keep running, but their transcript is
         // reconstructed from the durable snapshot+journal only when opened.
@@ -2459,6 +2541,11 @@ function App() {
         const deletedSessionId = sessionDeleteTargetId.current;
         sessionDeleteTargetId.current = "";
         if (deletedSessionId) sessionDraftStore.delete(deletedSessionId);
+        if (deletedSessionId) setMemoryExtractions((current) => {
+          const next = { ...current };
+          delete next[deletedSessionId];
+          return next;
+        });
         const deletedActiveConversation = deletedSessionId === activeConversationIdRef.current;
         if (deletedActiveConversation) {
           setSessionId("");
@@ -2755,8 +2842,14 @@ function App() {
     return next;
   }
 
-  async function refreshMemorySnapshot(query = "") {
-    const next = await requestManagement("memory.list", { query, limit: 500 });
+  async function refreshMemorySnapshot(scope: MemorySnapshot["scope"] = "user", query = "") {
+    if (scope === "conversation" && !sessionId) throw new Error(t("Create or open a conversation first."));
+    const next = await requestManagement("memory.list", {
+      session_id: sessionId || "default",
+      scope,
+      query,
+      limit: 500,
+    });
     setMemorySnapshot(next);
     return next;
   }
@@ -2769,22 +2862,78 @@ function App() {
     });
   }
 
-  async function saveMemory(content: string) {
-    const next = await requestManagement("memory.save", { content });
+  async function saveMemory(content: string, scope: MemorySnapshot["scope"]) {
+    if (scope === "conversation" && !sessionId) throw new Error(t("Create or open a conversation first."));
+    const next = await requestManagement("memory.save", {
+      session_id: sessionId || "default",
+      scope,
+      content,
+    });
     setMemorySnapshot(next);
     return next;
   }
 
-  async function deleteMemory(id: string) {
-    const next = await requestManagement("memory.delete", { id });
+  async function deleteMemory(id: string, scope: MemorySnapshot["scope"]) {
+    if (scope === "conversation" && !sessionId) throw new Error(t("Create or open a conversation first."));
+    const next = await requestManagement("memory.delete", {
+      session_id: sessionId || "default",
+      scope,
+      id,
+    });
     setMemorySnapshot(next);
     return next;
   }
 
-  async function clearMemory(confirmed: boolean) {
-    const next = await requestManagement("memory.clear", { confirmed });
+  async function clearMemory(confirmed: boolean, scope: MemorySnapshot["scope"]) {
+    if (scope === "conversation" && !sessionId) throw new Error(t("Create or open a conversation first."));
+    const next = await requestManagement("memory.clear", {
+      session_id: sessionId || "default",
+      scope,
+      confirmed,
+    });
     setMemorySnapshot(next);
     return next;
+  }
+
+  async function extractConversationMemory() {
+    const targetSessionId = sessionId;
+    if (!targetSessionId || memoryExtracting || busy) return;
+    setMemoryExtractions((current) => ({
+      ...current,
+      [targetSessionId]: emptyMemoryExtractionView(),
+    }));
+    try {
+      const targetProjectId = sessionProjectIds.current.get(targetSessionId)
+        ?? projectIdRef.current;
+      const accepted = await runtimeClient.request("memory.extract", {
+        session_id: targetSessionId,
+        project_id: targetProjectId,
+      }, {
+        scope: `management:${targetProjectId}:session:${targetSessionId}:memory.extract`,
+        timeoutMs: 30_000,
+      });
+      setMemoryExtractions((current) => ({
+        ...current,
+        [targetSessionId]: current[targetSessionId]?.status === "completed"
+          || current[targetSessionId]?.status === "failed"
+          ? current[targetSessionId]
+          : {
+              ...(current[targetSessionId] ?? emptyMemoryExtractionView()),
+              jobId: accepted.job_id,
+              status: "extracting",
+              pendingMessageCount: accepted.pending_message_count,
+            },
+      }));
+    } catch (error) {
+      setMemoryExtractions((current) => ({
+        ...current,
+        [targetSessionId]: {
+          ...(current[targetSessionId] ?? emptyMemoryExtractionView()),
+          status: "failed",
+          error: error instanceof Error ? error.message : String(error),
+        },
+      }));
+    }
   }
 
   async function refreshSkillSnapshot() {
@@ -2883,7 +3032,7 @@ function App() {
 
   function refreshManagementSnapshots() {
     for (const [label, operation] of [
-      ["Memory", refreshMemorySnapshot],
+      ["Memory", () => refreshMemorySnapshot(memorySnapshot.scope)],
       ["Skills", refreshSkillSnapshot],
       ["Browser", refreshBrowserSnapshot],
     ] as const) {
@@ -3597,7 +3746,7 @@ function App() {
   async function submitPrompt(event: FormEvent) {
     event.preventDefault();
     const value = prompt.trim();
-    if ((!value && attachments.length === 0) || !sessionId || runtimeMutationBusy) return;
+    if ((!value && attachments.length === 0) || !sessionId || runtimeMutationBusy || memoryExtracting) return;
     const submittedAttachments = attachments;
     const displayText = value || t("Please analyze the attached files.");
     setEntries((current) => [
@@ -4100,7 +4249,7 @@ function App() {
         <main className="conversation-panel">
           <div className="conversation-header">
             <div><h1>{activeConversation?.title ?? t("New conversation")}</h1><p>{activeProject?.name ?? t("No project")} - {t("protocol v{version}", { version: RUNTIME_PROTOCOL_VERSION })}</p></div>
-            <ModeSwitch mode={mode} onChange={changeMode} disabled={runtimeMutationBusy || !sessionId} t={t} />
+            <ModeSwitch mode={mode} onChange={changeMode} disabled={runtimeMutationBusy || memoryExtracting || !sessionId} t={t} />
           </div>
           <div className="transcript-shell">
           <div
@@ -4209,6 +4358,36 @@ function App() {
                 <button type="button" onClick={() => removeAttachment(attachment.id)} aria-label={t("Remove {name}", { name: attachment.display_name })}>x</button>
               </div>)}
             </div>}
+            {activeMemoryExtraction && <div className={`memory-extraction-status ${activeMemoryExtraction.status}`} role="status">
+              <span className="memory-extraction-dot" aria-hidden="true" />
+              <div>
+                <strong>{t(activeMemoryExtraction.status === "starting" || activeMemoryExtraction.status === "extracting"
+                  ? "Extracting long-term memory..."
+                  : activeMemoryExtraction.status === "failed"
+                  ? "Memory extraction failed"
+                  : activeMemoryExtraction.processedMessageCount === 0
+                  ? "No new user messages to extract."
+                  : activeMemoryExtraction.factCount === 0
+                  ? "No durable memory was found."
+                  : "Long-term memory extracted")}</strong>
+                <small>{activeMemoryExtraction.status === "failed"
+                  ? activeMemoryExtraction.error
+                  : activeMemoryExtraction.status === "starting" || activeMemoryExtraction.status === "extracting"
+                  ? t("Analyzing {count} pending user message(s) with the LLM.", { count: activeMemoryExtraction.pendingMessageCount })
+                  : t("Processed {messages} message(s): {saved} saved, {ignored} unchanged · {user} user / {conversation} conversation.", {
+                    messages: activeMemoryExtraction.processedMessageCount,
+                    saved: activeMemoryExtraction.savedCount,
+                    ignored: activeMemoryExtraction.ignoredCount,
+                    user: activeMemoryExtraction.userMemoryCount,
+                    conversation: activeMemoryExtraction.conversationMemoryCount,
+                  })}</small>
+              </div>
+              {!memoryExtracting && <button type="button" onClick={() => setMemoryExtractions((current) => {
+                const next = { ...current };
+                delete next[sessionId];
+                return next;
+              })} aria-label={t("Dismiss memory extraction status")}>×</button>}
+            </div>}
             <div className="composer-input-layer">
               <div className="composer-input-highlight" ref={composerHighlightRef} aria-hidden="true">
                 <HighlightedComposerPrompt value={prompt} />
@@ -4245,7 +4424,8 @@ function App() {
             </div>
             <div className="composer-footer">
               <button className="text-button" type="button" onClick={() => void chooseAttachments()} disabled={runtimeMutationBusy || !sessionId}>+ {t("Attach")}{attachments.length ? ` (${attachments.length})` : ""}</button>
-              <button className={`trace-toggle ${traceEnabled ? "active" : ""}`} type="button" onClick={() => void toggleTrace()} disabled={runtimeMutationBusy || !sessionId || Boolean(traceModeRequest.current)} title={tracePath || t("Record complete LLM, tool, approval, and Runtime event logs for this conversation")}>{t(traceEnabled ? "Trace On" : "Trace Off")}</button>
+              <button className={`text-button memory-extract-button ${memoryExtracting ? "active" : ""}`} type="button" onClick={() => void extractConversationMemory()} disabled={runtimeMutationBusy || !sessionId || busy || memoryExtracting} title={t("Let the LLM extract durable facts from unprocessed user messages in this conversation")}>{t(memoryExtracting ? "Extracting memory..." : "Extract memory")}</button>
+              <button className={`trace-toggle ${traceEnabled ? "active" : ""}`} type="button" onClick={() => void toggleTrace()} disabled={runtimeMutationBusy || memoryExtracting || !sessionId || Boolean(traceModeRequest.current)} title={tracePath || t("Record complete LLM, tool, approval, and Runtime event logs for this conversation")}>{t(traceEnabled ? "Trace On" : "Trace Off")}</button>
               <div className="access-switch" aria-label={t("Access mode")}>
                 <button className={accessMode === "restricted" ? "active" : ""} type="button" onClick={() => void changeAccessMode("restricted")} disabled={runtimeMutationBusy || !sessionId} title={t("Medium- and high-risk operations require approval")}>{t("Normal")}</button>
                 <button className={accessMode === "balanced" ? "active balanced" : ""} type="button" onClick={() => void changeAccessMode("balanced")} disabled={runtimeMutationBusy || !sessionId} title={t("Medium-risk operations are approved automatically; high-risk operations still require approval")}>{t("Balanced")}</button>
@@ -4253,7 +4433,7 @@ function App() {
               </div>
               <span className="composer-hint">{activeTaskFinalizing ? t("Finalizing workspace protection") : busy ? t("Agent is running") : ragIndexing ? t("RAG index is building") : sessionId ? t(appSettings.general.send_shortcut === "enter" ? "Enter to send - Shift+Enter for newline" : "Ctrl+Enter to send") : connectionLabel}</span>
               <button className="secondary-button" type="button" onClick={() => void cancelTask()} disabled={!busy || !activeTaskId || cancelling || activeTaskFinalizing}>{t(activeTaskFinalizing ? "Finalizing..." : cancelling ? "Stopping..." : "Stop")}</button>
-              <button className="primary-button" type="submit" disabled={!sessionId || runtimeMutationBusy || (!prompt.trim() && attachments.length === 0)}>{t("Send")}</button>
+              <button className="primary-button" type="submit" disabled={!sessionId || runtimeMutationBusy || memoryExtracting || (!prompt.trim() && attachments.length === 0)}>{t("Send")}</button>
             </div>
           </form>
         </main>
@@ -4468,7 +4648,7 @@ function App() {
         onRagRemoveSource={removeRagSource}
         onRagIndex={rebuildRagIndex}
         onRagClear={clearRagIndex}
-        onMemoryRefresh={() => refreshMemorySnapshot()}
+        onMemoryRefresh={(scope) => refreshMemorySnapshot(scope)}
         onMemorySave={saveMemory}
         onMemoryDelete={deleteMemory}
         onMemoryClear={clearMemory}
