@@ -1,4 +1,4 @@
-"""Typed short-term records and the minimal long-term memory record."""
+"""Extraction input records and the minimal persisted long-term memory record."""
 
 from __future__ import annotations
 
@@ -27,7 +27,7 @@ class ExtractedFact:
 
 @dataclass
 class MemoryEntry:
-    """Rich record used only by per-conversation short-term memory."""
+    """Transient extraction input; also reads legacy memory records during migration."""
 
     id: str
     content: str

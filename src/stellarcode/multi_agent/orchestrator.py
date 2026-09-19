@@ -118,8 +118,6 @@ class AgentOrchestrator:
                 "worker_count": len(self.workers),
             },
         )
-        if self.memory_manager:
-            self.memory_manager.add_user_message(user_input)
 
         try:
             plan = self.create_plan(user_input, cancellation_event)
@@ -129,8 +127,6 @@ class AgentOrchestrator:
                 "team.run.failed",
                 {"run_id": self._team_run_id(), "message": result},
             )
-            if self.memory_manager:
-                self.memory_manager.add_assistant_message(result)
             return result
 
         try:
@@ -148,8 +144,6 @@ class AgentOrchestrator:
                 "message": result if plan.has_failed() else "Team execution completed.",
             },
         )
-        if self.memory_manager:
-            self.memory_manager.add_assistant_message(result)
         return result
 
     def create_plan(

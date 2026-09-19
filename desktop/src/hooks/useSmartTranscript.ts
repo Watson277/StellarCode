@@ -150,6 +150,17 @@ export function useSmartTranscript<T extends HTMLElement = HTMLDivElement>(
     [],
   );
 
+  useEffect(() => {
+    const content = containerRef.current?.firstElementChild;
+    if (!content || typeof ResizeObserver === "undefined") return;
+    // Lazy Markdown and loaded images may grow after the transcript state commits.
+    const observer = new ResizeObserver(() => {
+      if (followingRef.current) notifyContentChanged(0);
+    });
+    observer.observe(content);
+    return () => observer.disconnect();
+  }, [notifyContentChanged]);
+
   return {
     containerRef,
     isFollowingBottom,

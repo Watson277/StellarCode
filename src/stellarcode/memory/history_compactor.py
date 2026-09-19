@@ -1,6 +1,6 @@
 """LLM-backed compression for the provider's real message history.
 
-This is separate from ``ConversationMemory``: it preserves tool-call protocol pairs in
+It preserves tool-call protocol pairs in
 ``Agent.messages`` when the model context window is close to exhaustion.
 """
 

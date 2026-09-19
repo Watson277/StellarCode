@@ -1,0 +1,98 @@
+:root {
+  --ui-font-caption: 11px;
+  --ui-font-small: 12px;
+  --ui-font-body: 13px;
+  --ui-font-label: 14px;
+  --ui-radius: 6px;
+}
+
+button, input, select, textarea { font-family: inherit; letter-spacing: 0; }
+button { touch-action: manipulation; }
+button:disabled { cursor: not-allowed; }
+.app-shell.theme-dark, .app-shell.theme-light {
+  --text-soft: color-mix(in srgb, var(--text) 82%, var(--panel));
+  --text-faint: color-mix(in srgb, var(--text) 72%, var(--panel));
+}
+.primary-button, .secondary-button {
+  display: inline-flex; align-items: center; justify-content: center; gap: 6px;
+  min-height: 32px; padding: 6px 10px; border-radius: var(--ui-radius);
+  font-size: var(--ui-font-small); line-height: 1.4;
+}
+.primary-button svg, .secondary-button svg { flex: none; }
+.ui-icon-button, .settings-titlebar button {
+  display: inline-grid; place-items: center; width: 32px; min-width: 32px; height: 32px; padding: 4px;
+}
+.row-delete { display: grid; place-items: center; width: 28px; height: 28px; right: 3px; }
+.row-delete:focus-visible, .conversation-row:focus-within .row-delete { opacity: 1; }
+.attachment-chip button { display: grid; place-items: center; min-width: 28px; min-height: 28px; }
+.brand-name, .section-heading { letter-spacing: 0; }
+
+.tool-card > summary { padding: 10px 12px; }
+.tool-card-header { display: flex; align-items: center; gap: 10px; min-width: 0; }
+.tool-card-summary { flex: 1; min-width: 0; }
+.tool-card-summary strong { font-size: var(--ui-font-body); overflow-wrap: anywhere; }
+.tool-detail-preview { display: block; font-family: inherit; white-space: normal; overflow-wrap: anywhere; font-size: var(--ui-font-small); color: var(--text-soft); margin-top: 4px; }
+.tool-name { display: block; overflow-wrap: anywhere; color: var(--text-faint); font-family: "Cascadia Code", Consolas, monospace; font-size: var(--ui-font-caption); margin-top: 3px; }
+.tool-target { display: block; white-space: normal; overflow-wrap: anywhere; }
+.tool-result { display: flex; flex-direction: column; gap: 3px; align-items: flex-end; font-size: var(--ui-font-caption); flex: none; }
+.tool-duration { color: var(--text-faint); font-variant-numeric: tabular-nums; }
+.tool-state-icon { flex: none; color: var(--text-soft); }
+.tool-failed .tool-state-icon { color: var(--danger); }
+.tool-completed .tool-state-icon { color: var(--good); }
+.tool-waiting_approval .tool-state-icon { color: var(--warn); }
+.tool-expand-marker { flex: none; }
+.tool-detail-panel { min-width: 0; font-size: var(--ui-font-small); }
+.tool-detail-panel pre { max-height: 320px; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; }
+.tool-failure-summary { padding: 10px 12px; border-left: 3px solid var(--danger); background: color-mix(in srgb, var(--danger) 7%, var(--panel)); }
+.tool-failure-summary p { margin: 5px 0 0; color: var(--text-soft); line-height: 1.6; }
+.tool-raw-output > summary { cursor: pointer; padding: 8px 0; color: var(--text-soft); }
+.tool-arguments > summary { cursor: pointer; padding: 8px 0; color: var(--text-soft); }
+.tool-card { container-type: inline-size; }
+@container (max-width: 340px) {
+  .tool-card-header { display: grid; grid-template-columns: 18px minmax(0, 1fr) 16px; gap: 7px; padding-inline: 0; }
+  .tool-card-summary { grid-column: 2; }
+  .tool-result { grid-column: 2; grid-row: 2; flex-direction: row; align-items: center; flex-wrap: wrap; gap: 10px; }
+  .tool-expand-marker { grid-column: 3; grid-row: 1; }
+}
+.ui-inline-error { color: var(--danger); font-size: var(--ui-font-small); }
+.ui-actions { display: flex; flex-wrap: wrap; gap: 8px; }
+.ui-error-boundary { padding: 16px; min-width: 0; color: var(--text); background: var(--panel); border-left: 3px solid var(--danger); font-size: var(--ui-font-body); }
+.ui-error-boundary.full-page { height: 100%; overflow: auto; padding: 48px 24px; }
+.ui-error-boundary p { line-height: 1.6; color: var(--text-soft); }
+.ui-error-boundary details { margin-top: 14px; }
+.ui-error-boundary pre { white-space: pre-wrap; overflow-wrap: anywhere; max-height: 300px; overflow: auto; }
+.ui-error-boundary.overlay { position: fixed; inset: 10%; z-index: 100; overflow: auto; box-shadow: 0 0 0 100vmax rgb(0 0 0 / 40%); }
+.settings-window { grid-template-rows: auto minmax(0, 1fr) auto; }
+.settings-titlebar { min-height: 52px; padding-block: 8px; }
+.settings-footer { min-height: 56px; flex-wrap: wrap; padding-block: 10px; }
+.settings-notice { white-space: normal; overflow-wrap: anywhere; font-size: var(--ui-font-small); flex: 1 1 200px; line-height: 1.5; }
+.settings-notice.error { color: var(--danger); }
+.settings-row p { font-size: var(--ui-font-small); line-height: 1.55; }
+.settings-control input:not([type='range']):not([type='color']), .settings-control select { min-height: 32px; }
+.settings-control input:user-invalid { border-color: var(--danger); }
+.settings-nav { overflow-y: auto; }
+.settings-nav button > span { border: 0; flex: none; }
+.worktree-location-control { min-width: 0; width: 100%; }
+.settings-control > * { max-width: 100%; }
+.settings-row { padding-block: 10px; }
+.settings-inline-actions { flex-wrap: wrap; }
+.ui-spin { animation: ui-spin 1s linear infinite; }
+@keyframes ui-spin { to { transform: rotate(360deg); } }
+@media (max-width: 900px) {
+  .topbar { gap: 6px; flex-wrap: wrap; padding-block: 4px; }
+  .app-shell { grid-template-rows: auto minmax(0, 1fr); }
+  .workspace-path { max-width: 150px; }
+  .tool-card-header { flex-wrap: wrap; }
+  .tool-card-summary { flex-basis: calc(100% - 50px); }
+  .tool-result { margin-left: 27px; }
+  .tool-expand-marker { margin-left: auto; }
+  .settings-row { grid-template-columns: minmax(0, 1fr); gap: 8px; }
+  .settings-control { justify-content: flex-start; }
+}
+@media (max-width: 760px) {
+  .settings-notice { display: block; flex-basis: 100%; }
+  .settings-nav button { min-height: 34px; }
+}
+@media (prefers-reduced-motion: reduce) { .ui-spin { animation: none; } }
+:root .transcript-history-control { display: flex; justify-content: center; padding: 8px 0 16px; }
+.markdown-loading { white-space: pre-wrap; overflow-wrap: anywhere; }

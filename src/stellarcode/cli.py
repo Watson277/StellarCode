@@ -117,15 +117,6 @@ def create_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-iterations", type=int, default=8)
     parser.add_argument("--memory-dir", default=None, help="Directory for long-term memory JSON.")
     parser.add_argument("--rag-dir", default=None, help="Directory for the SQLite code index.")
-    parser.add_argument(
-        "--short-memory-tokens",
-        type=_positive_int,
-        default=None,
-        help=(
-            "Override the short-term semantic-memory capacity. By default it is 50%% "
-            "of the configured model context window."
-        ),
-    )
     parser.add_argument("--team-workers", type=int, default=2)
     parser.add_argument("--team-retries", type=int, default=2)
     parser.add_argument(
@@ -349,7 +340,6 @@ def main() -> None:
     llm_client = TracingChatClient(base_llm_client, trace_recorder)
     memory_manager = MemoryManager(
         storage_dir=args.memory_dir,
-        short_term_tokens=args.short_memory_tokens,
         llm_client=llm_client,
     )
     agent = Agent(
@@ -389,6 +379,14 @@ def main() -> None:
     )
     plan_mode = False
     team_mode = False
+
+    def run_structured(runner, prompt):
+        # Keep CLI Plan/Team user turns in the shared model history, not a memory copy.
+        agent.messages.append({"role": "user", "content": prompt,
+                               "_stellarcode_original_user_text": prompt})
+        answer = runner.run(prompt)
+        agent.messages.append({"role": "assistant", "content": answer})
+        return answer
 
     console.print(f"StellarCode Python v{__version__}")
     console.print(f"Working directory: {workspace}")
@@ -451,7 +449,7 @@ def main() -> None:
         if user_input == "/clear":
             agent.reset()
             team_agent.reset()
-            memory_manager.clear_short_term()
+            memory_manager.reset_extraction()
             hitl_handler.clear_approved_all()
             skill_context_buffer.clear()
             plan_mode = False
@@ -590,20 +588,20 @@ def main() -> None:
             continue
         if user_input.startswith("/plan "):
             goal = user_input.removeprefix("/plan ").strip()
-            console.print(plan_agent.run(goal))
+            console.print(run_structured(plan_agent, goal))
             continue
         if user_input.startswith("/team "):
             goal = user_input.removeprefix("/team ").strip()
-            console.print(team_agent.run(goal), markup=False)
+            console.print(run_structured(team_agent, goal), markup=False)
             continue
 
         if team_mode:
             execution_mode = "team"
             team_mode = False
-            answer = team_agent.run(user_input)
+            answer = run_structured(team_agent, user_input)
         elif plan_mode or (args.auto_plan and should_plan(user_input)):
             execution_mode = "plan"
-            answer = plan_agent.run(user_input)
+            answer = run_structured(plan_agent, user_input)
         else:
             execution_mode = "react"
             answer = agent.run(user_input)

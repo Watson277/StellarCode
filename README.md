@@ -412,7 +412,7 @@ stellarcode/
 │  ├─ plan/                  # Plan-and-Execute 与 DAG
 │  ├─ multi_agent/           # Team 编排、Worker 与 MessageBus
 │  ├─ runtime/               # 桌面 JSONL Runtime 与事件协议实现
-│  ├─ memory/                # 记忆、摘要与上下文压缩
+│  ├─ memory/                # 长期记忆提取、检索与模型上下文压缩
 │  ├─ rag/                   # 代码索引和检索
 │  ├─ mcp/                   # MCP 客户端与工具接入
 │  ├─ skill/                 # Skill 发现、版本和渐进式披露
@@ -436,6 +436,12 @@ stellarcode/
 - `<workspace>/.stellarcode/mcp.json`：项目 MCP 配置；
 - `.stellarcode-memory/`：长期记忆；
 - `.stellarcode-rag/` 或配置的 RAG 目录：代码索引。
+
+记忆系统只维护模型上下文和长期记忆，不再使用独立短期记忆副本、预算或压缩。
+对话级长期记忆使用关键词与 Embedding 向量混合检索；用户级长期记忆按设计全部注入。
+模型上下文达到窗口的 80% 时压缩，保留最近 3 轮及工具调用配对；压缩时自动提取
+长期记忆，也可在聊天框手动提取。桌面端直接读取会话记录中的用户原话，并保存
+已提取消息 ID。旧会话仍可加载，新保存的会话不再包含 `short_term_memory`。
 
 Windows 桌面客户端的项目注册、会话、设置、Runtime journal、任务快照和临时 worktree 默认
 保存在：

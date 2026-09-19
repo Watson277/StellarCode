@@ -4,6 +4,10 @@
   "version": "0.1.0",
   "type": "module",
   "scripts": {
+    "test:ui": "playwright test",
+    "test:stream-buffer": "node scripts/test-assistant-delta-buffer.mjs",
+    "test:tool-presentation": "node scripts/test-tool-presentation.mjs",
+    "test:bundle": "node scripts/check-bundle-budget.mjs",
     "dev": "vite",
     "build": "tsc && vite build",
     "test:runtime-machine": "node scripts/test-runtime-machine.mjs",
@@ -21,12 +25,14 @@
     "@tauri-apps/plugin-dialog": "^2",
     "@tauri-apps/plugin-opener": "^2",
     "highlight.js": "^11.11.1",
+    "lucide-react": "^1.47.0",
     "react": "^19.1.0",
     "react-dom": "^19.1.0",
     "react-markdown": "^10.1.0",
     "remark-gfm": "^4.0.1"
   },
   "devDependencies": {
+    "@playwright/test": "^1.63.0",
     "@tauri-apps/cli": "^2",
     "@types/react": "^19.1.8",
     "@types/react-dom": "^19.1.6",

@@ -486,6 +486,8 @@ class SubAgent:
             cancellation_event,
         )
         if compaction is not None:
+            if self.memory_manager:
+                self.memory_manager.on_context_compacted()
             self.messages = compaction.messages
             self._refresh_system_prompt(
                 self._current_query,

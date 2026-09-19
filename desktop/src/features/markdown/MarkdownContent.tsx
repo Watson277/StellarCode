@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, type ReactNode } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
@@ -32,14 +32,18 @@ export function MarkdownContent({
   onOpenWorkspaceFile,
 }: MarkdownContentProps) {
   const [actionError, setActionError] = useState("");
+  const actions = useRef({ onReviewChanges, onOpenWorkspaceFile });
+  useLayoutEffect(() => { actions.current = { onReviewChanges, onOpenWorkspaceFile }; }, [onReviewChanges, onOpenWorkspaceFile]);
+  const reviewChanges = useCallback(() => actions.current.onReviewChanges?.(), []);
+  const canReviewChanges = Boolean(onReviewChanges);
 
   async function openWorkspaceFile(rawPath: string) {
     const reference = resolveWorkspaceFileReference(rawPath, workspace);
     if (!reference || !projectId) return;
     setActionError("");
     try {
-      if (onOpenWorkspaceFile) {
-        await onOpenWorkspaceFile(reference);
+      if (actions.current.onOpenWorkspaceFile) {
+        await actions.current.onOpenWorkspaceFile(reference);
       } else {
         await invoke<string>("workspace_file_open", {
           projectId,
@@ -65,8 +69,8 @@ export function MarkdownContent({
     >{children}</button>;
   }
 
-  return <div className="markdown-content">
-    <ReactMarkdown
+  // Composer edits and elapsed-time ticks must not reparse every completed answer.
+  const markdown = useMemo(() => <ReactMarkdown
       remarkPlugins={[remarkGfm]}
       components={{
         a: ({ children, href = "", node: _node, ...props }) => {
@@ -88,13 +92,16 @@ export function MarkdownContent({
             language={block.language}
             t={t}
             reviewChangesBusy={reviewChangesBusy}
-            onReviewChanges={onReviewChanges}
+            onReviewChanges={canReviewChanges ? reviewChanges : undefined}
           />;
         },
       }}
     >
       {content}
-    </ReactMarkdown>
+    </ReactMarkdown>, [content, workspace, projectId, t, reviewChangesBusy, canReviewChanges, reviewChanges]);
+
+  return <div className="markdown-content">
+    {markdown}
     {actionError && <div className="markdown-action-error" role="status">{actionError}</div>}
   </div>;
 }

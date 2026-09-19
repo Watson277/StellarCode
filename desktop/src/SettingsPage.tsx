@@ -5,7 +5,9 @@
  * Runtime operations. Keeping those two models distinct avoids implying that a second
  * "Save" click is required after an operational action has already taken effect.
  */
-import { useEffect, useState } from "react";
+import { useEffect, useId, useRef, useState } from "react";
+import { X, Settings, Palette, Cpu, Bot, FileText, Brain, BookOpen, Plug, Globe, Search, Activity } from "lucide-react";
+import { useModalFocus } from "./hooks/useModalFocus";
 import { invoke } from "@tauri-apps/api/core";
 import { confirm as confirmDialog, open } from "@tauri-apps/plugin-dialog";
 import { revealItemInDir } from "@tauri-apps/plugin-opener";
@@ -86,54 +88,7 @@ export interface SettingsSnapshot {
   api_keys: Record<string, boolean>;
 }
 
-export const DEFAULT_APP_SETTINGS: AppSettings = {
-  schema_version: 2,
-  general: {
-    reopen_last_project: true,
-    language: "zh-CN",
-    send_shortcut: "enter",
-    conversation_font_size: 12,
-    compact_tools: true,
-    compact_plans: true,
-    worktree_directory: "",
-  },
-  appearance: {
-    theme: "dark",
-    accent_color: "#80aaff",
-    background_color: "#111318",
-    panel_color: "#171a20",
-    text_color: "#d9dde7",
-    client_font_size: 12,
-  },
-  models: {
-    model: "",
-    base_url: "",
-    vision_model: "",
-    vision_base_url: "",
-  },
-  agent: {
-    default_mode: "react",
-    max_iterations: 8,
-    max_parallel_tools: 4,
-    tool_batch_timeout_seconds: 90,
-    plan_workers: 4,
-    team_workers: 2,
-    team_retries: 2,
-    context_window: 200000,
-  },
-  rag: {
-    model: "",
-    base_url: "",
-    automatic_retrieval: true,
-  },
-  diagnostics: {
-    python_path: "",
-    lsp_enabled: false,
-    lsp_command: "",
-    lsp_args: [],
-    lsp_timeout_seconds: 20,
-  },
-};
+export { DEFAULT_APP_SETTINGS } from "./settingsDefaults";
 
 const MAX_AGENT_ITERATIONS = 128;
 
@@ -275,8 +230,25 @@ export function SettingsPage({
   const [draft, setDraft] = useState<AppSettings>(() => structuredClone(snapshot.settings));
   const [saving, setSaving] = useState(false);
   const [notice, setNotice] = useState("");
+  const [noticeIsError, setNoticeIsError] = useState(false);
+  const dialogRef = useRef<HTMLDivElement>(null);
+  const closingRef = useRef(false);
+  const dirty = JSON.stringify(draft) !== JSON.stringify(snapshot.settings);
   const restartRequired = runtimeRestartPending || runtimeSettingsChanged(snapshot.settings, draft);
   const t = translator(draft.general.language);
+  useModalFocus(dialogRef, () => void requestClose());
+
+  async function requestClose() {
+    if (saving || closingRef.current) return;
+    closingRef.current = true;
+    try {
+      if (!dirty || await confirmDialog(t("Discard unsaved settings?"), {
+        title: t("Unsaved settings"), kind: "warning",
+      })) onClose();
+    } catch (error) {
+      setNotice(String(error)); setNoticeIsError(true);
+    } finally { closingRef.current = false; }
+  }
 
   useEffect(() => {
     setDraft(structuredClone(snapshot.settings));
@@ -288,8 +260,17 @@ export function SettingsPage({
 
   async function save(restart = false) {
     if (saving || busy) return;
+    const invalid = Array.from(dialogRef.current?.querySelectorAll<HTMLInputElement>("input") ?? [])
+      .find((input) => !input.checkValidity());
+    if (invalid) {
+      invalid.reportValidity();
+      setNotice(t("Check the highlighted field before saving."));
+      setNoticeIsError(true);
+      return;
+    }
     setSaving(true);
     setNotice("");
+    setNoticeIsError(false);
     try {
       const updated = await invoke<SettingsSnapshot>("settings_update", { settings: draft });
       onSaved(updated);
@@ -297,6 +278,7 @@ export function SettingsPage({
       setNotice(t("Settings saved."));
       if (restart && runtimeOnline) await onRestartRuntime();
     } catch (error) {
+      setNoticeIsError(true);
       setNotice(error instanceof Error ? error.message : String(error));
     } finally {
       setSaving(false);
@@ -313,12 +295,14 @@ export function SettingsPage({
       )
     ) return;
     setSaving(true);
+    setNoticeIsError(false);
     try {
       const reset = await invoke<SettingsSnapshot>("settings_reset");
       setDraft(structuredClone(reset.settings));
       onSaved(reset);
       setNotice(t("Default settings restored. Restart Runtime to apply model and Agent defaults."));
     } catch (error) {
+      setNoticeIsError(true);
       setNotice(error instanceof Error ? error.message : String(error));
     } finally {
       setSaving(false);
@@ -350,6 +334,7 @@ export function SettingsPage({
   }
 
   function checkModelConfiguration() {
+    setNoticeIsError(false);
     const available = [["llm", "Text"], ["vision", "Vision"], ["embedding", "Embedding"]]
       .filter(([key]) => snapshot.api_keys[key])
       .map(([, label]) => t(label));
@@ -360,12 +345,12 @@ export function SettingsPage({
 
   const immediateManagement = IMMEDIATE_MANAGEMENT_SECTIONS.has(section);
 
-  return <div className="settings-overlay" role="dialog" aria-modal="true" aria-label={t("Settings & Management")}>
+  return <div ref={dialogRef} tabIndex={-1} className="settings-overlay" role="dialog" aria-modal="true" aria-label={t("Settings & Management")}>
     <div className="settings-window">
-      <header className="settings-titlebar"><div><strong>{t("Settings & Management")}</strong><span>{t("StellarCode Desktop")}</span></div><button onClick={onClose} aria-label={t("Close settings")}>x</button></header>
+      <header className="settings-titlebar"><div><strong>{t("Settings & Management")}</strong><span>{t("StellarCode Desktop")}</span></div><button title={t("Close settings")} disabled={saving} onClick={() => void requestClose()} aria-label={t("Close settings")}><X size={18} /></button></header>
       <div className="settings-layout">
         <nav className="settings-nav">
-          {SETTINGS_SECTIONS.map((item) => <button className={section === item ? "active" : ""} onClick={() => setSection(item)} key={item}><span>{settingsIcon(item)}</span>{t(settingsSectionLabel(item))}</button>)}
+          {SETTINGS_SECTIONS.map((item) => <button title={t(settingsSectionLabel(item))} aria-label={t(settingsSectionLabel(item))} aria-current={section === item ? "page" : undefined} className={section === item ? "active" : ""} onClick={() => setSection(item)} key={item}><span aria-hidden="true">{settingsIcon(item)}</span>{t(settingsSectionLabel(item))}</button>)}
           <div className="settings-nav-spacer" />
           <small>{t("Protocol v{version}", { version: 1 })}<br />{t("Settings schema v{version}", { version: draft.schema_version })}</small>
         </nav>
@@ -458,9 +443,9 @@ export function SettingsPage({
       <footer className="settings-footer">
         {immediateManagement ? <>
           <span className="settings-notice">{t("Changes on this management page apply immediately.")}</span>
-          <button className="primary-button" onClick={onClose}>{t("Close")}</button>
+          <button className="primary-button" onClick={() => void requestClose()}>{t("Close")}</button>
         </> : <>
-          <span className={`settings-notice ${notice.toLowerCase().includes("missing") || notice.toLowerCase().includes("error") ? "error" : ""}`}>{notice || (restartRequired ? t("Runtime settings changed. Restart required to apply them.") : t("Settings are stored locally on this computer."))}</span>
+          <span role={noticeIsError ? "alert" : "status"} className={`settings-notice ${noticeIsError ? "error" : ""}`}>{notice || (dirty ? t("Unsaved settings") : restartRequired ? t("Runtime settings changed. Restart required to apply them.") : t("Settings are stored locally on this computer."))}</span>
           <button className="secondary-button" onClick={() => void resetSettings()} disabled={saving || busy}>{t("Reset")}</button>
           {restartRequired && runtimeOnline && <button className="secondary-button" onClick={() => void save(true)} disabled={saving || busy}>{t("Save & Restart Runtime")}</button>}
           <button className="primary-button" onClick={() => void save()} disabled={saving || busy}>{saving ? t("Saving...") : t("Save Settings")}</button>
@@ -526,7 +511,7 @@ function ModelSettingsForm({ draft, setDraft, apiKeys, onCheck, onOpenEnv }: For
     <SettingsRow label={t("Base URL")} description={t("OpenAI-compatible base URL. Leave empty to read LLM_BASE_URL from .env.")}><input value={models.base_url} onChange={(event) => update({ base_url: event.target.value })} placeholder="https://example.com/v1" /></SettingsRow>
     <SettingsRow label={t("Vision model")} description={t("Optional vision model name. Leave both vision fields empty to disable image routing.")}><input value={models.vision_model} onChange={(event) => update({ vision_model: event.target.value })} placeholder="VISION_MODEL_NAME" /></SettingsRow>
     <SettingsRow label={t("Vision base URL")} description={t("OpenAI-compatible vision endpoint. Leave empty to read VISION_BASE_URL from .env.")}><input value={models.vision_base_url} onChange={(event) => update({ vision_base_url: event.target.value })} placeholder="https://example.com/v1" /></SettingsRow>
-    <div className="settings-inline-actions"><button className="secondary-button" onClick={onCheck}>{t("Check configuration")}</button><button className="secondary-button" onClick={onOpenEnv}>{t("Show .env")}</button><small>{t("API keys are never copied into settings.json.")}</small></div>
+    <div className="settings-inline-actions"><button className="secondary-button" onClick={onCheck}>{t("Check API key presence")}</button><button className="secondary-button" onClick={onOpenEnv}>{t("Show .env")}</button><small>{t("API keys are never copied into settings.json.")}</small></div>
   </SettingsSectionView>;
 }
 
@@ -1073,6 +1058,8 @@ export function SkillManagementForm({
   const [notice, setNotice] = useState("");
   const [noticeIsError, setNoticeIsError] = useState(false);
   const [activeDiff, setActiveDiff] = useState<SkillDiff | null>(null);
+  const diffModalRef = useRef<HTMLElement>(null);
+  useModalFocus(diffModalRef, () => { if (!working) setActiveDiff(null); }, Boolean(activeDiff));
   const [installScope, setInstallScope] = useState<SkillInstallScope>("project");
   const [directoryNotice, setDirectoryNotice] = useState("");
   const [directoryNoticeIsError, setDirectoryNoticeIsError] = useState(false);
@@ -1255,7 +1242,7 @@ export function SkillManagementForm({
       <div className="management-paths"><PathRow label={t("Skill state file")} path={snapshot.state_path} t={t} /></div>
       <p className={`mcp-notice ${noticeIsError ? "error" : ""}`}>{notice || t(!runtimeOnline ? "Python Runtime must be online to manage skills." : "Skill enablement and reload changes apply on the next Agent turn.")}</p>
     </SettingsSectionView>
-    {activeDiff && <section className="diff-overlay" role="dialog" aria-modal="true" aria-label={t("Skill update Diff")}>
+    {activeDiff && <section ref={diffModalRef} tabIndex={-1} className="diff-overlay" role="dialog" aria-modal="true" aria-label={t("Skill update Diff")}>
       <div className="diff-dialog skill-diff-dialog">
         <header>
           <div>
@@ -1432,7 +1419,17 @@ function DiagnosticsSettingsForm({ draft, setDraft, snapshot, diagnosticsSnapsho
 interface FormProps { draft: AppSettings; setDraft: React.Dispatch<React.SetStateAction<AppSettings>>; }
 
 function SettingsSectionView({ title, description, children }: { title: string; description: string; children: React.ReactNode }) { return <section className="settings-section-view"><header><h2>{title}</h2><p>{description}</p></header><div className="settings-fields">{children}</div></section>; }
-function SettingsRow({ label, description, children }: { label: string; description: string; children: React.ReactNode }) { return <div className="settings-row"><div><strong>{label}</strong><p>{description}</p></div><div className="settings-control">{children}</div></div>; }
+function SettingsRow({ label, description, children }: { label: string; description: string; children: React.ReactNode }) {
+  const id = useId();
+  const controlRef = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    for (const control of controlRef.current?.querySelectorAll("input, select, textarea, [role='switch']") ?? []) {
+      if (!control.hasAttribute("aria-label") && !control.hasAttribute("aria-labelledby")) control.setAttribute("aria-labelledby", `${id}-label`);
+      control.setAttribute("aria-describedby", `${id}-description`);
+    }
+  }, [id, children]);
+  return <div className="settings-row"><div><strong id={`${id}-label`}>{label}</strong><p id={`${id}-description`}>{description}</p></div><div className="settings-control" ref={controlRef}>{children}</div></div>;
+}
 function Toggle({ checked, onChange, disabled = false }: { checked: boolean; onChange: (checked: boolean) => void; disabled?: boolean }) { return <button className={`settings-toggle ${checked ? "on" : ""}`} role="switch" aria-checked={checked} onClick={() => onChange(!checked)} disabled={disabled}><span /></button>; }
 function ColorControl({ value, onChange }: { value: string; onChange: (value: string) => void }) { return <label className="color-control"><input type="color" value={value} onChange={(event) => onChange(event.target.value)} /><code>{value.toUpperCase()}</code></label>; }
 function NumberSetting({ label, description, value, min, max, suffix, onChange }: { label: string; description: string; value: number; min: number; max: number; suffix?: string; onChange: (value: number) => void }) {
@@ -1463,7 +1460,10 @@ function PathRow({ label, path, t }: { label: string; path: string; t: ReturnTyp
     <button className="secondary-button" onClick={() => void revealPath()} disabled={!path || revealing}>{t(revealing ? "Opening..." : "Reveal")}</button>
   </SettingsRow>;
 }
-function settingsIcon(section: SettingsSection) { return { general: "◎", appearance: "◐", models: "◇", agent: "✦", prompt: "P", memory: "M", skills: "S", mcp: "⌘", browser: "B", rag: "⌕", diagnostics: "⚙" }[section]; }
+function settingsIcon(section: SettingsSection) {
+  const Icon = { general: Settings, appearance: Palette, models: Cpu, agent: Bot, prompt: FileText, memory: Brain, skills: BookOpen, mcp: Plug, browser: Globe, rag: Search, diagnostics: Activity }[section];
+  return <Icon size={16} />;
+}
 function settingsSectionLabel(section: SettingsSection) { return { general: "General", appearance: "Appearance", models: "Models", agent: "Agent", prompt: "Prompt", memory: "Memory", skills: "Skills", mcp: "MCP Servers", browser: "Browser", rag: "Code RAG", diagnostics: "Data & Diagnostics" }[section]; }
 function abbreviateText(value: string, limit: number) { return value.length <= limit ? value : `${value.slice(0, limit)}...`; }
 function shortHash(value?: string | null) { return value ? value.slice(0, 12) : "—"; }

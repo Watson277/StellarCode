@@ -234,6 +234,80 @@ installer must bundle a frozen Python sidecar executable and its runtime assets.
 
 ## Validation
 
+### Performance baseline
+
+Settings and Markdown rendering load on demand, separately from the initial shell. Completed
+Markdown reuses its parsed React tree when only the composer, clock, or unrelated task state
+changes; file/review actions still use their latest handlers. Lazy content resizing follows the
+bottom only when the reader is already following, without pulling readers away from history.
+
+Long conversations initially mount the latest 80 visible transcript groups. `Show earlier
+messages` adds 80 more while preserving the reading position. This is incremental rendering,
+not server-side pagination or a fixed-memory virtual list: complete transcript state remains
+available, and explicitly expanding history increases mounted rows. Pending approvals stay
+outside the history window and remain actionable.
+
+Transient `assistant.delta` text is coalesced on a 32 ms timer, with size/count limits. A
+non-delta event or response flushes pending text first; reset boundaries remain ordered and
+retired-process/other-conversation text cannot leak into the visible transcript. Terminal
+answers remain authoritative. This does not batch approvals or change Python execution.
+
+```powershell
+npm run test:stream-buffer
+npm run build
+npm run test:bundle
+npm run test:ui
+```
+
+The bundle check enforces a 500,000-byte uncompressed budget across the entry's static
+JavaScript import graph and verifies the Settings/Markdown lazy boundaries. The current entry
+is approximately 458 KB (141 KB gzip), down from 682 KB (207 KB gzip) before this round;
+on-demand chunks still contribute to total download size when opened. Browser tests include
+5,000-message history, scroll anchoring, stream resets/finalization, conversation isolation,
+and Markdown local-state preservation. These are regression checks, not a native-device FPS
+or end-to-end latency benchmark.
+
+### UI reliability baseline
+
+Tool cards retain structured call arguments independently of the returned preview. Their
+collapsed summary shows the operation target (command/path/URL/query when available), tool
+name, lifecycle status, reported duration, and a bounded result summary. Ordinary and Team
+tools share this renderer, including event replay. Parameters can be expanded separately.
+Failures explain likely causes before expandable raw diagnostics; classification is based on
+the failure output and never asserts that an entire command had no side effects. Output is
+the Runtime-provided preview and may already be truncated upstream.
+
+`npm run test:tool-presentation` checks target extraction, summaries, duration formatting,
+and error classification, including avoiding rate-limit false positives from line numbers.
+
+The desktop uses shared 11-14 px typography tokens, icon controls with accessible names,
+and responsive settings layouts. Tool failures show a concise diagnosis and next step before
+the expandable raw output; copying diagnostics reports clipboard failures. Display recovery
+never automatically retries a tool operation.
+
+Settings traps keyboard focus, restores focus on close, and confirms discarding unsaved
+preferences. Save errors preserve the draft. The API-key presence check only checks whether
+a key is configured; it is not an endpoint connectivity test. React error boundaries isolate
+settings, Markdown, file previews, and diffs, with an application-level fallback.
+
+Run the browser interaction suite after installing Chromium once:
+
+```powershell
+npx playwright install chromium
+npm run test:ui
+```
+
+The suite covers settings focus and save failures, sending/stopping tasks, conversation drafts,
+approvals, tool failures, clipboard failures, display recovery, Runtime reconnection, diff and
+rollback confirmation, Chinese labels, and light/dark layouts at narrow and desktop widths.
+Screenshots are written to `test-results/` (ignored by Git).
+
+Tests run the real React UI with simulated Tauri IPC and Runtime events, without API keys or
+real file changes. They do not replace native WebView, Python Runtime, OS clipboard/dialog,
+high-DPI, or release-installer acceptance tests. For a simulated browser preview, run
+`npm run dev` and open `/e2e/index.html?lang=zh` on the displayed local URL. This harness is
+not the production entry point.
+
 ```powershell
 npm run build
 cd src-tauri

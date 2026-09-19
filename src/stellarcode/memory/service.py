@@ -35,8 +35,8 @@ class ProjectMemoryService:
     ) -> None:
         self.storage_dir = Path(storage_dir).resolve()
         self.context_window = context_window
-        self.retriever = MemoryRetriever()
         self.embedding_client = embedding_client or EmbeddingClient()
+        self.retriever = MemoryRetriever(self.embedding_client)
         self.user_long_term = user_long_term or LongTermMemory(
             self.storage_dir / "user"
         )
@@ -81,11 +81,9 @@ class ProjectMemoryService:
         self,
         conversation_id: str = "default",
         *,
-        short_term_tokens: int | None = None,
         llm_client: Any | None = None,
     ) -> MemoryManager:
         return MemoryManager(
-            short_term_tokens=short_term_tokens,
             context_window=self.context_window,
             long_term=self.conversation_store(conversation_id),
             user_long_term=self.user_long_term,
@@ -125,7 +123,6 @@ class ProjectMemoryService:
         if normalized_query:
             entries = self.retriever.retrieve(
                 normalized_query,
-                [],
                 store.active(),
                 limit=bounded_limit,
             )

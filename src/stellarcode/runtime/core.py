@@ -898,7 +898,7 @@ class RuntimeSession:
                 conversation.agent.messages.append(
                     {"role": "assistant", "content": cancellation_message}
                 )
-            conversation.memory_manager.add_assistant_message(cancellation_message)
+
             conversation.transcript.append(
                 _transcript_entry("assistant", cancellation_message, task_id=task_id)
             )
@@ -1194,7 +1194,7 @@ class RuntimeSession:
             f"changes were not applied to the project. Reason: {reason}"
         )
         conversation.agent.messages.append({"role": "assistant", "content": correction})
-        conversation.memory_manager.add_assistant_message(correction)
+
         conversation.updated_at = _timestamp()
         self._save_conversation(conversation)
 
@@ -1502,7 +1502,7 @@ class RuntimeSession:
         )
         conversation.agent.reset()
         conversation.team_agent.reset()
-        conversation.memory_manager.clear_short_term()
+        conversation.memory_manager.reset_extraction()
         conversation.usage_ledger = UsageLedger(self.settings.context_window)
         conversation.transcript.clear()
         conversation.updated_at = _timestamp()
@@ -1672,7 +1672,7 @@ class RuntimeSession:
         event_floor_sequence: int = 0,
         agent_messages: list[dict[str, Any]] | None = None,
         history: dict[str, Any] | None = None,
-        short_term_memory: dict[str, Any] | None = None,
+        memory_extraction: dict[str, Any] | None = None,
         usage: dict[str, Any] | None = None,
         access_mode: str | None = None,
     ) -> ConversationRuntime:
@@ -1681,26 +1681,9 @@ class RuntimeSession:
             llm_client=self.llm_client,
         )
         skill_context_buffer = SkillContextBuffer()
-        restored_short_term = False
-        if short_term_memory is not None:
-            try:
-                memory_manager.restore_short_term(short_term_memory)
-                restored_short_term = True
-            except (KeyError, TypeError, ValueError) as exc:
-                self._progress(
-                    f"Short-term memory restore failed for conversation {identifier}; "
-                    f"rebuilding from transcript: {exc}"
-                )
-        if not restored_short_term:
-            # Compatibility path for schema-v2 and older conversations. This can invoke
-            # compression; new snapshots restore directly and never repeat LLM work.
-            for item in transcript:
-                role = item.get("role")
-                content = str(item.get("content") or "")
-                if role == "user":
-                    memory_manager.add_user_message(content)
-                elif role == "assistant":
-                    memory_manager.add_assistant_message(content)
+        memory_manager.bind_message_source(lambda: transcript)
+        if memory_extraction:
+            memory_manager.restore_extraction(memory_extraction)
 
         def event_callback(event_type: str, data: dict[str, Any]) -> None:
             self._emit_event(event_type, data)
@@ -1803,11 +1786,7 @@ class RuntimeSession:
                     history=(
                         payload.get("history") if isinstance(payload.get("history"), dict) else None
                     ),
-                    short_term_memory=(
-                        payload.get("short_term_memory")
-                        if isinstance(payload.get("short_term_memory"), dict)
-                        else None
-                    ),
+                    memory_extraction=_restore_extraction_progress(payload),
                     usage=(
                         payload.get("usage") if isinstance(payload.get("usage"), dict) else None
                     ),
@@ -1828,7 +1807,7 @@ class RuntimeSession:
     def _save_conversation(self, conversation: ConversationRuntime) -> None:
         persisted_messages, _ = repair_tool_message_history(conversation.agent.messages)
         payload = {
-            "schema_version": 3,
+            "schema_version": 4,
             "id": conversation.id,
             "project_id": self.project_id,
             "title": conversation.title,
@@ -1842,7 +1821,7 @@ class RuntimeSession:
             "transcript": conversation.transcript,
             "agent_messages": persisted_messages,
             "history": conversation.agent.history_snapshot(),
-            "short_term_memory": conversation.memory_manager.short_term_snapshot(),
+            "memory_extraction": conversation.memory_manager.extraction_snapshot(),
             "usage": conversation.usage_ledger.snapshot(),
         }
         with self._persistence_lock:
@@ -2113,6 +2092,29 @@ def _task_workspace_prompt_context(
         )
     )
 
+
+
+def _restore_extraction_progress(payload: dict[str, Any]) -> dict[str, Any]:
+    """Migrate only extraction progress from old short-term snapshots, never their text."""
+    current = payload.get("memory_extraction")
+    if isinstance(current, dict):
+        return current
+    legacy = payload.get("short_term_memory") or {}
+    entries = legacy.get("entries", []) if isinstance(legacy, dict) else []
+    if isinstance(entries, dict):
+        entries = list(entries.values())
+    processed_texts = [
+        str(item.get("content") or "")
+        for item in entries if isinstance(item, dict)
+        and item.get("metadata", {}).get("role") == "user"
+        and item.get("metadata", {}).get("long_term_extracted") == "true"
+    ]
+    return {"processed_ids": [
+        item["id"] for item in payload.get("transcript", [])
+        if item.get("role") == "user" and item.get("id") and item.get("content")
+        and any(text == item["content"] or text.endswith("\n\n" + item["content"])
+                for text in processed_texts)
+    ]}
 
 def _transcript_entry(
     role: str,

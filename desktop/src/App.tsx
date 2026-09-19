@@ -25,24 +25,27 @@ import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { confirm as confirmDialog, open } from "@tauri-apps/plugin-dialog";
 import { revealItemInDir } from "@tauri-apps/plugin-opener";
 import "./App.css";
+import { Settings, X, Trash2 } from "lucide-react";
+import { ErrorBoundary } from "./components/ErrorBoundary";
+import { ToolActivityCard } from "./features/activity/ToolActivityCard";
 import {
   SupervisionCenter,
   type SupervisionApproval as SupervisionApprovalView,
   type SupervisionTask as SupervisionTaskView,
 } from "./features/supervision/SupervisionCenter";
-import { MarkdownContent } from "./features/markdown/MarkdownContent";
 import {
   reconcileChangedWorkspaceFile,
   type WorkspaceFileReference,
 } from "./features/markdown/codeAnswer";
 import type { WorkspaceFilePreview } from "./features/filePreview/FilePreviewPanel";
-import {
-  DEFAULT_APP_SETTINGS,
-  SettingsPage,
-  type AppSettings,
-  type SettingsSection,
-  type SettingsSnapshot,
+import type {
+  AppSettings,
+  SettingsSection,
+  SettingsSnapshot,
 } from "./SettingsPage";
+import { DEFAULT_APP_SETTINGS } from "./settingsDefaults";
+import { TranscriptWindow } from "./features/transcript/TranscriptWindow";
+import { AssistantDeltaBuffer } from "./runtime/assistantDeltaBuffer";
 import { translate, translateDiagnosticRuntimeText, translateRuntimeText, type Language, type TranslationValues, type Translator } from "./i18n";
 import {
   INITIAL_FRONTEND_RUNTIME_STATE,
@@ -107,6 +110,8 @@ const ReviewChangesWorkbench = lazy(async () => {
   const module = await import("./features/review/ReviewChangesWorkbench");
   return { default: module.ReviewChangesWorkbench };
 });
+const SettingsPage = lazy(() => import("./SettingsPage").then((module) => ({ default: module.SettingsPage })));
+const MarkdownContent = lazy(() => import("./features/markdown/MarkdownContent").then((module) => ({ default: module.MarkdownContent })));
 const FilePreviewPanel = lazy(async () => {
   const module = await import("./features/filePreview/FilePreviewPanel");
   return { default: module.FilePreviewPanel };
@@ -132,6 +137,7 @@ type ToolTranscriptEntry = {
   taskId?: string;
   name: string;
   detail: string;
+  arguments?: Record<string, unknown>;
   status: ToolStatus;
   elapsed?: number;
   timestamp?: string;
@@ -200,6 +206,7 @@ type TeamDialogueItem = {
   messageKind?: string;
   content?: string;
   toolName?: string;
+  toolArguments?: Record<string, unknown>;
   toolStatus?: ToolStatus;
   elapsed?: number;
   streaming?: boolean;
@@ -623,7 +630,7 @@ function App() {
   function tx(message: string, values?: TranslationValues) {
     return translate(languageRef.current, message, values);
   }
-  const t: Translator = tx;
+  const t: Translator = useMemo(() => (message, values) => translate(appSettings.general.language, message, values), [appSettings.general.language]);
 
   const composerReferences = useMemo<ComposerReference[]>(() => {
     const skills = skillSnapshot.skills
@@ -1068,6 +1075,17 @@ function App() {
   useEffect(() => {
     let disposed = false;
     const unlisteners: Array<() => void> = [];
+    const assistantDeltas = new AssistantDeltaBuffer((batch) => {
+      const currentSession = activeConversationIdRef.current;
+      const currentPid = activeRuntimePid.current;
+      const accepted = batch.filter((event) => event.session_id === currentSession
+        && (event.runtime_pid === undefined || event.runtime_pid === currentPid));
+      if (disposed || !accepted.length) return;
+      setEntries((current) => accepted.reduce((result, event) => applyAssistantDelta(
+        result, event.task_id, event.event_id, event.data.text,
+        event.data.reset === true, event.timestamp,
+      ), current));
+    });
 
     function captureRuntimeRestoreTargets() {
       const projectIds = new Set(
@@ -1453,6 +1471,8 @@ function App() {
     }
 
     function handleRuntimeMessage(message: RuntimeMessage, replaying = false) {
+      // Flush text before lifecycle/approval/response events so display order stays causal.
+      if (message.kind !== "event" || message.type !== "assistant.delta") assistantDeltas.flush();
       // One reducer accepts both live Sidecar events and durable replay.  Replay
       // rebuilds presentation state only; live events also update the running
       // task registry used to keep background conversations independently busy.
@@ -1847,6 +1867,7 @@ function App() {
           kind: "tool",
           toolName: message.data.name,
           toolStatus: "running",
+          toolArguments: message.data.arguments,
           content: JSON.stringify(message.data.arguments),
           timestamp: message.timestamp,
         }));
@@ -1936,6 +1957,7 @@ function App() {
           taskId: message.task_id,
           name: message.data.name,
           detail: JSON.stringify(message.data.arguments),
+          arguments: message.data.arguments,
           status: "running",
           timestamp: message.timestamp,
           changePreview: message.data.change_preview,
@@ -2032,14 +2054,7 @@ function App() {
         }
       } else if (message.type === "assistant.delta") {
         if (replaying) return;
-        setEntries((current) => applyAssistantDelta(
-          current,
-          message.task_id,
-          message.event_id,
-          message.data.text,
-          message.data.reset === true,
-          message.timestamp,
-        ));
+        assistantDeltas.push(message);
       } else if (message.type === "assistant.completed") {
         if (replaying) return;
         setEntries((current) => completeAssistantStream(
@@ -2165,6 +2180,7 @@ function App() {
     }
 
     function handleResponse(message: RuntimeResponse) {
+      assistantDeltas.flush();
       if (!message.ok) {
         const failedWorkspaceOpen = message.request_id === workspaceOpenRequest.current;
         const failedSessionList = message.request_id === sessionListRequest.current;
@@ -2643,6 +2659,7 @@ function App() {
     void start();
     return () => {
       disposed = true;
+      assistantDeltas.dispose();
       liveRuntimeEventHandler.current = () => undefined;
       legacyRuntimeResponseHandler.current = () => undefined;
       rejectAllRuntimeRequests(tx("Desktop Runtime connection closed."));
@@ -4073,7 +4090,7 @@ function App() {
   function renderAgentMarkdown(content: string, taskId?: string) {
     const taskEntry = taskId ? taskStatusById.get(taskId) : undefined;
     const canReviewChanges = Boolean(taskEntry?.changes?.diff_available);
-    return <MarkdownContent
+    return <ErrorBoundary t={t} resetKey={activeConversationId}><Suspense fallback={<div className="markdown-loading">{content}</div>}><MarkdownContent
       content={content}
       workspace={workspace}
       projectId={activeProjectId}
@@ -4081,7 +4098,7 @@ function App() {
       reviewChangesBusy={Boolean(taskId && taskDiffLoading === taskId)}
       onReviewChanges={canReviewChanges && taskEntry ? () => void viewTaskDiff(taskEntry) : undefined}
       onOpenWorkspaceFile={(reference) => previewWorkspaceFile(reference, taskId)}
-    />;
+    /></Suspense></ErrorBoundary>;
   }
 
   return (
@@ -4142,7 +4159,7 @@ function App() {
           }, decision, "supervision")}
         />
         <span className={`connection-state ${connection}`}><i /> {connectionLabel}</span>
-        <button className="icon-button" aria-label={t("Open settings")} onClick={() => setSettingsTarget("general")}>{t("Settings")}</button>
+        <button className="icon-button ui-icon-button" title={t("Open settings")} aria-label={t("Open settings")} onClick={() => setSettingsTarget("general")}><Settings size={18} /></button>
       </header>
 
       <div
@@ -4214,7 +4231,7 @@ function App() {
                             {runningTasks[conversation.id] && <span className="session-running-label">{t("Running")}</span>}
                           </span>
                         </button>
-                        {isActiveProject && <button className="row-delete" onClick={() => void deleteConversation(conversation)} disabled={Boolean(runningTasks[conversation.id]) || projectActionBusy} aria-label={t("Delete {name}", { name: conversation.title })}>x</button>}
+                        {isActiveProject && <button className="row-delete" title={t("Delete {name}", { name: conversation.title })} onClick={() => void deleteConversation(conversation)} disabled={Boolean(runningTasks[conversation.id]) || projectActionBusy} aria-label={t("Delete {name}", { name: conversation.title })}><Trash2 size={14} /></button>}
                       </div>
                     ))}
                     {projectConversations.length === 0 && <span className="empty-conversations">{
@@ -4248,7 +4265,7 @@ function App() {
 
         <main className="conversation-panel">
           <div className="conversation-header">
-            <div><h1>{activeConversation?.title ?? t("New conversation")}</h1><p>{activeProject?.name ?? t("No project")} - {t("protocol v{version}", { version: RUNTIME_PROTOCOL_VERSION })}</p></div>
+            <div><h1>{activeConversation?.title ?? t("New conversation")}</h1><p>{activeProject?.name ?? t("No project")}</p></div>
             <ModeSwitch mode={mode} onChange={changeMode} disabled={runtimeMutationBusy || memoryExtracting || !sessionId} t={t} />
           </div>
           <div className="transcript-shell">
@@ -4260,10 +4277,11 @@ function App() {
             aria-busy={busy}
             tabIndex={0}
           >
+            <div className="transcript-content">
             {entries.length === 0 && <Message role="StellarCode" timestampFallback={t("runtime")} language={appSettings.general.language} accent>
               {sessionId ? t("Runtime connected to {name}. Submit a task to start.", { name: activeProject?.name ?? t("No project") }) : connectionLabel}
             </Message>}
-            {transcriptGroups.map((group) => group.kind === "activity" ? null : group.kind === "task-status" ? (
+            <TranscriptWindow key={activeConversationId} items={transcriptGroups.filter((group) => group.kind !== "activity")} containerRef={transcriptRef} t={t} renderItem={(group) => group.kind === "task-status" ? (
               <AgentRunStatus
                 entry={group.entry}
                 now={timerNow}
@@ -4294,7 +4312,7 @@ function App() {
                   ? <>{renderAgentMarkdown(group.entry.text, group.entry.taskId)}{group.entry.streaming && <span className="streaming-caret" aria-label={t("Streaming response")} />}</>
                   : group.entry.text}
               </Message>
-            ))}
+            )} />
             {approval && <section className="approval-card pending">
               <div className="approval-icon">!</div><div className="approval-content">
                 <div className="approval-heading"><strong>{t("Approval required")}</strong><span>{t(`${approval.data.danger_level} risk`)}</span></div>
@@ -4307,6 +4325,7 @@ function App() {
                 </div>
               </div>
             </section>}
+            </div>
           </div>
           <span className="sr-only" role="status" aria-live="polite" aria-atomic="true">
             {approval ? t("Approval required") : activeTaskFinalizing ? t("Finalizing workspace protection") : busy ? t("Agent is running") : ""}
@@ -4355,7 +4374,7 @@ function App() {
               {attachments.map((attachment) => <div className={`attachment-chip ${attachment.kind}`} key={attachment.id} title={attachment.local_path}>
                 <AttachmentPreview attachment={attachment} t={t} />
                 <span className="attachment-details"><span className="attachment-name">{attachment.display_name}</span><span className="attachment-size">{formatFileSize(attachment.size_bytes)}</span></span>
-                <button type="button" onClick={() => removeAttachment(attachment.id)} aria-label={t("Remove {name}", { name: attachment.display_name })}>x</button>
+                <button type="button" title={t("Remove {name}", { name: attachment.display_name })} onClick={() => removeAttachment(attachment.id)} aria-label={t("Remove {name}", { name: attachment.display_name })}><X size={14} /></button>
               </div>)}
             </div>}
             {activeMemoryExtraction && <div className={`memory-extraction-status ${activeMemoryExtraction.status}`} role="status">
@@ -4577,7 +4596,7 @@ function App() {
             aria-labelledby="right-changes-tab"
             hidden={rightSidebarView !== "changes"}
           >
-            {taskDiff ? <Suspense fallback={<div className="right-sidebar-empty">{t("Loading changes...")}</div>}>
+            {taskDiff ? <ErrorBoundary t={t} resetKey={taskDiff.task_id}><Suspense fallback={<div className="right-sidebar-empty">{t("Loading changes...")}</div>}>
               <ReviewChangesWorkbench
                 embedded
                 result={taskDiff}
@@ -4603,7 +4622,7 @@ function App() {
                   return rollbackTaskChanges(reviewedTaskEntry);
                 }}
               />
-            </Suspense> : <div className="right-sidebar-empty">{t("No task changes loaded.")}</div>}
+            </Suspense></ErrorBoundary> : <div className="right-sidebar-empty">{t("No task changes loaded.")}</div>}
           </div>
           <div
             id="right-file-panel"
@@ -4613,7 +4632,7 @@ function App() {
             hidden={rightSidebarView !== "file"}
           >
             {activeFilePreviewTab?.preview ? <Suspense fallback={<div className="right-sidebar-empty">{t("Loading file...")}</div>}>
-              <FilePreviewPanel preview={activeFilePreviewTab.preview} t={t} />
+              <ErrorBoundary t={t} resetKey={activeFilePreviewTab.id}><FilePreviewPanel preview={activeFilePreviewTab.preview} t={t} /></ErrorBoundary>
             </Suspense> : activeFilePreviewTab?.error
               ? <div className="right-sidebar-empty file-preview-error"><div><strong>{t("File preview failed")}</strong><p>{activeFilePreviewTab.error}</p><button type="button" className="secondary-button" onClick={() => closeFilePreview(activeFilePreviewTab.id)}>{t("Close")}</button></div></div>
               : <div className="right-sidebar-empty">{t("Loading file...")}</div>}
@@ -4621,7 +4640,7 @@ function App() {
         </aside>
       </div>
 
-      {settingsTarget && settingsSnapshot && <SettingsPage
+      {settingsTarget && settingsSnapshot && <ErrorBoundary overlay t={t} onDismiss={() => setSettingsTarget(null)}><Suspense fallback={<div className="settings-overlay" role="status">{t("Loading settings...")}</div>}><SettingsPage
         initialSection={settingsTarget}
         snapshot={settingsSnapshot}
         runtimeOnline={connection === "online"}
@@ -4669,7 +4688,7 @@ function App() {
         onDiagnosticsRefresh={refreshDiagnosticsSnapshot}
         onDiagnosticsRun={runDiagnostics}
         onDiagnosticsCancel={cancelDiagnostics}
-      />}
+      /></Suspense></ErrorBoundary>}
     </div>
   );
 }
@@ -4851,6 +4870,7 @@ function RuntimeActivityPanel({ entries, language, t, renderMarkdown }: {
         <ToolCard
           name={entry.name}
           status={entry.status}
+          arguments={entry.arguments}
           detail={entry.detail}
           elapsed={entry.elapsed === undefined ? "" : `${entry.elapsed} ms`}
           changePreview={entry.changePreview}
@@ -4936,6 +4956,7 @@ function TeamConversationCard({ entry, t, renderMarkdown, compact = false, onOpe
                   <ToolCard
                     key={item.id}
                     name={item.toolName || t("Tool")}
+                    arguments={item.toolArguments}
                     status={item.toolStatus || "running"}
                     detail={item.content || ""}
                     elapsed={item.elapsed === undefined ? "" : `${item.elapsed} ms`}
@@ -5125,54 +5146,10 @@ function readFileAsDataUrl(file: File, t: Translator): Promise<string> {
   });
 }
 
-function ToolCard({ name, status, detail, elapsed, changePreview, t }: { name: string; status: ToolStatus; detail: string; elapsed: string; changePreview?: FileChangePreview; t: Translator }) {
-  const [copied, setCopied] = useState(false);
-  const display = {
-    waiting_approval: { marker: "WAIT", label: "Waiting for approval" },
-    running: { marker: "RUN", label: "Running" },
-    completed: { marker: "OK", label: "Completed" },
-    failed: { marker: "FAIL", label: "Failed" },
-  }[status];
-  const hasDetails = Boolean(detail.trim() || changePreview);
-  const header = <span className="tool-card-header">
-    <span className="tool-status">{t(display.marker)}</span>
-    <span className="tool-card-summary">
-      <strong>{name}</strong>
-      {detail && <code className="tool-detail-preview">{summarizeToolDetail(detail)}</code>}
-    </span>
-    <span className="tool-result">{t(display.label)}{elapsed && ` · ${elapsed}`}</span>
-    {hasDetails && <span className="tool-expand-marker" aria-hidden="true">›</span>}
-  </span>;
-
-  if (!hasDetails) return <div className={`tool-card tool-${status}`}>{header}</div>;
-
-  async function copyDetails() {
-    if (!detail) return;
-    try {
-      await navigator.clipboard.writeText(detail);
-      setCopied(true);
-      window.setTimeout(() => setCopied(false), 1_500);
-    } catch {
-      setCopied(false);
-    }
-  }
-
-  return <details className={`tool-card tool-${status}`} open={status === "failed"}>
-    <summary aria-label={t("Show tool details for {name}", { name })}>{header}</summary>
-    <div className="tool-detail-panel">
-      <div className="tool-detail-toolbar">
-        <strong>{t("Tool details")}</strong>
-        {detail && <button type="button" onClick={() => void copyDetails()}>{t(copied ? "Copied" : "Copy details")}</button>}
-      </div>
-      {detail && <pre>{detail}</pre>}
-      {changePreview && <ChangePreviewPanel preview={changePreview} t={t} expanded />}
-    </div>
-  </details>;
-}
-
-function summarizeToolDetail(detail: string) {
-  const normalized = detail.replace(/\s+/g, " ").trim();
-  return normalized.length > 220 ? `${normalized.slice(0, 217)}...` : normalized;
+function ToolCard({ name, status, detail, elapsed, arguments: args, changePreview, t }: { name: string; status: ToolStatus; detail: string; elapsed: string; arguments?: Record<string, unknown>; changePreview?: FileChangePreview; t: Translator }) {
+  return <ToolActivityCard name={name} status={status} detail={detail} elapsed={elapsed} arguments={args} t={t}>
+    {changePreview && <ChangePreviewPanel preview={changePreview} t={t} expanded />}
+  </ToolActivityCard>;
 }
 
 function ChangePreviewPanel({ preview, t, expanded = false }: { preview: FileChangePreview; t: Translator; expanded?: boolean }) {

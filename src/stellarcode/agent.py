@@ -144,6 +144,8 @@ class Agent:
             last_compacted_at=history_last_compacted_at,
         )
         self.messages: list[dict[str, Any]] = [{"role": "system", "content": system_prompt}]
+        if self.memory_manager and not self.memory_manager.message_source_bound:
+            self.memory_manager.bind_message_source(lambda: self.messages)
 
     def reset(self) -> None:
         self.messages = [{"role": "system", "content": self.base_system_prompt}]
@@ -162,11 +164,11 @@ class Agent:
         self._current_query = user_input
         self._web_search_calls = 0
         prune_historical_images(self.messages)
-        if self.memory_manager:
-            self.memory_manager.add_user_message(user_input)
         self._refresh_system_prompt(user_input, include_memory_context=True)
 
-        self.messages.append(self.image_parser.user_message(self._prepend_skill_bodies(user_input)))
+        message = self.image_parser.user_message(self._prepend_skill_bodies(user_input))
+        message["_stellarcode_original_user_text"] = user_input
+        self.messages.append(message)
         self._checkpoint("user_message")
         return self._run_iterations(cancellation_event)
 
@@ -226,7 +228,7 @@ class Agent:
                     f"{type(exc).__name__}: {exc}"
                 )
                 self._emit_progress(f"[Agent] {content}")
-                self._record_final_answer(content)
+
                 return content
             self.messages.append(assistant_message)
             self._checkpoint("assistant_message")
@@ -234,7 +236,7 @@ class Agent:
             tool_calls = assistant_message.get("tool_calls") or []
             if not tool_calls:
                 content = str(assistant_message.get("content") or "")
-                self._record_final_answer(content)
+
                 return content
 
             tool_results, execution_results = self._execute_tool_calls(
@@ -251,11 +253,6 @@ class Agent:
             repeated_failure_result: dict[str, Any] | None = None
             for tool_call, tool_result in zip(tool_calls, tool_results):
                 self.messages.append(tool_result)
-                if self.memory_manager:
-                    self.memory_manager.add_tool_result(
-                        tool_result["name"],
-                        tool_result["content"],
-                    )
 
                 if _is_failed_tool_result(tool_result["content"]):
                     fingerprint = _tool_failure_fingerprint(tool_call, tool_result)
@@ -524,14 +521,14 @@ class Agent:
             self._emit_progress(
                 f"[Agent] Final explanation request failed: {type(exc).__name__}: {exc}"
             )
-            self._record_final_answer(content)
+
             return content
         self.messages.append(assistant_message)
         self._checkpoint("assistant_final")
         content = str(assistant_message.get("content") or "").strip()
         if not content:
             content = f"Tool operation failed repeatedly. {tool_result['content']}"
-        self._record_final_answer(content)
+
         return content
 
     def _finish_after_iteration_limit(
@@ -566,7 +563,7 @@ class Agent:
             self._checkpoint("assistant_final")
             content = str(assistant_message.get("content") or "").strip()
             if content:
-                self._record_final_answer(content)
+
                 return content
             final_error = "The model returned no final text even with tools disabled."
         except TaskCancelledError:
@@ -580,7 +577,7 @@ class Agent:
             final_error,
         )
         self._emit_progress(f"[Agent] {final_error}")
-        self._record_final_answer(content)
+
         return content
 
     def _emit_progress(self, message: str) -> None:
@@ -608,11 +605,6 @@ class Agent:
             # A checkpoint is a recovery aid; an I/O failure must not mutate the
             # in-memory message list halfway through the active turn.
             pass
-
-    def _record_final_answer(self, content: str) -> None:
-        if not self.memory_manager:
-            return
-        self.memory_manager.add_assistant_message(content)
 
     def history_snapshot(self) -> dict[str, Any]:
         return self.history_compactor.snapshot()
@@ -652,6 +644,8 @@ class Agent:
                 cancellation_event,
             )
             if compaction is not None:
+                if self.memory_manager:
+                    self.memory_manager.on_context_compacted()
                 self.messages = compaction.messages
                 self._refresh_system_prompt(
                     self._current_query,

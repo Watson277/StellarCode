@@ -1,4 +1,4 @@
-"""Layered prompt recall for short-term, conversation, and user memory."""
+"""Layered recall for conversation and user long-term memory."""
 
 from __future__ import annotations
 
@@ -11,12 +11,11 @@ from datetime import datetime
 from stellarcode.memory.entry import (
     LongTermMemoryEntry,
     MemoryEntry,
-    MemoryType,
     estimate_tokens,
 )
+from stellarcode.rag.embedding import EmbeddingClient
 
 
-_PROMPT_CONTEXT_TYPES = frozenset({MemoryType.FACT, MemoryType.SUMMARY})
 MemoryRecord = MemoryEntry | LongTermMemoryEntry
 
 
@@ -27,28 +26,46 @@ class ScoredMemory:
 
 
 class MemoryRetriever:
-    """Retrieve local context while always exposing active user-level memories."""
+    """Hybrid keyword/vector recall for type-free long-term memory.
+
+    User-level injection is handled by ``build_layered_context_for_query`` and remains
+    unconditional. This retriever ranks conversation memories with lexical overlap,
+    embedding similarity, and a small recency signal. If embedding generation fails,
+    retrieval degrades to keyword matching instead of blocking the agent run.
+    """
+
+    KEYWORD_WEIGHT = 0.40
+    VECTOR_WEIGHT = 0.50
+    RECENCY_WEIGHT = 0.10
+    MIN_VECTOR_SIMILARITY = 0.25
+
+    def __init__(self, embedding_client: EmbeddingClient | None = None) -> None:
+        self.embedding_client = embedding_client or EmbeddingClient()
 
     def retrieve(
         self,
         query: str,
-        short_entries: list[MemoryEntry],
         long_entries: list[LongTermMemoryEntry],
         limit: int = 5,
     ) -> list[MemoryRecord]:
         query_tokens = _tokenize(query)
+        query_embedding = self._embed_query(query)
         scored: list[ScoredMemory] = []
-
-        for entry in short_entries:
-            score = _score_short(entry, query_tokens, source_weight=1.0)
-            if score > 0:
-                scored.append(ScoredMemory(entry, score))
 
         for entry in long_entries:
             if entry.status != "active":
                 continue
-            score = _score_long(entry, query_tokens, source_weight=1.2)
-            if score > 0:
+            keyword_score = _keyword_overlap(entry.content, query_tokens)
+            vector_score = _cosine_similarity(query_embedding, entry.embedding)
+            if keyword_score <= 0 and vector_score < self.MIN_VECTOR_SIMILARITY:
+                continue
+            score = _score_long(
+                entry,
+                keyword_score=keyword_score,
+                vector_score=vector_score,
+                vector_available=bool(query_embedding and entry.embedding),
+            )
+            if score > 0.0:
                 scored.append(ScoredMemory(entry, score))
 
         scored.sort(key=lambda item: item.score, reverse=True)
@@ -57,22 +74,12 @@ class MemoryRetriever:
     def build_context_for_query(
         self,
         query: str,
-        short_entries: list[MemoryEntry],
         long_entries: list[LongTermMemoryEntry],
         max_tokens: int = 500,
     ) -> str:
-        query_tokens = _tokenize(query)
-        prompt_short_entries = [
-            entry for entry in short_entries if _eligible_short_entry(entry, query_tokens)
-        ]
-        prompt_long_entries = [
-            entry
-            for entry in long_entries
-            if entry.status == "active" and _content_matches(entry.content, query_tokens)
-        ]
         selected: list[str] = []
         used_tokens = 0
-        for entry in self.retrieve(query, prompt_short_entries, prompt_long_entries):
+        for entry in self.retrieve(query, long_entries):
             token_count = estimate_tokens(entry.content)
             if used_tokens + token_count > max_tokens:
                 continue
@@ -85,7 +92,6 @@ class MemoryRetriever:
     def build_layered_context_for_query(
         self,
         query: str,
-        short_entries: list[MemoryEntry],
         conversation_entries: list[LongTermMemoryEntry],
         user_entries: list[LongTermMemoryEntry],
         max_conversation_tokens: int = 500,
@@ -93,8 +99,7 @@ class MemoryRetriever:
         """Build a two-layer context envelope.
 
         Every active user memory is included without query matching or a retrieval
-        budget, as required by the user-memory contract. Short-term summaries and
-        conversation memories remain query-scoped and share a bounded local budget.
+        budget. Conversation memories remain query-scoped with a bounded local budget.
         """
 
         active_user_entries = [
@@ -102,21 +107,11 @@ class MemoryRetriever:
         ]
         user_lines = [f"- {entry.content}" for entry in active_user_entries]
 
-        query_tokens = _tokenize(query)
-        prompt_short_entries = [
-            entry for entry in short_entries if _eligible_short_entry(entry, query_tokens)
-        ]
-        prompt_conversation_entries = [
-            entry
-            for entry in conversation_entries
-            if entry.status == "active" and _content_matches(entry.content, query_tokens)
-        ]
         local_lines: list[str] = []
         used_tokens = 0
         for entry in self.retrieve(
             query,
-            prompt_short_entries,
-            prompt_conversation_entries,
+            conversation_entries,
         ):
             token_count = estimate_tokens(entry.content)
             if used_tokens + token_count > max_conversation_tokens:
@@ -136,54 +131,51 @@ class MemoryRetriever:
             )
         return "\n\n".join(sections)
 
-
-def _eligible_short_entry(entry: MemoryEntry, query_tokens: set[str]) -> bool:
-    if entry.type not in _PROMPT_CONTEXT_TYPES or not query_tokens:
-        return False
-    entry_tokens = _tokenize(entry.content)
-    for value in entry.metadata.values():
-        entry_tokens.update(_tokenize(value))
-    return bool(query_tokens & entry_tokens)
-
-
-def _content_matches(content: str, query_tokens: set[str]) -> bool:
-    return bool(query_tokens and query_tokens & _tokenize(content))
-
-
-def _score_short(
-    entry: MemoryEntry,
-    query_tokens: set[str],
-    source_weight: float,
-) -> float:
-    content_tokens = _tokenize(entry.content)
-    metadata_tokens = set()
-    for value in entry.metadata.values():
-        metadata_tokens.update(_tokenize(value))
-    if not query_tokens:
-        return 0.0
-    content_overlap = len(query_tokens & content_tokens) / len(query_tokens)
-    metadata_overlap = len(query_tokens & metadata_tokens) / len(query_tokens)
-    age_hours = max((time.time() - entry.timestamp) / 3600.0, 0.0)
-    time_decay = math.exp(-age_hours / 168.0)
-    type_weight = 1.15 if entry.type in _PROMPT_CONTEXT_TYPES else 1.0
-    return (
-        (0.65 * content_overlap + 0.2 * metadata_overlap + 0.15 * time_decay)
-        * source_weight
-        * type_weight
-    )
+    def _embed_query(self, query: str) -> list[float]:
+        if not query.strip():
+            return []
+        try:
+            return self.embedding_client.embed(query)
+        except Exception:
+            return []
 
 
 def _score_long(
     entry: LongTermMemoryEntry,
-    query_tokens: set[str],
-    source_weight: float,
+    *,
+    keyword_score: float,
+    vector_score: float,
+    vector_available: bool,
 ) -> float:
-    if not query_tokens:
-        return 0.0
-    content_overlap = len(query_tokens & _tokenize(entry.content)) / len(query_tokens)
     age_hours = max((time.time() - _timestamp(entry.updated_at)) / 3600.0, 0.0)
     time_decay = math.exp(-age_hours / 168.0)
-    return (0.85 * content_overlap + 0.15 * time_decay) * source_weight
+    if not vector_available:
+        # Preserve useful keyword ranking when an embedding endpoint is unavailable or
+        # a legacy record has not received an embedding yet.
+        return 0.90 * keyword_score + 0.10 * time_decay
+    normalized_vector = max(0.0, min(1.0, vector_score))
+    return (
+        MemoryRetriever.KEYWORD_WEIGHT * keyword_score
+        + MemoryRetriever.VECTOR_WEIGHT * normalized_vector
+        + MemoryRetriever.RECENCY_WEIGHT * time_decay
+    )
+
+
+def _keyword_overlap(content: str, query_tokens: set[str]) -> float:
+    if not query_tokens:
+        return 0.0
+    return len(query_tokens & _tokenize(content)) / len(query_tokens)
+
+
+def _cosine_similarity(left: list[float], right: list[float]) -> float:
+    if not left or not right or len(left) != len(right):
+        return 0.0
+    left_norm = math.sqrt(sum(value * value for value in left))
+    right_norm = math.sqrt(sum(value * value for value in right))
+    denominator = left_norm * right_norm
+    if denominator == 0.0:
+        return 0.0
+    return sum(a * b for a, b in zip(left, right)) / denominator
 
 
 def _timestamp(value: str) -> float:

@@ -5,16 +5,7 @@ from __future__ import annotations
 import threading
 
 
-SHORT_TERM_MEMORY_RATIO = 0.50
 COMPRESSION_THRESHOLD_RATIO = 0.80
-
-
-def proportional_short_term_tokens(context_window: int) -> int:
-    """Return the default semantic-memory capacity for one model window."""
-
-    if context_window <= 0:
-        raise ValueError("context_window must be greater than 0")
-    return max(1, int(context_window * SHORT_TERM_MEMORY_RATIO))
 
 
 class TokenBudget:
