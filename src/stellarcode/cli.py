@@ -115,7 +115,7 @@ def create_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument("--max-iterations", type=int, default=8)
-    parser.add_argument("--memory-dir", default=None, help="Directory for long-term memory JSON.")
+    parser.add_argument("--memory-dir", default=None, help="Directory for the long-term memory SQLite database.")
     parser.add_argument("--rag-dir", default=None, help="Directory for the SQLite code index.")
     parser.add_argument("--team-workers", type=int, default=2)
     parser.add_argument("--team-retries", type=int, default=2)

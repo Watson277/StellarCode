@@ -57,9 +57,12 @@ class ProjectMemoryService:
 
         identifiers = list(dict.fromkeys(_safe_conversation_id(value) for value in conversation_ids))
         legacy_file = self.storage_dir / "long_term_memory.json"
+        legacy_database = self.storage_dir / "long_term_memory.db"
         marker = self.storage_dir / ".layered-memory-v2-migrated"
         with self._lock:
-            if marker.exists() or not legacy_file.is_file() or not identifiers:
+            if marker.exists() or not identifiers or not (
+                legacy_file.is_file() or legacy_database.is_file()
+            ):
                 return 0
             legacy_store = LongTermMemory(self.storage_dir)
             legacy_entries = legacy_store.all()
