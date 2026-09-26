@@ -35,6 +35,8 @@ class Task:
     error: str = ""
     start_time: float | None = None
     end_time: float | None = None
+    # Optional Team hand-off contract; guidance, not a filesystem security boundary.
+    contract: dict[str, list[str]] = field(default_factory=dict)
 
     def is_executable(self, tasks: dict[str, "Task"]) -> bool:
         if self.status != TaskStatus.PENDING:

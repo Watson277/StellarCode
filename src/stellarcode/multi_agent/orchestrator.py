@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import json
+import os
 import queue
 import re
+import shutil
 import threading
 import time
 import uuid
@@ -42,6 +44,7 @@ class StepExecutionResult:
     approved: bool | None = None
     review_feedback: str = ""
     retries: int = 0
+    tool_evidence: tuple[dict[str, Any], ...] = ()
 
 
 class AgentOrchestrator:
@@ -109,6 +112,7 @@ class AgentOrchestrator:
         self.last_message_bus_path: Path | None = None
         self._worker_cursor = 0
         self._active_message_bus: FileMessageBus | None = None
+        self.python_executable = ""
 
     def run(
         self,
@@ -150,7 +154,7 @@ class AgentOrchestrator:
                 "message": "Team execution completed." if plan.status.value == "COMPLETED" else result,
             },
         )
-        if self.final_review_approved is False:
+        if plan.status.value != "COMPLETED":
             raise MultiAgentError(result)
         return result
 
@@ -204,6 +208,11 @@ class AgentOrchestrator:
         self.final_review_approved = None
         self.review_retries = 0
         self.repair_results = []
+        configured_python = os.getenv("TEAM_PYTHON_EXECUTABLE", "").strip()
+        candidate = configured_python or shutil.which("python") or ""
+        self.python_executable = str(Path(candidate).resolve()) if candidate else ""
+        if configured_python and not Path(configured_python).is_file():
+            raise MultiAgentError("TEAM_PYTHON_EXECUTABLE must point to an existing executable.")
         try:
             plan.compute_execution_order()
         except PlanValidationError as exc:
@@ -397,9 +406,17 @@ class AgentOrchestrator:
                 error="Worker returned an empty result.",
             )
 
+        if _handoff_blocked(worker_result.content):
+            return StepExecutionResult(
+                task_id=task.id, worker_name=worker.name, success=False,
+                error=worker_result.content,
+                tool_evidence=tuple(getattr(worker, "tool_evidence", [])),
+            )
+
         return StepExecutionResult(
             task_id=task.id, worker_name=worker.name,
             success=True, result=worker_result.content,
+            tool_evidence=tuple(getattr(worker, "tool_evidence", [])),
         )
 
     def _review_completed_plan(
@@ -443,13 +460,15 @@ class AgentOrchestrator:
                         "files, actual validation results, and unresolved issues.",
                     ),
                     task_id=f"final_repair_{self.review_retries}",
-                    context=f"Overall goal:\n{plan.goal}\n\n"
+                    context=f"Python executable: {self.python_executable or 'unavailable; report blocker'}\n"
+                            f"Overall goal:\n{plan.goal}\n\n"
                             f"Completed work:\n{execution_result}\n\nReview feedback:\n{feedback}",
                     cancellation_event=cancellation_event,
                 )
             finally:
                 worker.clear_history()
-            if repair.type == MessageType.ERROR or not repair.content.strip():
+            if (repair.type == MessageType.ERROR or not repair.content.strip()
+                    or _handoff_blocked(repair.content)):
                 self.final_review_feedback += "\nRepair failed: " + repair.content
                 return False
             self.repair_results.append(repair.content)
@@ -644,18 +663,46 @@ class AgentOrchestrator:
         return self._active_message_bus
 
     def _build_step_context(self, plan: ExecutionPlan, current_task: Task) -> str:
-        lines = [f"Overall goal:\n{plan.goal}"]
-        for dependency_id in current_task.dependencies:
+        lines = [f"Overall goal:\n{plan.goal}",
+                 "Execution environment (resolved once per task; do not silently switch):\n"
+                 + json.dumps({"python_executable": self.python_executable or None}, ensure_ascii=False),
+                 "For PowerShell use & with the quoted executable path; run pip via -m pip.",
+                 "Current task contract (scope guidance, not extra permissions):\n"
+                 + json.dumps(current_task.contract, ensure_ascii=False)]
+        # Carry prerequisite contracts transitively so interfaces/environment are not lost.
+        ancestors: set[str] = set()
+
+        def visit(identifier: str) -> None:
+            if identifier in ancestors:
+                return
+            ancestors.add(identifier)
+            for parent in plan.get_task(identifier).dependencies:
+                visit(parent)
+
+        for identifier in current_task.dependencies:
+            visit(identifier)
+        remaining = 24_000
+        for dependency_id in plan.execution_order:
+            if dependency_id not in ancestors:
+                continue
             dependency = plan.get_task(dependency_id)
             if dependency.status != TaskStatus.COMPLETED:
                 continue
+            outcome = self.last_step_results.get(dependency_id)
             preview = dependency.result
-            if len(preview) > 500:
-                preview = f"{preview[:500]}..."
+            # Preserve concise structured hand-offs; legacy free text remains supported.
+            limit = min(6_000, max(0, remaining))
+            if len(preview) > limit:
+                preview = preview[:limit] + "\n[Hand-off truncated; inspect relevant artifacts if needed.]"
+            remaining -= len(preview)
             lines.append(
                 f"Completed dependency [{dependency.id}]: {dependency.description}\n"
                 f"Result: {preview}"
             )
+            if outcome and outcome.tool_evidence:
+                evidence = json.dumps(outcome.tool_evidence[-8:], ensure_ascii=False)
+                lines.append("Recorded tool evidence (not model-authored; applies at execution time):\n"
+                             + evidence[:4_000])
         return "\n\n".join(lines)
 
     def _build_final_result(self, plan: ExecutionPlan) -> str:
@@ -675,6 +722,10 @@ class AgentOrchestrator:
                 lines.append(f"  result: {task.result}")
             if task.error:
                 lines.append(f"  error: {task.error}")
+            if outcome and outcome.tool_evidence:
+                lines.append("  recorded tool evidence: " + json.dumps(
+                    outcome.tool_evidence[-8:], ensure_ascii=False,
+                )[:6_000])
         for index, result in enumerate(self.repair_results, 1):
             lines.append(f"Repair round {index}: {result}")
         if self.final_review_approved is not None:
@@ -729,6 +780,15 @@ def _extract_json(text: str) -> str:
     if start == -1 or end == -1 or end < start:
         raise PlanValidationError("Response does not contain a JSON object.")
     return stripped[start : end + 1]
+
+
+def _handoff_blocked(content: str) -> bool:
+    """Do not release dependent work when the structured worker report is blocked."""
+    try:
+        report = json.loads(_extract_json(content))
+    except (json.JSONDecodeError, PlanValidationError):
+        return False  # Backward compatibility with plain-text worker reports.
+    return isinstance(report, dict) and report.get("status") in {"blocked", "failed"}
 
 
 def _serialize_agent_message(message: AgentMessage) -> dict[str, str | None]:

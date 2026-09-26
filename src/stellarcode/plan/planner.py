@@ -164,6 +164,13 @@ class Planner:
             )
             if not task.description:
                 raise PlanValidationError(f"Task {normalized_id} has empty description.")
+            for field in ("write_paths", "deliverables", "verification", "non_goals"):
+                if field not in item:
+                    continue
+                values = item[field]
+                if not isinstance(values, list) or not all(isinstance(v, str) for v in values):
+                    raise PlanValidationError(f"Task {normalized_id} {field} must be a string list.")
+                task.contract[field] = values
             plan.add_task(task)
 
         for index, item in enumerate(raw_tasks, start=1):

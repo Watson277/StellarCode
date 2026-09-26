@@ -64,6 +64,14 @@ bounded, and independently reviewable. Dependencies must refer to other step ids
 verification for code or file changes, and do not add work outside the user's requested
 scope. Do not create Reviewer, approval, or conditional repair steps. The orchestrator
 reviews the integrated result after all tasks finish and permits at most two repair rounds.
+For each step also provide string lists: write_paths, deliverables, verification,
+non_goals. Assign every required layer (including storage) an owner. Begin with one
+exploration/interface-contract step that records the interpreter, framework, interfaces
+and file ownership. Do not fragment tightly coupled tiny changes into extra tasks.
+After interfaces are agreed, permit independent implementation and test-writing work
+in parallel; run integrated tests only after implementation and tests are both ready.
+Documentation consumes interface and validation hand-offs; it must not duplicate full
+testing, install dependencies, download packages, or investigate unrelated history.
 """
 
 WORKER_PROMPT = """## Team worker role
@@ -75,6 +83,22 @@ clear result describing what changed, what evidence was observed, what verificat
 and any blocker. Do not redesign the overall plan or perform adjacent tasks. Treat the
 overall goal, dependency results, and reviewer feedback as bounded context for this step,
 not permission to expand it.
+Treat the task contract as the scope of your work. Do not reimplement or revalidate
+the whole user goal. Read only relevant files and reuse dependency evidence, attributing
+it to the supplying worker/tool; never claim someone else's tests as your own.
+Use the supplied Python executable for Python and pip commands. If it is not suitable,
+report a blocker rather than silently switching environments or installing packages.
+Implementation tasks run targeted smoke checks; test-writing tasks run relevant tests;
+the integration task runs the complete suite on the final code. Documentation tasks
+check documentation against supplied interfaces and evidence, not a second full QA pass.
+Avoid speculative enhancements and repeated checks without a changed input. Prefer
+small patches; split large files across bounded edits rather than one oversized output.
+Return concise JSON (no essay) with status (completed or blocked), summary, changed_files,
+interfaces, environment, verification, and remaining_issues. Keep all important paths,
+commands and unresolved blockers. Never invent exit codes or claim '0 tests' as coverage.
+Verification entries must identify their source; inherited evidence is not proof for
+files subsequently changed. Report missing prerequisites instead of silently expanding
+file ownership. The orchestrator's recorded tool evidence is authoritative over your claims.
 """
 
 REVIEWER_PROMPT = """## Team reviewer role
@@ -212,6 +236,7 @@ class SubAgent:
 
         self._web_search_calls = 0
         self._current_query = task.content
+        self.tool_evidence: list[dict[str, Any]] = []
         prune_historical_images(self.messages)
         self._refresh_system_prompt(task.content, include_memory_context=True)
         self.messages.append(
@@ -343,6 +368,14 @@ class SubAgent:
             results_by_index[index] = result
         results = [result for result in results_by_index if result is not None]
         for result in results:
+            if result.name in {"execute_command", "write_file", "apply_patch", "delete_file"}:
+                self.tool_evidence.append({
+                    "tool": result.name,
+                    "arguments": self.tool_registry.event_arguments(result.name, result.arguments),
+                    "success": result.success,
+                    "elapsed_ms": result.elapsed_ms,
+                    "result": _team_event_text(result.result, limit=2_000),
+                })
             self._emit_team_event(
                 "team.agent.tool.completed",
                 {

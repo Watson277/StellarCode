@@ -9,6 +9,7 @@ from stellarcode.image import strip_images_for_text_model
 from stellarcode.llm.message_history import repair_tool_message_history
 from stellarcode.llm.openai_stream import consume_chat_completion_stream
 from stellarcode.llm.types import ChatResult, TokenUsage
+from stellarcode.llm.team_budget import team_request_options
 
 
 class CompatibleApiError(RuntimeError):
@@ -81,6 +82,7 @@ class OpenAICompatibleClient:
             "messages": prepared_messages,
             "temperature": temperature,
         }
+        payload.update(team_request_options())
         if tools:
             payload["tools"] = tools
             payload["tool_choice"] = "auto"
@@ -110,6 +112,9 @@ class OpenAICompatibleClient:
             choices = data.get("choices") or []
             if not choices:
                 raise RuntimeError(f"LLM response has no choices: {data}")
+            if choices[0].get("finish_reason") == "length":
+                raise RuntimeError("LLM output limit reached; incomplete response was not executed. "
+                                   "Increase TEAM_<ROLE>_MAX_OUTPUT_TOKENS or split the task.")
             message = choices[0].get("message")
             if not isinstance(message, dict):
                 raise RuntimeError(f"LLM response has no message: {data}")

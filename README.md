@@ -12,6 +12,17 @@ Reviewer 仅对致命错误或有具体证据的重大设计隐患要求返工�
 超过上限仍未通过，或审查/修复调用失败，则任务失败并报告未解决问题，不自动放行。
 Planner 只规划实现与测试任务，审查及返工由编排器控制；Reviewer 当前根据执行报告审查，不直接调用工具。
 
+### Team 执行效率
+
+- Team 的兼容 API 请求默认 `reasoning_effort=low`，Planner/Reviewer 单次输出上限 4096、Worker 8192 Token；不影响 ReAct/Plan。可通过 `.env.example` 中的 `TEAM_*` 参数覆盖。接口不支持推理参数时设置 `TEAM_REASONING_EFFORT=`；不静默降级。达到输出上限会明确失败，不执行截断的工具参数。
+- Planner 为子任务提供文件归属、交付物、验证方式和非目标；Worker 使用简短 JSON 交接。文档任务不得自行扩展为依赖研究、安装或全套测试。范围约束是提示词指导，不取代 PathGuard/HITL，也不是硬性工具白名单。
+- 后续 Worker 可读取传递依赖的交付结果及运行时记录的工具证据，不再只截取直接依赖前 500 字符。旧文本报告仍兼容；交接有长度限制，截断会显式标记。模型报告 `blocked/failed` 时停止依赖链。
+- 每个总任务固定一个 Python 路径（`TEAM_PYTHON_EXECUTABLE` 或 Runtime PATH 中的 python），通过上下文指导所有 Worker 使用同一解释器；不自动安装或切换环境。此处不是 shell 命令强制重写。
+- 实现任务做针对性冒烟，测试任务验证相关测试，集成阶段验证最终状态；工具证据保留来源，旧状态的测试结果不能冒充修改后的验证。工具 success 字段不等同测试通过，仍需核对输出中的退出码与实际测试数。
+- 当前仍采用批次 DAG 调度；本轮未改成完成即调度，也未增加自动无进展终止器。提速幅度需要同负载实测，不能由配置变化直接保证。
+
+离线回归：`python -m pytest regression_tests tests/test_multi_agent.py tests/test_plan.py tests/test_compatible_client.py tests/test_openai_stream.py -q`。
+
 桌面版不是用 Rust 重写 Python Agent：
 
 ```text

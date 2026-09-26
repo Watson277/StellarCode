@@ -25,6 +25,7 @@ def consume_chat_completion_stream(
     tool_calls: dict[int, dict[str, Any]] = {}
     usage: dict[str, Any] | None = None
     saw_payload = False
+    finish_reason = None
 
     for raw_line in lines:
         line = _decode_line(raw_line).strip()
@@ -49,6 +50,8 @@ def consume_chat_completion_stream(
         choices = payload.get("choices") or []
         if not choices or not isinstance(choices[0], dict):
             continue
+        if choices[0].get("finish_reason") is not None:
+            finish_reason = choices[0]["finish_reason"]
         delta = choices[0].get("delta")
         if not isinstance(delta, dict):
             continue
@@ -94,6 +97,9 @@ def consume_chat_completion_stream(
 
     if not saw_payload:
         raise RuntimeError("LLM stream ended without a data payload")
+    if finish_reason == "length":
+        raise RuntimeError("LLM output limit reached; incomplete response was not executed. "
+                           "Increase the output budget or split the task.")
     if tool_calls:
         message["tool_calls"] = [tool_calls[index] for index in sorted(tool_calls)]
         if not message.get("content"):
