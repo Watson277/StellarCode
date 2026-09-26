@@ -23,6 +23,13 @@ Planner 只规划实现与测试任务，审查及返工由编排器控制；Rev
 
 离线回归：`python -m pytest regression_tests tests/test_multi_agent.py tests/test_plan.py tests/test_compatible_client.py tests/test_openai_stream.py -q`。
 
+小型真实 Team 耗时测试（消耗 API 额度）：`python scripts/benchmark_team_latency.py --run`。
+它读取根目录 `.env`，在 `experiments/results/team-latency-*/workspace` 中构建标准库库存/CSV 模块；
+只开放限定文件工具与固定 `run_tests`，不提供任意 shell、MCP 或网络工具。
+总任务最多 60 次模型请求、15 分钟；保留各角色事件、真实 usage、生成测试和独立验收结果。
+该目录隔离不等于 OS 沙箱，生成的 Python 测试仍在本机执行。它不包含桌面、审批和 Git 合并耗时，
+也不等同之前的 Todo API 负载，单次结果不能据此声称同比提速。结果默认仅保留本地、不提交。
+
 桌面版不是用 Rust 重写 Python Agent：
 
 ```text
