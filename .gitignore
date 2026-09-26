@@ -57,3 +57,5 @@ tmp/
 .DS_Store
 Thumbs.db
 Desktop.ini
+# Local benchmark experiment artifacts and scripts
+/experiments/
