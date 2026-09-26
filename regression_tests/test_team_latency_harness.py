@@ -52,3 +52,59 @@ def render_inventory(stock):
 def test_no_generated_tests_is_explicitly_counted_as_zero(tmp_path):
     result = harness().execute_tests(tmp_path)
     assert result["test_count"] == 0
+
+
+def todo_fixture():
+    path = Path(__file__).resolve().parents[1] / "scripts" / "todo_latency_fixture.py"
+    spec = importlib.util.spec_from_file_location("todo_fixture", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_snapshot_redaction_preserves_python_syntax():
+    source = 'api_key = "sk-test0123456789"\nprint("hello")\n'
+    result = todo_fixture().redact_source(source)
+    assert "sk-test0123456789" not in result
+    assert 'print("hello")' in result
+    compile(result, "sanitized", "exec")
+
+
+def test_command_environment_preserves_windows_resolution_not_keys(monkeypatch):
+    monkeypatch.setenv("PATHEXT", ".COM;.EXE;.BAT;.CMD")
+    monkeypatch.setenv("LLM_API_KEY", "never-pass-to-tools")
+    environment = harness().clean_process_environment()
+    assert environment["PATHEXT"] == ".COM;.EXE;.BAT;.CMD"
+    assert "LLM_API_KEY" not in environment
+
+
+def test_todo_acceptance_requires_real_api(tmp_path):
+    fixture = todo_fixture()
+    compile(fixture.ACCEPTANCE, "acceptance", "exec")
+    result = fixture.validate(tmp_path, private=True)
+    assert result["exit_code"] != 0
+
+
+def test_todo_validator_supports_pytest_without_requiring_unittest(tmp_path):
+    (tmp_path / "tests").mkdir()
+    (tmp_path / "tests" / "test_example.py").write_text(
+        "def test_example():\n    assert True\n", encoding="utf-8")
+    result = todo_fixture().validate(tmp_path)
+    assert result["exit_code"] == 0, result["output"]
+    assert result["test_count"] == 1
+
+
+def test_todo_validator_detects_app_entry_without_changing_assertions(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    fixture = todo_fixture()
+    (tmp_path / "app").mkdir()
+    (tmp_path / "app" / "main.py").touch()
+    calls = []
+    def run(command, **kwargs):
+        calls.append(command)
+        return SimpleNamespace(returncode=0, stdout="Ran 12 tests\nOK", stderr="")
+    monkeypatch.setattr(fixture.subprocess, "run", run)
+    result = fixture.validate(tmp_path, private=True)
+    assert result["app_module"] == "app.main"
+    assert calls[0][-1] == "app.main"
+    assert calls[0][3] == fixture.ACCEPTANCE
