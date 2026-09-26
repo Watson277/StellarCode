@@ -22,7 +22,7 @@ from stellarcode.multi_agent.message import AgentMessage, MessageType
 from stellarcode.multi_agent.message_bus import FileMessageBus, MessageBusError
 from stellarcode.multi_agent.role import AgentRole
 from stellarcode.multi_agent.sub_agent import SubAgent
-from stellarcode.plan import ExecutionPlan, PlanValidationError, Planner, Task, TaskStatus
+from stellarcode.plan import ExecutionPlan, PlanValidationError, Planner, Task, TaskStatus, TaskType
 from stellarcode.prompt import PromptAssembler
 from stellarcode.skill import SkillContextBuffer, SkillRegistry
 from stellarcode.tools import ToolRegistry
@@ -73,6 +73,12 @@ class AgentOrchestrator:
         self.tool_registry = tool_registry
         self.memory_manager = memory_manager
         self.max_retries_per_step = max_retries_per_step
+        # Legacy constructor option now caps whole-task repair rounds, never above two.
+        self.max_review_retries = min(max_retries_per_step, 2)
+        self.final_review_feedback = ""
+        self.final_review_approved: bool | None = None
+        self.review_retries = 0
+        self.repair_results: list[str] = []
         self.max_iterations_per_agent = max_iterations_per_agent
         self.progress_callback = progress_callback
         self.skill_registry = skill_registry
@@ -138,12 +144,14 @@ class AgentOrchestrator:
             )
             raise
         self._emit_team_event(
-            "team.run.completed" if not plan.has_failed() else "team.run.failed",
+            "team.run.completed" if plan.status.value == "COMPLETED" else "team.run.failed",
             {
                 "run_id": self._team_run_id(),
-                "message": result if plan.has_failed() else "Team execution completed.",
+                "message": "Team execution completed." if plan.status.value == "COMPLETED" else result,
             },
         )
+        if self.final_review_approved is False:
+            raise MultiAgentError(result)
         return result
 
     def create_plan(
@@ -155,6 +163,9 @@ class AgentOrchestrator:
         self._emit("Multi-Agent phase 1/2: planner is creating the execution DAG...")
         task = AgentMessage.task(
             "orchestrator",
+            "Plan implementation and executable verification tasks only. "
+            "Do not add Reviewer, approval, or conditional repair steps: the orchestrator "
+            "performs one final review and at most two repair rounds after all steps finish.\n"
             f"Create an execution plan for this user goal:\n{user_input}",
         )
         try:
@@ -189,6 +200,10 @@ class AgentOrchestrator:
         self._ensure_message_bus()
         self.last_plan = plan
         self.last_step_results = {}
+        self.final_review_feedback = ""
+        self.final_review_approved = None
+        self.review_retries = 0
+        self.repair_results = []
         try:
             plan.compute_execution_order()
         except PlanValidationError as exc:
@@ -196,7 +211,7 @@ class AgentOrchestrator:
             return f"Multi-Agent plan validation failed: {exc}"
 
         plan.mark_started()
-        self._emit("Multi-Agent phase 2/2: workers are executing and reviewers are checking...")
+        self._emit("Multi-Agent phase 2/2: workers are executing; final review follows all steps...")
         batch_index = 0
 
         while True:
@@ -218,13 +233,7 @@ class AgentOrchestrator:
                 self.last_step_results[task.id] = outcome
                 if outcome.success:
                     task.mark_completed(outcome.result)
-                    review = "approved" if outcome.approved else "kept after review warning"
-                    if outcome.approved is None:
-                        review = "kept because review was unavailable"
-                    self._emit(
-                        f"{task.id} completed by {outcome.worker_name}; "
-                        f"review={review}; retries={outcome.retries}."
-                    )
+                    self._emit(f"{task.id} completed by {outcome.worker_name}.")
                 else:
                     task.mark_failed(outcome.error)
                     plan.skip_blocked_tasks(task.id)
@@ -236,8 +245,10 @@ class AgentOrchestrator:
 
         if plan.has_failed():
             plan.mark_failed()
-        else:
+        elif self._review_completed_plan(plan, cancellation_event):
             plan.mark_completed()
+        else:
+            plan.mark_failed()
         return self._build_final_result(plan)
 
     def reset(self) -> None:
@@ -248,6 +259,10 @@ class AgentOrchestrator:
         self.last_plan = None
         self.last_step_results = {}
         self._active_message_bus = None
+        self.final_review_feedback = ""
+        self.final_review_approved = None
+        self.review_retries = 0
+        self.repair_results = []
 
     def parse_review_approval(self, review_content: str | None) -> bool:
         if not review_content or not review_content.strip():
@@ -301,21 +316,18 @@ class AgentOrchestrator:
         if len(batch) == 1:
             worker = self.workers[self._worker_cursor % len(self.workers)]
             self._worker_cursor += 1
-            reviewer = self.reviewer
             try:
                 worker.clear_history()
                 return {
                     batch[0].id: self._run_step(
                         batch[0],
                         worker,
-                        reviewer,
                         contexts[batch[0].id],
                         cancellation_event,
                     )
                 }
             finally:
                 worker.clear_history()
-                reviewer.clear_history()
 
         worker_pool: queue.Queue[SubAgent] = queue.Queue()
         for worker in self.workers:
@@ -323,13 +335,11 @@ class AgentOrchestrator:
 
         def run_parallel(task: Task) -> StepExecutionResult:
             worker = worker_pool.get()
-            reviewer = self._new_sub_agent(f"reviewer-{task.id}", AgentRole.REVIEWER)
             try:
                 worker.clear_history()
                 return self._run_step(
                     task,
                     worker,
-                    reviewer,
                     contexts[task.id],
                     cancellation_event,
                 )
@@ -344,7 +354,6 @@ class AgentOrchestrator:
                 )
             finally:
                 worker.clear_history()
-                reviewer.clear_history()
                 worker_pool.put(worker)
 
         parallelism = min(len(batch), len(self.workers))
@@ -361,7 +370,6 @@ class AgentOrchestrator:
         self,
         task: Task,
         worker: SubAgent,
-        reviewer: SubAgent,
         context: str,
         cancellation_event: threading.Event | None = None,
     ) -> StepExecutionResult:
@@ -389,79 +397,69 @@ class AgentOrchestrator:
                 error="Worker returned an empty result.",
             )
 
-        accepted_result = worker_result.content
-        review = self._review_via_bus(
-            reviewer,
-            task,
-            accepted_result,
-            cancellation_event,
-        )
-        reviewer.clear_history()
-        if review.type == MessageType.ERROR:
-            return StepExecutionResult(
-                task_id=task.id,
-                worker_name=worker.name,
-                success=True,
-                result=accepted_result,
-                approved=None,
-                review_feedback=review.content,
-            )
-
-        approved = self.parse_review_approval(review.content)
-        feedback = self.parse_review_issues(review.content)
-        retries = 0
-
-        while not approved and retries < self.max_retries_per_step:
-            raise_if_cancelled(cancellation_event)
-            retries += 1
-            retry_context = (
-                f"{context}\n\nThe previous result was rejected by the reviewer.\n"
-                f"Review feedback:\n{feedback}"
-            )
-            retry_result = self._execute_agent_via_bus(
-                worker,
-                task_message,
-                task_id=task.id,
-                context=retry_context,
-                cancellation_event=cancellation_event,
-            )
-            if retry_result.type == MessageType.ERROR:
-                feedback = retry_result.content
-                continue
-            if not retry_result.content.strip():
-                feedback = "Worker returned an empty result during retry."
-                continue
-
-            accepted_result = retry_result.content
-            review = self._review_via_bus(
-                reviewer,
-                task,
-                accepted_result,
-                cancellation_event,
-            )
-            reviewer.clear_history()
-            if review.type == MessageType.ERROR:
-                return StepExecutionResult(
-                    task_id=task.id,
-                    worker_name=worker.name,
-                    success=True,
-                    result=accepted_result,
-                    approved=None,
-                    review_feedback=review.content,
-                    retries=retries,
-                )
-            approved = self.parse_review_approval(review.content)
-            feedback = self.parse_review_issues(review.content)
-
         return StepExecutionResult(
-            task_id=task.id,
-            worker_name=worker.name,
-            success=True,
-            result=accepted_result,
-            approved=approved,
-            review_feedback="" if approved else feedback,
-            retries=retries,
+            task_id=task.id, worker_name=worker.name,
+            success=True, result=worker_result.content,
         )
+
+    def _review_completed_plan(
+        self, plan: ExecutionPlan, cancellation_event: threading.Event | None,
+    ) -> bool:
+        """One whole-goal review, then bounded serial repairs without rerunning the DAG."""
+        review_task = Task("final_review", plan.goal, TaskType.VERIFICATION)
+        execution_result = self._build_final_result(plan)
+        for attempt in range(self.max_review_retries + 1):
+            raise_if_cancelled(cancellation_event)
+            try:
+                review = self._review_via_bus(
+                    self.reviewer, review_task, execution_result, cancellation_event,
+                )
+            finally:
+                self.reviewer.clear_history()
+            if review.type == MessageType.ERROR or not review.content.strip():
+                self.final_review_feedback = review.content or "Reviewer returned no result."
+                self.final_review_approved = False
+                return False
+            self.final_review_approved = self.parse_review_approval(review.content)
+            self.final_review_feedback = review.content
+            if self.final_review_approved:
+                return True
+            if attempt == self.max_review_retries:
+                return False
+
+            self.review_retries += 1
+            feedback = self.parse_review_issues(review.content)
+            worker = self.workers[attempt % len(self.workers)]
+            self._emit(f"Final review rejected; repair round {self.review_retries}/"
+                       f"{self.max_review_retries}.")
+            try:
+                worker.clear_history()
+                repair = self._execute_agent_via_bus(
+                    worker,
+                    AgentMessage.task(
+                        "orchestrator",
+                        "Repair only the blocking issues from the final review. "
+                        "Preserve completed work and run relevant tests. Report changed "
+                        "files, actual validation results, and unresolved issues.",
+                    ),
+                    task_id=f"final_repair_{self.review_retries}",
+                    context=f"Overall goal:\n{plan.goal}\n\n"
+                            f"Completed work:\n{execution_result}\n\nReview feedback:\n{feedback}",
+                    cancellation_event=cancellation_event,
+                )
+            finally:
+                worker.clear_history()
+            if repair.type == MessageType.ERROR or not repair.content.strip():
+                self.final_review_feedback += "\nRepair failed: " + repair.content
+                return False
+            self.repair_results.append(repair.content)
+            execution_result = (
+                self._build_final_result(plan)
+                + "\nReview the integrated result, verify prior blocking issues were fixed, "
+                "and check for regressions. Only fatal errors or major design risks block "
+                "approval; disclose all remaining non-blocking problems and uncertainties."
+            )
+        return False
 
     def _review_via_bus(
         self,
@@ -473,6 +471,10 @@ class AgentOrchestrator:
         """Ask a reviewer through its mailbox rather than by direct peer hand-off."""
         review_task = AgentMessage.task(
             "orchestrator",
+            "Review the complete user goal against all execution results. "
+            "Return approved, summary, issues (fatal errors or major design risks only), "
+            "and suggestions. Approve non-fatal issues without rework, but truthfully "
+            "disclose remaining defects, failed tests, limitations, and unverified claims.\n"
             f"Original task:\n{task.description}\n\nExecution result:\n{execution_result}",
         )
         return self._execute_agent_via_bus(
@@ -673,15 +675,12 @@ class AgentOrchestrator:
                 lines.append(f"  result: {task.result}")
             if task.error:
                 lines.append(f"  error: {task.error}")
-            if outcome and outcome.approved is False:
-                lines.append(
-                    f"  review: not approved after {outcome.retries} retries; "
-                    "latest result was kept"
-                )
-                if outcome.review_feedback:
-                    lines.append(f"  feedback: {outcome.review_feedback}")
-            elif outcome and outcome.approved is None:
-                lines.append("  review: unavailable; worker result was kept")
+        for index, result in enumerate(self.repair_results, 1):
+            lines.append(f"Repair round {index}: {result}")
+        if self.final_review_approved is not None:
+            lines.append(f"Final review: {'approved' if self.final_review_approved else 'not approved'}; "
+                         f"repair rounds: {self.review_retries}/{self.max_review_retries}")
+            lines.append(f"Review feedback: {self.final_review_feedback}")
         return "\n".join(lines)
 
     def _new_sub_agent(self, name: str, role: AgentRole) -> SubAgent:

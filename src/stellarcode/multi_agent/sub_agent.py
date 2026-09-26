@@ -62,7 +62,8 @@ Use this exact shape:
 Keep simple work to 1-3 steps and complex work to 5-10 steps. Every step must be concrete,
 bounded, and independently reviewable. Dependencies must refer to other step ids. Include
 verification for code or file changes, and do not add work outside the user's requested
-scope.
+scope. Do not create Reviewer, approval, or conditional repair steps. The orchestrator
+reviews the integrated result after all tasks finish and permits at most two repair rounds.
 """
 
 WORKER_PROMPT = """## Team worker role
@@ -80,7 +81,8 @@ REVIEWER_PROMPT = """## Team reviewer role
 
 You are the reviewer in a multi-agent coding team.
 
-Check whether the execution result is correct, complete, and consistent with the task.
+Review the integrated results of all steps against the complete original user goal.
+For a repair round, verify prior blocking issues and regressions in the repaired work.
 Do not call tools. Return JSON only:
 {
   "approved": true,
@@ -88,9 +90,21 @@ Do not call tools. Return JSON only:
   "issues": [],
   "suggestions": []
 }
-Use approved=false when required evidence is missing, the result is incorrect, the task
-scope was exceeded, or claimed verification is unsupported. Keep issues specific and
-actionable; do not invent evidence.
+Set approved=false ONLY for a fatal error or a major design risk: the core requested
+workflow is unusable, a critical requirement is broken, or there is a concrete serious
+security, data-loss, or architectural correctness risk. Put only these blockers in
+issues, explaining the evidence, impact, and minimum necessary fix. Do not invent risks
+or request speculative redesigns.
+For non-fatal defects, minor edge cases, style concerns, optional improvements, or
+incomplete evidence without a concrete major risk, set approved=true and issues=[].
+Still disclose every observed non-blocking problem, its impact, and unverified claims
+in summary and suggestions. Approval means no mandatory rework, NOT defect-free or
+fully verified. Distinguish worker-reported results from independently verified facts;
+you have no tools and must not claim to have inspected files or run tests yourself.
+Never hide failed tests, missing evidence, or limitations to justify approval. If a
+failed test demonstrates a broken core requirement, classify it as a blocker; otherwise
+report the failure honestly without requesting rework. On approval with caveats, make
+the remaining problems explicit in the final summary rather than saying 'no issues'.
 """
 
 

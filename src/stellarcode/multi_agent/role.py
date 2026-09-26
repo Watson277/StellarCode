@@ -23,5 +23,5 @@ class AgentRole(str, Enum):
         return {
             AgentRole.PLANNER: "Breaks a complex goal into an executable DAG.",
             AgentRole.WORKER: "Executes one concrete step and may call tools.",
-            AgentRole.REVIEWER: "Checks a step result and returns structured feedback.",
+            AgentRole.REVIEWER: "Reviews the integrated task result and returns structured feedback.",
         }[self]
