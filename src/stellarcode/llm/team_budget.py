@@ -7,7 +7,7 @@ from stellarcode.llm.types import current_llm_operation
 
 def team_request_options() -> dict[str, object]:
     role = current_llm_operation().removeprefix("team-")
-    if current_llm_operation() not in {"team-planner", "team-worker", "team-reviewer"}:
+    if current_llm_operation() not in {"team-planner", "team-worker", "team-reviewer", "team-summary"}:
         return {}
     prefix = f"TEAM_{role.upper()}_"
     effort = os.getenv(prefix + "REASONING_EFFORT", os.getenv("TEAM_REASONING_EFFORT", "low")).strip()
