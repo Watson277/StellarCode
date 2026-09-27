@@ -60,3 +60,7 @@ Thumbs.db
 Desktop.ini
 # Local benchmark experiment artifacts and scripts
 /experiments/
+
+# Local automation and agent instructions
+/scripts/
+/AGENTS.md
