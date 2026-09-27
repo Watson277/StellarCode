@@ -414,7 +414,7 @@ button { border: 0; }
 .team-agent-dialogue.status-working summary > span { color: var(--accent); }
 .team-agent-dialogue.status-completed summary > span { color: var(--good); }
 .team-agent-dialogue.status-failed summary > span { color: var(--danger); }
-.team-dialogue-messages { display: grid; gap: 6px; padding: 8px; }
+.team-dialogue-messages { display: grid; grid-auto-rows: max-content; align-content: start; min-width: 0; max-height: min(65vh, 720px); overflow: auto; gap: 6px; padding: 8px; scrollbar-gutter: stable; }
 .team-dialogue-bubble { max-width: min(100%, 980px); padding: 7px 8px; border: 1px solid var(--border); border-radius: 5px; background: var(--bg); color: var(--text); font-size: var(--ui-font-caption); line-height: 1.5; overflow-wrap: anywhere; white-space: pre-wrap; }
 .team-dialogue-bubble.from-lead { margin-right: 22px; border-left: 2px solid var(--accent); }
 .team-dialogue-bubble.from-agent { margin-left: 22px; border-left: 2px solid var(--good); }

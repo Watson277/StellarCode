@@ -4953,7 +4953,7 @@ function TeamConversationCard({ entry, t, renderMarkdown, compact = false, onOpe
                 </div>
                 <span>{t(teamStatusLabel(agent.status))}</span>
               </summary>
-              <div className="team-dialogue-messages">
+              <div className="team-dialogue-messages" tabIndex={0}>
                 {agent.items.map((item) => item.kind === "tool" ? (
                   <ToolCard
                     key={item.id}
