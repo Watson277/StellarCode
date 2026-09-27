@@ -19,6 +19,7 @@ from typing import Any
 
 from stellarcode import __version__
 from stellarcode.cancellation import TaskCancelledError
+from stellarcode.multi_agent.orchestrator import TeamTaskNotApproved
 from stellarcode.mcp import McpServerConfig
 from stellarcode.memory import LongTermMemory
 from stellarcode.rag.index import is_indexable_file
@@ -748,6 +749,18 @@ class SidecarServer:
                 "reason": "user",
                 "elapsed_ms": int((time.monotonic() - started) * 1000),
             }
+        except TeamTaskNotApproved as exc:
+            terminal_type = "task.failed"
+            terminal_outcome = "failed"
+            terminal_data = {
+                "status": "failed", "error_code": "task_not_approved",
+                "message": str(exc), "recoverable": False,
+                "elapsed_ms": int((time.monotonic() - started) * 1000),
+            }
+            self._emit_task_progress_best_effort(
+                "assistant.completed", {"content": exc.summary, "finish_reason": "stop"},
+                session_id=session_id, task_id=task_id,
+            )
         except Exception as exc:
             terminal_type = "task.failed"
             terminal_outcome = "failed"

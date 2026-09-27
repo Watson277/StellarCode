@@ -2097,7 +2097,9 @@ function App() {
           if (message.task_id) clearApprovalsForTask(message.task_id);
         }
         setEntries((current) => finishPlanTask(current, message.task_id, "failed"));
-        if (!replaying) reportError(message.data.message, message.event_id);
+        if (!replaying && message.data.error_code !== "task_not_approved") {
+          reportError(message.data.message, message.event_id);
+        }
       } else if (message.type === "task.cancelled") {
         if (!replaying && pendingRecovery.current?.task_id === message.task_id) pendingRecovery.current = null;
         setEntries((current) => updateTaskStatus(finishTaskStatus(

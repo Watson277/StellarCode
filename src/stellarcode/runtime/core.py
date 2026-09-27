@@ -41,6 +41,7 @@ from stellarcode.mcp import (
     McpServerManager,
 )
 from stellarcode.multi_agent import AgentOrchestrator
+from stellarcode.multi_agent.orchestrator import TeamTaskNotApproved
 from stellarcode.plan import ExecutionPlan, PlanExecuteAgent, Task, TaskStatus, TaskType
 from stellarcode.path_utils import subprocess_safe_path
 from stellarcode.protection import WorkspaceProtectionService
@@ -913,6 +914,9 @@ class RuntimeSession:
                 {"status": "cancelled", "reason": "user"},
             )
             raise
+        except TeamTaskNotApproved as exc:
+            self._persist_unapproved_team_summary(conversation, task_id, exc.summary)
+            raise
         except Exception as exc:
             self.mark_task_finalize_pending(
                 task_id,
@@ -927,6 +931,15 @@ class RuntimeSession:
             raise
         finally:
             self._release_task(task_id)
+
+    def _persist_unapproved_team_summary(self, conversation, task_id: str, summary: str) -> None:
+        conversation.transcript.append(_transcript_entry("assistant", summary, task_id=task_id))
+        conversation.updated_at = _timestamp()
+        self._save_conversation(conversation)
+        self.mark_task_finalize_pending(task_id, "failed", {
+            "status": "failed", "error_code": "task_not_approved",
+            "message": "Team task did not pass final acceptance.", "recoverable": False,
+        })
 
     def prepare_task(
         self,
@@ -1279,6 +1292,9 @@ class RuntimeSession:
                 "cancelled",
                 {"status": "cancelled", "reason": "user"},
             )
+            raise
+        except TeamTaskNotApproved as exc:
+            self._persist_unapproved_team_summary(conversation, task_id, exc.summary)
             raise
         except Exception as exc:
             self.mark_task_finalize_pending(

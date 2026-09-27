@@ -35,6 +35,14 @@ class MultiAgentError(RuntimeError):
     pass
 
 
+class TeamTaskNotApproved(MultiAgentError):
+    """An assessed task outcome, not a Runtime transport/system failure."""
+
+    def __init__(self, summary: str) -> None:
+        super().__init__("Team task did not pass final acceptance.")
+        self.summary = summary
+
+
 @dataclass(frozen=True)
 class StepExecutionResult:
     task_id: str
@@ -157,7 +165,7 @@ class AgentOrchestrator:
             },
         )
         if plan.status.value != "COMPLETED":
-            raise MultiAgentError(result)
+            raise TeamTaskNotApproved(result)
         return result
 
     def create_plan(
@@ -224,11 +232,14 @@ class AgentOrchestrator:
         plan.mark_started()
         self._emit("Multi-Agent phase 2/2: workers are executing; final review follows all steps...")
         batch_index = 0
+        rechecked: set[str] = set()
 
         while True:
             raise_if_cancelled(cancellation_event)
             batch = plan.executable_tasks()
             if not batch:
+                if self._recheck_stale_blockers(plan, rechecked, cancellation_event):
+                    continue
                 break
             batch_index += 1
             self._emit(
@@ -261,6 +272,64 @@ class AgentOrchestrator:
         else:
             plan.mark_failed()
         return self._build_final_result(plan)
+
+    def _recheck_stale_blockers(
+        self, plan: ExecutionPlan, rechecked: set[str],
+        cancellation_event: threading.Event | None,
+    ) -> bool:
+        """Revalidate once after newer successful work; never clear failures by inference."""
+        recovered = False
+        for task in plan.tasks.values():
+            if (task.id in rechecked or task.status != TaskStatus.FAILED
+                    or not _handoff_blocked(task.error)):
+                continue
+            if not any(other.status == TaskStatus.COMPLETED
+                       and (other.end_time or 0) > (task.end_time or 0)
+                       for other in plan.tasks.values()):
+                continue
+            rechecked.add(task.id)
+            previous_error = task.error
+            worker = self.workers[0]
+            try:
+                worker.clear_history()
+                outcome = self._run_step(
+                    task, worker,
+                    self._build_step_context(plan, task)
+                    + "\nRevalidate this previously blocked task against the CURRENT files. "
+                    "Later tasks may have fixed the blocker. Execute relevant checks; do not "
+                    "trust earlier passing tests. Stay within your original file ownership. "
+                    "Return JSON status completed only when the original deliverables and "
+                    "blocker are verified; otherwise status blocked.\nPrevious blocker:\n"
+                    + previous_error + "\nLatest execution evidence:\n"
+                    + self._build_final_result(plan), cancellation_event,
+                )
+            finally:
+                worker.clear_history()
+            try:
+                report = json.loads(_extract_json(outcome.result))
+            except (json.JSONDecodeError, PlanValidationError):
+                report = {}
+            if (outcome.success and isinstance(report, dict)
+                    and report.get("status") == "completed"
+                    and any(item.get("success") and not item.get("timed_out")
+                            and not re.search(r"exit_code:\s*(?!0\b)-?\d+", str(item.get("result", "")))
+                            for item in outcome.tool_evidence)):
+                self.last_step_results[task.id] = outcome
+                task.mark_completed(outcome.result)
+                # Keep previous failure in the report for final reviewer audit.
+                task.error = "Previous blocker (revalidated): " + previous_error
+                recovered = True
+            else:
+                task.error = previous_error + "\nRevalidation did not resolve the blocker: " + (
+                    outcome.error or outcome.result)
+        if recovered:
+            for task in plan.tasks.values():
+                if (task.status == TaskStatus.SKIPPED
+                        and task.error.startswith("Skipped because dependency failed:")):
+                    task.status = TaskStatus.PENDING
+                    task.error = ""
+                    task.end_time = None
+        return recovered
 
     def reset(self) -> None:
         self.planner.clear_history()
